@@ -237,7 +237,8 @@ async fn c6_system_only_admin_cannot_gain_access_through_any_assignment_path() {
     ok(s, &b);
     let (s, b) = olga.post(&format!("/api/intakes/{intake}/register"),
         json!({"registry_id":refs["registries"][0]["id"],"category":"civil_contract","title":"Blocked registration","responsible_user_id":pavel})).await;
-    err(s, &b, StatusCode::BAD_REQUEST, "validation");
+    // Naming another responsible officer at registration is a staff assignment (needs case.assign_staff).
+    err(s, &b, StatusCode::FORBIDDEN, "forbidden");
     let (_, card_after) = olga.get(&format!("/api/cases/{cid}")).await;
     assert_eq!(card["case"], card_after["case"]);
     assert_eq!(audit_count(&olga, &app, "case.assigned", cid), 0);
