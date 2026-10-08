@@ -65,7 +65,8 @@ if the sandbox cookie is missing/expired). `Actor { user_id, username, display_n
 JSON `{"error":{"code":"snake_case","message":"Human readable","details":{}}}`.
 400 `validation`, 401 `unauthenticated`/`no_sandbox`/`mfa_required`, 403 `forbidden` (missing permission on an object the actor can see),
 404 `not_found` (also returned when the actor may not see the object — never leak existence),
-409 `version_conflict` (details: `current` object) / `hearing_conflict` (details: conflicting hearings) / `invalid_transition` / `open_items` / `duplicate`,
+409 `stale_review` (decision review no longer matches; details: current `version`, `document_version_id`) /
+`version_conflict` (details: `current` object) / `hearing_conflict` (details: conflicting hearings) / `invalid_transition` / `open_items` / `duplicate`,
 413 `too_large`, 415 `unsupported_type`.
 
 ### Mutations
@@ -75,6 +76,10 @@ JSON `{"error":{"code":"snake_case","message":"Human readable","details":{}}}`.
   replay returns stored result, never a second case number / decision / attempt. Party creation, participant addition/ending,
   and participant representation edits also accept a key; the operation, target and body are bound to the actor.
   A changed body returns `409 idempotency_mismatch`; access is checked again on replay. The UI keeps one key per opened form (separate keys for party creation and participant addition).
+- Idempotency: `Idempotency-Key` header (client UUID) on register/close/finalise/schedule, decision create/amend/withdraw,
+  dispatch create/queue/record-sent/confirm, and hearing outcome; stored in `operation_keys`;
+  same actor, key and command body replay the stored response; a different body returns 409 `idempotency_mismatch`.
+  Authorization is checked again before replay. UI forms keep one key throughout retries.
 - Every response for private data: `Cache-Control: no-store, private`.
 
 ## 3. Time
@@ -82,6 +87,9 @@ JSON `{"error":{"code":"snake_case","message":"Human readable","details":{}}}`.
 - Calendar dates (document date, received date, registration date, closure date, due date) stored as `YYYY-MM-DD` court-local, **separately**.
 - API takes hearing times as court-local `starts_local`/`ends_local` (`YYYY-MM-DDTHH:MM`) and returns both UTC and local.
   Browser timezone never influences court dates. Interval is `[start, end)`: 09:00–10:00 does not clash with 10:00–11:00.
+  Calendar ranges select overlaps (`starts_at < range_end AND ends_at > range_start`); `from` and `to` are inclusive
+  court dates, converted to UTC midnight bounds. Day/week/month and print show each overlapping day, clipped to
+  00:00–24:00 with “continued”/“continues” markers. An end exactly at midnight does not occupy the next day.
   Optional buffer between hearings = setting `hearing_buffer_minutes` (default 0).
 
 ## 4. Permissions (strings in `user_permissions`)
@@ -170,7 +178,8 @@ user; invalid rows are reported individually and skipped. Eligibility changes af
   with reason + authoriser; new gets `previous_hearing_id`), frees the slot, generates "notify again" tasks per participant. `held` cannot be adjourned;
   correction via `hearing.admin_correct` with reason. Held never closes the case.
 - Decision: `draft → finalised → superseded` (by a finalised amendment, linked); `draft → withdrawn` (reason). Finalised file can never be replaced in place.
-- Dispatch (notice or copy package): `draft → queued → sent|failed`; `failed → queued` (retry = new attempt row). Technical delivery receipt,
+- Dispatch (notice or copy package): `draft → queued → sent|failed|superseded`;
+  `draft|failed → superseded` when bound material becomes obsolete; superseded is terminal and requires a fresh dispatch; `failed → queued` (retry = new attempt row). Technical delivery receipt,
   human confirmation and legal service assessment are **separate** records.
 - Task: `open → done|cancelled(reason)|carried_forward(reason)`.
 
@@ -192,6 +201,33 @@ Adjournment requires a changed start (`400`, "Choose a new date or time"). Adjou
 accept `override_reason`, with the same conflict checks, permission and audit rules as creation.
 Draft hearing PATCH accepts `room_id: null` and `judge_user_id: null`; task PATCH accepts `assignee_user_id: null`;
 draft decision PATCH accepts `decision_date: null`. Null clears these values; omission preserves them.
+
+Judicial review commands bind to the exact record shown to the reviewer:
+- `POST /decisions/:id/finalise` requires `{version, document_version_id, decision_date, signed_file_uploaded?}`.
+  A draft row or bound file mismatch returns 409 `stale_review` with `{version, document_version_id}`; no state change.
+  The UI reloads the draft, identifies the file/revision and requires a fresh review before retrying.
+- `POST /hearings/:id/confirm` requires `{version, override_reason?}`. A changed draft slot returns
+  409 `version_conflict` with `{current}` before booking. The UI reloads time/room/judge for review.
+- Hearing outcome's early-recording exception applies only to DEMO. Production refuses future hearings.
+
+Dispatch material and currency:
+- Create accepts `kind: notice|copies|decision_copy|working_document`; the last three are stored as a copy package.
+  `decision_copy` requires every selected `version_ids` entry to be the exact bound version of a currently
+  finalised decision. `working_document` explicitly sends ordinary material (including drafts). Legacy `copies`
+  derives each item's kind from its current decision binding. Items return `material_kind` and `decision_id`.
+  The existing `dispatch.manage` decision-copy permission and document visibility/clean-scan rules apply.
+- Working material always carries “DRAFT / working material” in subject/body and mailbox attachments;
+  finalised-only packages carry “Copy of finalised decision”. Custom edits retain these labels.
+- Hearing invitations store `hearing_id`, `hearing_version`, `hearing_starts_at` at preparation and verify them
+  when previewing, then bind the review to those current values. Hearing edits, confirmation, adjournment,
+  cancellation, outcomes and corrections atomically supersede unsent invitations, with an audit event.
+  Sent notices remain unchanged. Adjournment creates tasks; no replacement notice is automatically queued.
+- The `hearing_cancellation` template derives `notice_purpose: cancellation`; other hearing notices derive
+  `invitation`. Cancellation notices and document copies are independent of hearing cancellation.
+- Queue uses a JSON command body (normally `{}`) in its idempotency fingerprint. Queue/manual handover/retry
+  validate currency; the worker checks again within the delivery transaction and marks stale invitations or
+  decision copies `superseded` before any delivery attempt/mailbox entry. The UI displays
+  “Superseded — hearing changed; prepare a new notice” (or the corresponding decision-copy reason).
 
 ## 6. Next-action messages
 `GET /api/cases/:id` returns `next_actions: [{code, message, link}]` computed server-side, e.g.

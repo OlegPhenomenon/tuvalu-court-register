@@ -16,7 +16,7 @@ use axum::extract::{Path, Query, State};
 use axum::routing::{get, post};
 use axum::{Json, Router};
 use rusqlite::{Connection, OptionalExtension, Transaction, params};
-use serde::Deserialize;
+use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
 use std::collections::BTreeSet;
 
@@ -50,7 +50,7 @@ pub fn dispatch_visible_sql(actor: &Actor) -> String {
 
 const DISPATCH_SQL: &str = "\
 SELECT d.id, d.case_id, c.number AS case_number, d.intake_id, i.reference AS intake_reference,
-       d.hearing_id, d.kind, d.template_code, d.recipient_party_id, d.recipient_name, d.method, d.address,
+       d.hearing_id, d.hearing_version, d.hearing_starts_at, d.notice_purpose, d.kind, d.template_code, d.recipient_party_id, d.recipient_name, d.method, d.address,
        d.subject, d.body, d.purpose, d.status,
        ru.display_name AS reviewed_by_name, d.reviewed_at,
        pu.display_name AS prepared_by_name, d.prepared_at,
@@ -87,6 +87,7 @@ fn state_summary(d: &Value) -> String {
             "Delivery failed: {}",
             d["failure_reason"].as_str().unwrap_or("unknown reason")
         ),
+        "superseded" => d["status_reason"].as_str().unwrap_or("Superseded — prepare a new dispatch").into(),
         "cancelled" => match d["status_reason"].as_str() {
             Some(r) => format!("Cancelled: {r}"),
             None => "Cancelled".into(),
@@ -105,7 +106,7 @@ fn dispatch_json(conn: &Connection, actor: &Actor, id: i64) -> AppResult<Value> 
     d["items"] = json!(query_json(
         conn,
         "SELECT di.document_version_id, v.document_id, doc.title AS document_title, v.version_no,
-                v.filename, v.sha256, doc.visibility
+                v.filename, v.sha256, doc.visibility, di.material_kind, di.decision_id
          FROM dispatch_items di
          JOIN document_versions v ON v.id = di.document_version_id
          JOIN documents doc ON doc.id = v.document_id
@@ -213,6 +214,10 @@ fn validate_composition(conn: &Connection, actor: &Actor, d: &Value) -> AppResul
         &current_items(conn, d["id"].as_i64().unwrap())?,
         true,
     )?;
+    require_current_material(conn, actor, d["id"].as_i64().unwrap())?;
+    if let Some(why) = stale_reason(conn, d["id"].as_i64().unwrap())? {
+        return Err(AppError::conflict("stale_review", why));
+    }
     Ok(())
 }
 
@@ -369,17 +374,71 @@ fn copy_body(custom: &Option<String>, rendered: String, items: &str) -> AppResul
     required(&body, "Body")
 }
 
-fn insert_items(tx: &Transaction, dispatch_id: i64, version_ids: &[i64]) -> AppResult<()> {
+fn insert_items(tx: &Transaction, dispatch_id: i64, version_ids: &[i64], working: bool, require_decision: bool) -> AppResult<()> {
     for vid in version_ids {
+        let decision: Option<i64> = if working { None } else {
+            tx.query_row("SELECT id FROM decisions WHERE document_version_id=?1 AND status='finalised' ORDER BY id DESC LIMIT 1", [vid], |r| r.get(0)).optional()?
+        };
+        if require_decision && decision.is_none() {
+            return Err(AppError::validation("Decision copies require the exact document version of a finalised decision."));
+        }
         tx.execute(
-            "INSERT INTO dispatch_items (dispatch_id, document_version_id) VALUES (?1, ?2)",
-            params![dispatch_id, vid],
+            "INSERT INTO dispatch_items (dispatch_id, document_version_id, material_kind, decision_id) VALUES (?1, ?2, ?3, ?4)",
+            params![dispatch_id, vid, if decision.is_some() { "decision_copy" } else { "working_document" }, decision],
         )?;
     }
     Ok(())
 }
 
-#[derive(Deserialize)]
+/// Verify decision-copy authority separately from ordinary file access at every sending step.
+pub(crate) fn require_current_material(conn: &Connection, actor: &Actor, id: i64) -> AppResult<()> {
+    let copies: i64 = conn.query_row("SELECT count(*) FROM dispatch_items WHERE dispatch_id=?1 AND material_kind='decision_copy'", [id], |r| r.get(0))?;
+    if copies > 0 { actor.require(perm::DISPATCH_MANAGE)?; }
+    Ok(())
+}
+
+/// Business currency is checked under the same write lock as delivery. Unknown legacy
+/// bindings fail closed. Copies and cancellation notices are independent of hearing state.
+pub(crate) fn stale_reason(conn: &Connection, id: i64) -> AppResult<Option<&'static str>> {
+    let stale_hearing: bool = conn.query_row(
+        "SELECT EXISTS(SELECT 1 FROM dispatches d LEFT JOIN hearings h ON h.id=d.hearing_id
+         WHERE d.id=?1 AND d.kind='notice' AND d.hearing_id IS NOT NULL AND d.notice_purpose='invitation'
+         AND (h.id IS NULL OR h.status <> 'scheduled' OR d.hearing_version IS NOT h.version OR d.hearing_starts_at IS NOT h.starts_at))", [id], |r| r.get(0))?;
+    if stale_hearing { return Ok(Some("Superseded — hearing changed; prepare a new notice")); }
+    let stale_decision: bool = conn.query_row(
+        "SELECT EXISTS(SELECT 1 FROM dispatch_items di LEFT JOIN decisions d ON d.id=di.decision_id
+         WHERE di.dispatch_id=?1 AND di.material_kind='decision_copy'
+         AND (d.id IS NULL OR d.status <> 'finalised' OR d.document_version_id <> di.document_version_id))", [id], |r| r.get(0))?;
+    Ok(stale_decision.then_some("Superseded — decision changed; prepare a new copy"))
+}
+
+pub(crate) fn supersede(conn: &Connection, actor: Option<&Actor>, id: i64, why: &str) -> AppResult<()> {
+    let case_id: Option<i64> = conn.query_row("SELECT case_id FROM dispatches WHERE id=?1", [id], |r| r.get(0))?;
+    let changed = conn.execute("UPDATE dispatches SET status='superseded',status_reason=?2,version=version+1 WHERE id=?1 AND status IN ('draft','queued','failed')", params![id, why])?;
+    if changed > 0 {
+        audit::record(conn, actor, Event::new("dispatch.superseded", "dispatch", id, why).case(case_id).details(json!({"reason":why})))?;
+    }
+    Ok(())
+}
+
+pub(super) fn supersede_hearing_notices(conn: &Connection, actor: &Actor, hearing_id: i64) -> AppResult<()> {
+    let ids = query_json(conn, "SELECT id FROM dispatches WHERE hearing_id=?1 AND kind='notice' AND notice_purpose='invitation' AND status IN ('draft','queued','failed')", [hearing_id])?;
+    for d in ids { supersede(conn, Some(actor), d["id"].as_i64().unwrap(), "Superseded — hearing changed; prepare a new notice")?; }
+    Ok(())
+}
+
+/// Labels are mandatory even when the preparer writes custom correspondence.
+fn label_material(conn: &Connection, id: i64) -> AppResult<()> {
+    let has_items: bool = conn.query_row("SELECT EXISTS(SELECT 1 FROM dispatch_items WHERE dispatch_id=?1)", [id], |r| r.get(0))?;
+    if !has_items { return Ok(()); }
+    let working: bool = conn.query_row("SELECT EXISTS(SELECT 1 FROM dispatch_items WHERE dispatch_id=?1 AND material_kind='working_document')", [id], |r| r.get(0))?;
+    let label = if working { "DRAFT / working material" } else { "Copy of finalised decision" };
+    conn.execute("UPDATE dispatches SET subject=CASE WHEN subject LIKE ?2 || '%' THEN subject ELSE ?2 || ': ' || subject END,
+      body=CASE WHEN body LIKE ?2 || '%' THEN body ELSE ?2 || char(10) || char(10) || body END WHERE id=?1", params![id, label])?;
+    Ok(())
+}
+
+#[derive(Deserialize, Serialize)]
 struct CreateReq {
     kind: String, // 'notice' | 'copies'
     recipient_party_id: Option<i64>,
@@ -447,6 +506,7 @@ fn hearing_vars(
 async fn create(
     ctx: Ctx,
     Path(case_id): Path<i64>,
+    IdemKey(key): IdemKey,
     JsonBody(req): JsonBody<CreateReq>,
 ) -> JsonResult {
     let actor = ctx.actor;
@@ -454,119 +514,126 @@ async fn create(
         .db
         .write(move |tx| {
             let case = policy::require_case_perm(tx, &actor, case_id, perm::DISPATCH_MANAGE)?;
-            if !matches!(req.kind.as_str(), "notice" | "copies") {
-                return Err(AppError::validation("Kind must be 'notice' or 'copies'."));
-            }
-            require_ref(tx, "dispatch_method", &req.method)?;
-            // One dispatch = one recipient: an active participant (default address = its service
-            // contact, then the party's e-mail, then the party's address) or a free-form name.
-            let mut recipient_name = optional(&req.recipient_name);
-            let mut address = optional(&req.address);
-            if let Some(pid) = req.recipient_party_id {
-                let party: (String, Option<String>, Option<String>, Option<String>) = tx
-                    .query_row(
-                        "SELECT p.name, cp.service_contact, p.contact_email, p.address FROM case_participations cp
-                         JOIN parties p ON p.id = cp.party_id
-                         WHERE cp.case_id = ?1 AND cp.party_id = ?2 AND cp.active = 1",
-                        params![case_id, pid],
-                        |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?, r.get(3)?)),
-                    )
-                    .optional()?
-                    .ok_or_else(|| AppError::validation("The recipient is not an active participant of this case."))?;
-                if recipient_name.is_none() {
-                    recipient_name = Some(party.0);
+            idempotent(tx, &actor, &key, "dispatch.create", &(case_id, &req), || {
+                if !matches!(req.kind.as_str(), "notice" | "copies" | "decision_copy" | "working_document") {
+                    return Err(AppError::validation("Kind must be notice, copies, decision_copy or working_document."));
                 }
-                if address.is_none() {
-                    address = [party.1, party.2, party.3]
-                        .into_iter()
-                        .flatten()
-                        .find(|a| !a.trim().is_empty());
+                let copies = matches!(req.kind.as_str(), "copies" | "decision_copy" | "working_document");
+                let kind = if copies { "copies" } else { "notice" };
+                let notice_purpose = if req.template_code.as_deref() == Some("hearing_cancellation") { "cancellation" } else { "invitation" };
+                require_ref(tx, "dispatch_method", &req.method)?;
+                // One dispatch = one recipient: an active participant (default address = its service
+                // contact, then the party's e-mail, then the party's address) or a free-form name.
+                let mut recipient_name = optional(&req.recipient_name);
+                let mut address = optional(&req.address);
+                if let Some(pid) = req.recipient_party_id {
+                    let party: (String, Option<String>, Option<String>, Option<String>) = tx
+                        .query_row(
+                            "SELECT p.name, cp.service_contact, p.contact_email, p.address FROM case_participations cp
+                             JOIN parties p ON p.id = cp.party_id
+                             WHERE cp.case_id = ?1 AND cp.party_id = ?2 AND cp.active = 1",
+                            params![case_id, pid],
+                            |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?, r.get(3)?)),
+                        )
+                        .optional()?
+                        .ok_or_else(|| AppError::validation("The recipient is not an active participant of this case."))?;
+                    if recipient_name.is_none() {
+                        recipient_name = Some(party.0);
+                    }
+                    if address.is_none() {
+                        address = [party.1, party.2, party.3]
+                            .into_iter()
+                            .flatten()
+                            .find(|a| !a.trim().is_empty());
+                    }
                 }
-            }
-            let recipient_name = recipient_name
-                .ok_or_else(|| AppError::validation("Recipient name is required.").with_details(json!({ "field": "recipient_name" })))?;
-            if req.method == "email" && address.is_none() {
-                return Err(AppError::validation("An e-mail address is required for this delivery method.").with_details(json!({ "field": "address" })));
-            }
-            let hv = hearing_vars(tx, case_id, req.hearing_id)?;
-            let version_ids = req.version_ids.clone().unwrap_or_default();
-            let include_restricted = req.include_restricted.unwrap_or(false);
-            let (version_ids, items_text) = check_items(tx, &actor, Some(case_id), None, &version_ids, include_restricted)?;
-            if req.kind == "copies" && version_ids.is_empty() {
-                return Err(AppError::validation("Choose at least one document version to send."));
-            }
-            // The template supplies defaults. A custom copy body must retain the inventory;
-            // the mandatory preview shows the final composition before anything is sent.
-            let (mut subject, mut body) = if req.kind == "copies" {
-                render_template(
-                    tx,
-                    "copy_dispatch",
-                    &[
+                let recipient_name = recipient_name
+                    .ok_or_else(|| AppError::validation("Recipient name is required.").with_details(json!({ "field": "recipient_name" })))?;
+                if req.method == "email" && address.is_none() {
+                    return Err(AppError::validation("An e-mail address is required for this delivery method.").with_details(json!({ "field": "address" })));
+                }
+                let hv = hearing_vars(tx, case_id, req.hearing_id)?;
+                let version_ids = req.version_ids.clone().unwrap_or_default();
+                let include_restricted = req.include_restricted.unwrap_or(false);
+                let (version_ids, items_text) = check_items(tx, &actor, Some(case_id), None, &version_ids, include_restricted)?;
+                if copies && version_ids.is_empty() {
+                    return Err(AppError::validation("Choose at least one document version to send."));
+                }
+                // The template supplies defaults. A custom copy body must retain the inventory;
+                // the mandatory preview shows the final composition before anything is sent.
+                let (mut subject, mut body) = if copies {
+                    render_template(
+                        tx,
+                        "copy_dispatch",
+                        &[
+                            ("recipient", recipient_name.clone()),
+                            ("case_number", case.number.clone()),
+                            ("case_title", case.title.clone()),
+                            ("items", items_text.clone()),
+                        ],
+                    )?
+                } else if let Some(code) = optional(&req.template_code) {
+                    let vars: Vec<(&str, String)> = [
                         ("recipient", recipient_name.clone()),
                         ("case_number", case.number.clone()),
                         ("case_title", case.title.clone()),
-                        ("items", items_text.clone()),
+                    ]
+                    .into_iter()
+                    .chain(hv.iter().map(|(k, v)| (k.as_str(), v.clone())))
+                    .collect();
+                    render_template(tx, &code, &vars)?
+                } else {
+                    (String::new(), String::new())
+                };
+                if let Some(s) = optional(&req.subject) {
+                    subject = s;
+                }
+                if !copies && let Some(b) = optional(&req.body) {
+                    body = b;
+                }
+                if copies {
+                    body = copy_body(&req.body, body, &items_text)?;
+                }
+                let subject = required(&subject, "Subject")?;
+                let body = required(&body, "Body")?;
+                let template_code = if copies { Some("copy_dispatch".to_string()) } else { optional(&req.template_code) };
+                tx.execute(
+                    "INSERT INTO dispatches (case_id, hearing_id, kind, template_code, recipient_party_id, recipient_name,
+                                             method, address, subject, body, purpose, status, prepared_by, prepared_at)
+                     VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, 'draft', ?12, ?13)",
+                    params![
+                        case_id,
+                        req.hearing_id,
+                        kind,
+                        template_code,
+                        req.recipient_party_id,
+                        recipient_name,
+                        req.method,
+                        address,
+                        subject,
+                        body,
+                        optional(&req.purpose),
+                        actor.user_id,
+                        crate::time::now_utc()
                     ],
-                )?
-            } else if let Some(code) = optional(&req.template_code) {
-                let vars: Vec<(&str, String)> = [
-                    ("recipient", recipient_name.clone()),
-                    ("case_number", case.number.clone()),
-                    ("case_title", case.title.clone()),
-                ]
-                .into_iter()
-                .chain(hv.iter().map(|(k, v)| (k.as_str(), v.clone())))
-                .collect();
-                render_template(tx, &code, &vars)?
-            } else {
-                (String::new(), String::new())
-            };
-            if let Some(s) = optional(&req.subject) {
-                subject = s;
-            }
-            if req.kind != "copies" && let Some(b) = optional(&req.body) {
-                body = b;
-            }
-            if req.kind == "copies" {
-                body = copy_body(&req.body, body, &items_text)?;
-            }
-            let subject = required(&subject, "Subject")?;
-            let body = required(&body, "Body")?;
-            let template_code = if req.kind == "copies" { Some("copy_dispatch".to_string()) } else { optional(&req.template_code) };
-            tx.execute(
-                "INSERT INTO dispatches (case_id, hearing_id, kind, template_code, recipient_party_id, recipient_name,
-                                         method, address, subject, body, purpose, status, prepared_by, prepared_at)
-                 VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, 'draft', ?12, ?13)",
-                params![
-                    case_id,
-                    req.hearing_id,
-                    req.kind,
-                    template_code,
-                    req.recipient_party_id,
-                    recipient_name,
-                    req.method,
-                    address,
-                    subject,
-                    body,
-                    optional(&req.purpose),
-                    actor.user_id,
-                    crate::time::now_utc()
-                ],
-            )?;
-            let id = tx.last_insert_rowid();
-            insert_items(tx, id, &version_ids)?;
-            audit::record(
-                tx,
-                Some(&actor),
-                Event::new(
-                    "dispatch.prepared",
-                    "dispatch",
-                    id,
-                    super::common::dispatch_activity(tx, id, "prepared")?,
-                )
-                .case(Some(case_id)),
-            )?;
-            dispatch_json(tx, &actor, id)
+                )?;
+                let id = tx.last_insert_rowid();
+                insert_items(tx, id, &version_ids, req.kind == "working_document", req.kind == "decision_copy")?;
+                label_material(tx, id)?;
+                tx.execute("UPDATE dispatches SET notice_purpose=?2, hearing_version=(SELECT version FROM hearings WHERE id=hearing_id), hearing_starts_at=(SELECT starts_at FROM hearings WHERE id=hearing_id) WHERE id=?1", params![id, notice_purpose])?;
+                audit::record(
+                    tx,
+                    Some(&actor),
+                    Event::new(
+                        "dispatch.prepared",
+                        "dispatch",
+                        id,
+                        super::common::dispatch_activity(tx, id, "prepared")?,
+                    )
+                    .case(Some(case_id)),
+                )?;
+                dispatch_json(tx, &actor, id)
+            })
         })
         .await?;
     Ok(Json(v))
@@ -615,7 +682,8 @@ async fn update(ctx: Ctx, Path(id): Path<i64>, JsonBody(req): JsonBody<PatchReq>
                     return Err(AppError::validation("Choose at least one document version to send."));
                 }
                 tx.execute("DELETE FROM dispatch_items WHERE dispatch_id = ?1", [id])?;
-                insert_items(tx, id, &ids)?;
+                let decision_only = d["items"].as_array().is_some_and(|items| !items.is_empty() && items.iter().all(|i| i["material_kind"] == "decision_copy"));
+                insert_items(tx, id, &ids, !decision_only, decision_only)?;
             }
             if d["kind"] == "copies" && (req.version_ids.is_some() || req.body.is_some() || req.recipient_name.is_some()) {
                 let (_, items_text) = check_items(tx, &actor, d["case_id"].as_i64(), None, &current_items(tx, id)?, true)?;
@@ -643,6 +711,7 @@ async fn update(ctx: Ctx, Path(id): Path<i64>, JsonBody(req): JsonBody<PatchReq>
                  WHERE id = ?1",
                 params![id, recipient_name, req.method, optional(&req.address), subject, body],
             )?;
+            label_material(tx, id)?;
             audit::record(
                 tx,
                 Some(&actor),
@@ -671,7 +740,9 @@ async fn preview(ctx: Ctx, Path(id): Path<i64>) -> JsonResult {
             }
             validate_composition(tx, &actor, &d)?;
             tx.execute(
-                "UPDATE dispatches SET reviewed_by = ?2, reviewed_at = ?3, version = version + 1 WHERE id = ?1",
+                "UPDATE dispatches SET reviewed_by = ?2, reviewed_at = ?3, version = version + 1,
+                 hearing_version=(SELECT version FROM hearings WHERE id=hearing_id),
+                 hearing_starts_at=(SELECT starts_at FROM hearings WHERE id=hearing_id) WHERE id = ?1",
                 params![id, actor.user_id, crate::time::now_utc()],
             )?;
             audit::record(
@@ -698,6 +769,7 @@ async fn queue(
     ctx: Ctx,
     Path(id): Path<i64>,
     IdemKey(key): IdemKey,
+    JsonBody(body): JsonBody<Value>,
 ) -> JsonResult {
     let actor = ctx.actor;
     let db = ctx.db.clone();
@@ -706,7 +778,7 @@ async fn queue(
         .write(move |tx| {
             let d = dispatch_json(tx, &actor, id)?;
             require_dispatch_perm(&actor, &d, perm::DISPATCH_MANAGE)?;
-            idempotent(tx, &actor, &key, "dispatch.queue", &id, || {
+            idempotent(tx, &actor, &key, "dispatch.queue", &(id, &body), || {
                 if d["status"].as_str() != Some("draft") {
                     return Err(AppError::invalid_transition("This dispatch is not a draft."));
                 }
@@ -718,6 +790,7 @@ async fn queue(
                         "This dispatch does not go by e-mail — record the handover with record-sent instead.",
                     ));
                 }
+                validate_composition(tx, &actor, &d)?;
                 tx.execute(
                     "UPDATE dispatches SET status = 'queued', queued_by = ?2, queued_at = ?3, failure_reason = NULL,
                             version = version + 1 WHERE id = ?1",
@@ -737,7 +810,7 @@ async fn queue(
     Ok(Json(v))
 }
 
-#[derive(Deserialize)]
+#[derive(Deserialize, Serialize)]
 struct RecordSentReq {
     occurred_date: String,
     note: Option<String>,
@@ -748,6 +821,7 @@ struct RecordSentReq {
 async fn record_sent(
     ctx: Ctx,
     Path(id): Path<i64>,
+    IdemKey(key): IdemKey,
     JsonBody(req): JsonBody<RecordSentReq>,
 ) -> JsonResult {
     let actor = ctx.actor;
@@ -756,40 +830,42 @@ async fn record_sent(
         .write(move |tx| {
             let d = dispatch_json(tx, &actor, id)?;
             require_dispatch_perm(&actor, &d, perm::DISPATCH_MANAGE)?;
-            if d["method"].as_str() == Some("email") {
-                return Err(AppError::invalid_transition("E-mail dispatches go through the outbox — use queue."));
-            }
-            if d["status"].as_str() != Some("draft") {
-                return Err(AppError::invalid_transition("This dispatch is not a draft."));
-            }
-            if d["reviewed_at"].is_null() {
-                return Err(review_required());
-            }
-            validate_composition(tx, &actor, &d)?;
-            let date = crate::time::parse_date(&req.occurred_date)?;
-            let note = reason(&req.note)?;
-            let attempt_no: i64 = tx.query_row(
-                "SELECT COALESCE(MAX(attempt_no), 0) + 1 FROM delivery_attempts WHERE dispatch_id = ?1",
-                [id],
-                |r| r.get(0),
-            )?;
-            tx.execute(
-                "INSERT INTO delivery_attempts (dispatch_id, attempt_no, status, technical_receipt, detail, occurred_date, at)
-                 VALUES (?1, ?2, 'sent', 'manual', ?3, ?4, ?5)",
-                params![id, attempt_no, note, date, crate::time::now_utc()],
-            )?;
-            tx.execute(
-                "UPDATE dispatches SET status = 'sent', sent_at = ?2, version = version + 1 WHERE id = ?1",
-                params![id, crate::time::now_utc()],
-            )?;
-            audit::record(
-                tx,
-                Some(&actor),
-                Event::new("dispatch.sent", "dispatch", id, super::common::dispatch_activity(tx, id, "sent")?)
-                    .case(d["case_id"].as_i64())
-                    .details(json!({ "method": d["method"], "manual": true, "occurred_date": date, "attempt_no": attempt_no })),
-            )?;
-            dispatch_json(tx, &actor, id)
+            idempotent(tx, &actor, &key, "dispatch.record_sent", &(id, &req), || {
+                if d["method"].as_str() == Some("email") {
+                    return Err(AppError::invalid_transition("E-mail dispatches go through the outbox — use queue."));
+                }
+                if d["status"].as_str() != Some("draft") {
+                    return Err(AppError::invalid_transition("This dispatch is not a draft."));
+                }
+                if d["reviewed_at"].is_null() {
+                    return Err(review_required());
+                }
+                validate_composition(tx, &actor, &d)?;
+                let date = crate::time::parse_date(&req.occurred_date)?;
+                let note = reason(&req.note)?;
+                let attempt_no: i64 = tx.query_row(
+                    "SELECT COALESCE(MAX(attempt_no), 0) + 1 FROM delivery_attempts WHERE dispatch_id = ?1",
+                    [id],
+                    |r| r.get(0),
+                )?;
+                tx.execute(
+                    "INSERT INTO delivery_attempts (dispatch_id, attempt_no, status, technical_receipt, detail, occurred_date, at)
+                     VALUES (?1, ?2, 'sent', 'manual', ?3, ?4, ?5)",
+                    params![id, attempt_no, note, date, crate::time::now_utc()],
+                )?;
+                tx.execute(
+                    "UPDATE dispatches SET status = 'sent', sent_at = ?2, version = version + 1 WHERE id = ?1",
+                    params![id, crate::time::now_utc()],
+                )?;
+                audit::record(
+                    tx,
+                    Some(&actor),
+                    Event::new("dispatch.sent", "dispatch", id, super::common::dispatch_activity(tx, id, "sent")?)
+                        .case(d["case_id"].as_i64())
+                        .details(json!({ "method": d["method"], "manual": true, "occurred_date": date, "attempt_no": attempt_no })),
+                )?;
+                dispatch_json(tx, &actor, id)
+            })
         })
         .await?;
     Ok(Json(v))
@@ -814,6 +890,7 @@ async fn retry(State(state): State<AppState>, ctx: Ctx, Path(id): Path<i64>) -> 
             if d["reviewed_at"].is_null() {
                 return Err(review_required());
             }
+            validate_composition(tx, &actor, &d)?;
             tx.execute(
                 "UPDATE dispatches SET status = 'queued', queued_by = ?2, queued_at = ?3, failure_reason = NULL,
                         version = version + 1 WHERE id = ?1",
@@ -831,7 +908,7 @@ async fn retry(State(state): State<AppState>, ctx: Ctx, Path(id): Path<i64>) -> 
     Ok(Json(v))
 }
 
-#[derive(Deserialize)]
+#[derive(Deserialize, Serialize)]
 struct ConfirmReq {
     kind: String, // 'technical_ack' | 'human_handover'
     note: String,
@@ -839,38 +916,40 @@ struct ConfirmReq {
 }
 
 /// Human confirmation of handover/receipt — a separate record from the technical attempt.
-async fn confirm(ctx: Ctx, Path(id): Path<i64>, JsonBody(req): JsonBody<ConfirmReq>) -> JsonResult {
+async fn confirm(ctx: Ctx, Path(id): Path<i64>, IdemKey(key): IdemKey, JsonBody(req): JsonBody<ConfirmReq>) -> JsonResult {
     let actor = ctx.actor;
     let v = ctx
         .db
         .write(move |tx| {
             let d = dispatch_json(tx, &actor, id)?;
             require_dispatch_perm(&actor, &d, perm::DISPATCH_MANAGE)?;
-            if d["status"].as_str() != Some("sent") {
-                return Err(AppError::invalid_transition("Only a sent dispatch can be confirmed."));
-            }
-            if !matches!(req.kind.as_str(), "technical_ack" | "human_handover") {
-                return Err(AppError::validation("Kind must be 'technical_ack' or 'human_handover'."));
-            }
-            let note = required(&req.note, "Note")?;
-            tx.execute(
-                "INSERT INTO delivery_confirmations (dispatch_id, kind, note, occurred_date, recorded_by, recorded_at)
-                 VALUES (?1, ?2, ?3, ?4, ?5, ?6)",
-                params![id, req.kind, note, crate::time::parse_opt_date(req.occurred_date.as_deref())?, actor.user_id, crate::time::now_utc()],
-            )?;
-            let recipient = d["recipient_name"].as_str().unwrap_or_default();
-            let summary = match req.kind.as_str() {
-                "human_handover" => format!("Handover to {recipient} confirmed by a person"),
-                _ => format!("Technical delivery acknowledgement recorded for {recipient}"),
-            };
-            audit::record(
-                tx,
-                Some(&actor),
-                Event::new("dispatch.confirmed", "dispatch", id, summary)
-                    .case(d["case_id"].as_i64())
-                    .details(json!({ "kind": req.kind })),
-            )?;
-            dispatch_json(tx, &actor, id)
+            idempotent(tx, &actor, &key, "dispatch.confirm", &(id, &req), || {
+                if d["status"].as_str() != Some("sent") {
+                    return Err(AppError::invalid_transition("Only a sent dispatch can be confirmed."));
+                }
+                if !matches!(req.kind.as_str(), "technical_ack" | "human_handover") {
+                    return Err(AppError::validation("Kind must be 'technical_ack' or 'human_handover'."));
+                }
+                let note = required(&req.note, "Note")?;
+                tx.execute(
+                    "INSERT INTO delivery_confirmations (dispatch_id, kind, note, occurred_date, recorded_by, recorded_at)
+                     VALUES (?1, ?2, ?3, ?4, ?5, ?6)",
+                    params![id, req.kind, note, crate::time::parse_opt_date(req.occurred_date.as_deref())?, actor.user_id, crate::time::now_utc()],
+                )?;
+                let recipient = d["recipient_name"].as_str().unwrap_or_default();
+                let summary = match req.kind.as_str() {
+                    "human_handover" => format!("Handover to {recipient} confirmed by a person"),
+                    _ => format!("Technical delivery acknowledgement recorded for {recipient}"),
+                };
+                audit::record(
+                    tx,
+                    Some(&actor),
+                    Event::new("dispatch.confirmed", "dispatch", id, summary)
+                        .case(d["case_id"].as_i64())
+                        .details(json!({ "kind": req.kind })),
+                )?;
+                dispatch_json(tx, &actor, id)
+            })
         })
         .await?;
     Ok(Json(v))

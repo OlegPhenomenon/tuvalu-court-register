@@ -69,6 +69,12 @@ Intake events become part of linked case history without rewriting the append-on
 Changing responsibility through case PATCH and importing a named responsible user require staff
 assignment permission and an active user with case-work permissions. Imports cannot grant technical
 administrators case access. Party/participation command retries recheck access before replay.
+Judicial finalisation checks both the reviewed decision row version and exact document version
+inside the write transaction. Draft hearing confirmation likewise checks its reviewed version.
+Unsent invitations are superseded atomically when a hearing changes. Before delivery, the worker
+rechecks the hearing binding and finalised decision-copy binding as well as current access.
+Stale material is retained as terminal `superseded` history and never delivered. Working documents,
+including drafts, carry an explicit DRAFT / working material label in the message and mailbox.
 
 ## Sessions, cookies, CSRF
 

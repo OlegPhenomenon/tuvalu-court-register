@@ -45,6 +45,7 @@ function DecisionForm({ mode, decision, caseId, caseData, onClose, onSaved }: Ca
 }) {
   const docs = useDocumentDetails(`/cases/${caseId}/documents`);
   const hearings = useApi<{ items: Hearing[] }>(mode === 'draft' ? `/cases/${caseId}/hearings` : null);
+  const [commandKey] = useState(newKey);
   const [title, setTitle] = useState(decision?.title ?? '');
   const [date, setDate] = useState(decision?.decision_date ?? '');
   const [versionId, setVersionId] = useState(mode === 'edit' ? String(decision?.document_version_id ?? '') : '');
@@ -70,9 +71,9 @@ function DecisionForm({ mode, decision, caseId, caseData, onClose, onSaved }: Ca
     setBusy(true); setError(null);
     if (reason) setBasis(reason);
     try {
-      if (mode === 'draft') await api('POST', `/cases/${caseId}/decisions`, { title: title.trim(), decision_date: date || null, document_version_id: Number(versionId), hearing_id: hearing ? Number(hearing) : null });
+      if (mode === 'draft') await api('POST', `/cases/${caseId}/decisions`, { title: title.trim(), decision_date: date || null, document_version_id: Number(versionId), hearing_id: hearing ? Number(hearing) : null }, { idempotencyKey: commandKey });
       else if (mode === 'edit') await api('PATCH', `/decisions/${decision!.id}`, attempted);
-      else await api('POST', `/decisions/${decision!.id}/amend`, { title: title.trim(), decision_date: date || null, document_version_id: Number(versionId), amendment_basis: reason ?? basis });
+      else await api('POST', `/decisions/${decision!.id}/amend`, { title: title.trim(), decision_date: date || null, document_version_id: Number(versionId), amendment_basis: reason ?? basis }, { idempotencyKey: commandKey });
       onSaved(); onClose();
     } catch (e) { setError(e); } finally { setBusy(false); }
   };
@@ -103,7 +104,9 @@ function DecisionForm({ mode, decision, caseId, caseData, onClose, onSaved }: Ca
   </>;
 }
 
-function FinaliseForm({ decision, onClose, onSaved }: { decision: Decision; onClose: () => void; onSaved: () => void }) {
+function FinaliseForm({ decision: initialDecision, onClose, onSaved }: { decision: Decision; onClose: () => void; onSaved: () => void }) {
+  const [decision, setDecision] = useState(initialDecision);
+  const [reviewChanged, setReviewChanged] = useState(false);
   const [date, setDate] = useState(decision.decision_date ?? courtToday());
   const [signed, setSigned] = useState(decision.signed_file_uploaded);
   const [key] = useState(newKey);
@@ -112,17 +115,27 @@ function FinaliseForm({ decision, onClose, onSaved }: { decision: Decision; onCl
   const submit = async (e: FormEvent) => {
     e.preventDefault(); if (busy) return;
     setBusy(true); setError(null);
-    try { await api('POST', `/decisions/${decision.id}/finalise`, { decision_date: date, signed_file_uploaded: signed }, { idempotencyKey: key }); onSaved(); onClose(); }
-    catch (err) { setError(err); } finally { setBusy(false); }
+    try { await api('POST', `/decisions/${decision.id}/finalise`, { decision_date: date, signed_file_uploaded: signed, version: decision.version, document_version_id: decision.document_version_id }, { idempotencyKey: key }); onSaved(); onClose(); }
+    catch (err) {
+      setError(err);
+      if (err instanceof ApiError && err.code === 'stale_review') {
+        setReviewChanged(true);
+        onSaved();
+        try { setDecision(await api<Decision>('GET', `/decisions/${decision.id}`)); }
+        catch (reloadError) { setError(reloadError); }
+      }
+    } finally { setBusy(false); }
   };
   return <Modal title={`Finalise ${decision.title}`} open onClose={busy ? () => {} : onClose}>
     <ErrorBanner error={error} />
-    <p>Bound file: <DecisionFile decision={decision} /></p><p>{finalisedNote}</p>
+    {reviewChanged && <p role="alert">The draft changed. Review the reloaded file before finalising.</p>}
+    {reviewChanged && <Button variant="secondary" disabled={busy || decision.status !== 'draft'} onClick={() => { setReviewChanged(false); setError(null); }}>I have reviewed the current draft</Button>}
+    <p>Decision revision {decision.version}. Bound file: <DecisionFile decision={decision} /></p><p>{finalisedNote}</p>
     <p>After finalisation, corrections require a linked amendment.</p>
     <form onSubmit={submit}><fieldset disabled={busy} className="doc-fieldset">
       <DateField label="Decision date" value={date} onChange={setDate} required />
       <CheckboxField label="Signed scan uploaded" checked={signed} onChange={setSigned} help="Confirm only if the bound file already contains the signed scan. This checkbox does not upload or sign a file." />
-      <div className="actions"><Button type="submit" busy={busy}>Finalise decision</Button><Button type="button" variant="secondary" onClick={onClose}>Cancel</Button></div>
+      <div className="actions"><Button type="submit" busy={busy} disabled={reviewChanged || decision.status !== 'draft'}>Finalise decision</Button><Button type="button" variant="secondary" onClick={onClose}>Cancel</Button></div>
     </fieldset></form>
   </Modal>;
 }
@@ -147,6 +160,7 @@ function DecisionsTabContent(props: CaseTabProps) {
   const [form, setForm] = useState<{ mode: 'draft' | 'edit' | 'amend' | 'finalise'; decision?: Decision } | null>(null);
   const closeForm = useCallback(() => setForm(null), []);
   const [withdraw, setWithdraw] = useState<Decision | null>(null);
+  const [withdrawKey, setWithdrawKey] = useState(newKey);
   const [busy, setBusy] = useState(false);
   const [error, setError] = useState<unknown>(null);
   const changed = () => { decisions.reload(); reload(); };
@@ -156,7 +170,7 @@ function DecisionsTabContent(props: CaseTabProps) {
   const withdrawDraft = async (reason: string) => {
     if (!withdraw || busy) return;
     setBusy(true); setError(null);
-    try { await api('POST', `/decisions/${withdraw.id}/withdraw`, { reason }); setWithdraw(null); changed(); }
+    try { await api('POST', `/decisions/${withdraw.id}/withdraw`, { reason }, { idempotencyKey: withdrawKey }); setWithdraw(null); changed(); }
     catch (e) { setError(e); } finally { setBusy(false); }
   };
   const items = decisions.data?.items ?? [];
@@ -167,7 +181,7 @@ function DecisionsTabContent(props: CaseTabProps) {
       {!decisions.loading && !decisions.error && items.length === 0 && <p className="muted">No decisions on this case yet.</p>}
     </Card>
     {items.map((d) => <div id={`decision-${d.id}`} key={d.id}><Card title={<>{d.title} <StatusBadge status={d.status} /></>} actions={<>
-      {d.status === 'draft' && canDraft && <><Button variant="secondary" onClick={() => setForm({ mode: 'edit', decision: d })}>Edit draft</Button><Button variant="secondary" onClick={() => { setError(null); setWithdraw(d); }}>Withdraw draft</Button></>}
+      {d.status === 'draft' && canDraft && <><Button variant="secondary" onClick={() => setForm({ mode: 'edit', decision: d })}>Edit draft</Button><Button variant="secondary" onClick={() => { setError(null); setWithdrawKey(newKey()); setWithdraw(d); }}>Withdraw draft</Button></>}
       {d.status === 'draft' && canFinalise && <Button onClick={() => setForm({ mode: 'finalise', decision: d })}>Finalise</Button>}
       {d.status === 'finalised' && canFinalise && <Button variant="secondary" onClick={() => setForm({ mode: 'amend', decision: d })}>Amend finalised</Button>}
     </>}>

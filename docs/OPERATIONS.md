@@ -107,6 +107,12 @@ sudo systemctl restart tuvalu-court
 Schema migrations run automatically at startup (`PRAGMA user_version`), both
 for the production database and for any existing demo sandboxes on first touch.
 
+Migration 0007 preserves dispatch ids, items, attempts, confirmations and mailbox history while
+adding terminal `superseded` and reviewed hearing/material bindings. Pending legacy working material
+is labelled DRAFT / working material and its old review is cleared. Legacy invitations without a
+provable hearing binding are superseded when processed; prepare a new notice and preview it.
+Sent history is unchanged. A superseded item cannot be retried: prepare and review a fresh message.
+
 ## 4. Backup and restore
 
 ```sh

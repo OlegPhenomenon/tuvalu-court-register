@@ -136,7 +136,7 @@ async fn calendar(ctx: Ctx, Query(q): Query<CalendarQuery>) -> JsonResult {
             let sql = format!(
                 "SELECT h.id FROM hearings h
                  WHERE {vis}
-                   AND (?1 IS NULL OR h.starts_at >= ?1) AND (?2 IS NULL OR h.starts_at < ?2)
+                   AND (?1 IS NULL OR h.ends_at > ?1) AND (?2 IS NULL OR h.starts_at < ?2)
                    AND (?3 IS NULL OR h.judge_user_id = ?3) AND (?4 IS NULL OR h.room_id = ?4)
                    AND (?5 IS NULL OR h.case_id = ?5)
                  ORDER BY h.starts_at, h.id",
@@ -621,6 +621,7 @@ async fn update(ctx: Ctx, Path(id): Path<i64>, JsonBody(req): JsonBody<UpdateReq
                 .case(Some(case_id))
                 .details(json!({ "before": h })),
             )?;
+            super::dispatch::supersede_hearing_notices(tx, &actor, id)?;
             hearing_json(tx, id)
         })
         .await?;
@@ -631,6 +632,7 @@ async fn update(ctx: Ctx, Path(id): Path<i64>, JsonBody(req): JsonBody<UpdateReq
 
 #[derive(Deserialize)]
 struct ConfirmReq {
+    version: i64,
     override_reason: Option<String>,
 }
 
@@ -643,6 +645,9 @@ async fn confirm(ctx: Ctx, Path(id): Path<i64>, JsonBody(req): JsonBody<ConfirmR
             actor.require(perm::HEARING_SCHEDULE)?;
             if h["status"].as_str() != Some("draft") {
                 return Err(AppError::invalid_transition("Only a draft hearing can be confirmed."));
+            }
+            if h["version"].as_i64() != Some(req.version) {
+                return Err(AppError::version_conflict(h));
             }
             let case_id = h["case_id"].as_i64().unwrap_or_default();
             require_open_case(tx, &actor, case_id)?;
@@ -685,6 +690,7 @@ async fn confirm(ctx: Ctx, Path(id): Path<i64>, JsonBody(req): JsonBody<ConfirmR
                 Some(&actor),
                 Event::new("hearing.confirmed", "hearing", id, format!("Hearing on {when} confirmed")).case(h["case_id"].as_i64()),
             )?;
+            super::dispatch::supersede_hearing_notices(tx, &actor, id)?;
             hearing_json(tx, id)
         })
         .await?;
@@ -778,6 +784,7 @@ async fn adjourn(ctx: Ctx, Path(id): Path<i64>, IdemKey(key): IdemKey, JsonBody(
                         .case(Some(case_id))
                         .details(json!({ "reason": why, "authorised_by": authorised, "new_hearing_id": new_id, "tasks": made.iter().map(|t| t["id"].clone()).collect::<Vec<_>>() })),
                 )?;
+                super::dispatch::supersede_hearing_notices(tx, &actor, id)?;
                 Ok(json!({ "old": hearing_json(tx, id)?, "new": hearing_json(tx, new_id)?, "tasks": made }))
             })
         })
@@ -821,6 +828,7 @@ async fn cancel(ctx: Ctx, Path(id): Path<i64>, JsonBody(req): JsonBody<ReasonReq
                 .case(h["case_id"].as_i64())
                 .details(json!({ "reason": why })),
             )?;
+            super::dispatch::supersede_hearing_notices(tx, &actor, id)?;
             hearing_json(tx, id)
         })
         .await?;
@@ -829,20 +837,20 @@ async fn cancel(ctx: Ctx, Path(id): Path<i64>, JsonBody(req): JsonBody<ReasonReq
 
 // ------------------------------------------------------------------ outcome & correction
 
-#[derive(Deserialize)]
+#[derive(Deserialize, Serialize)]
 struct Attendance {
     participant_id: i64,
     attended: bool,
 }
 
-#[derive(Deserialize)]
+#[derive(Deserialize, Serialize)]
 struct NextTaskIn {
     title: String,
     assignee_user_id: Option<i64>,
     due_date: Option<String>,
 }
 
-#[derive(Deserialize)]
+#[derive(Deserialize, Serialize)]
 struct NextHearingIn {
     starts_local: String,
     ends_local: String,
@@ -851,7 +859,7 @@ struct NextHearingIn {
     override_reason: Option<String>,
 }
 
-#[derive(Deserialize)]
+#[derive(Deserialize, Serialize)]
 struct OutcomeReq {
     held: bool,
     reason: Option<String>,
@@ -870,6 +878,7 @@ async fn outcome(
     ctx: Ctx,
     State(state): State<AppState>,
     Path(id): Path<i64>,
+    IdemKey(key): IdemKey,
     JsonBody(req): JsonBody<OutcomeReq>,
 ) -> JsonResult {
     let demo = state.is_demo();
@@ -879,123 +888,126 @@ async fn outcome(
         .write(move |tx| {
             let h = require_hearing(tx, &actor, id)?;
             actor.require(perm::HEARING_RECORD_OUTCOME)?;
-            if h["status"].as_str() != Some("scheduled") {
-                return Err(AppError::invalid_transition(
-                    "Only a scheduled hearing can have an outcome recorded.",
-                ));
-            }
-            let now = crate::time::now_utc();
-            let future = h["starts_at"].as_str().unwrap_or_default() > now.as_str();
-            if future && !demo {
-                return Err(AppError::invalid_transition("The hearing has not taken place yet."));
-            }
-            let case_id = h["case_id"].as_i64().unwrap_or_default();
-            let when = human_local(h["starts_at"].as_str().unwrap_or_default());
-            if req.held {
-                let summary = required(req.outcome_summary.as_deref().unwrap_or(""), "Outcome summary")?;
-                tx.execute(
-                    "UPDATE hearings SET status = 'held', outcome_summary = ?2, next_step = ?3,
-                            outcome_recorded_by = ?4, outcome_recorded_at = ?5, version = version + 1
-                     WHERE id = ?1",
-                    params![id, summary, optional(&req.next_step), actor.user_id, now],
-                )?;
-            } else {
-                let why = reason(&req.reason)?;
-                tx.execute(
-                    "UPDATE hearings SET status = 'cancelled', status_reason = ?2, outcome_summary = ?3, next_step = ?4,
-                            outcome_recorded_by = ?5, outcome_recorded_at = ?6, version = version + 1
-                     WHERE id = ?1",
-                    params![
+            idempotent(tx, &actor, &key, "hearing.outcome", &(id, &req), || {
+                if h["status"].as_str() != Some("scheduled") {
+                    return Err(AppError::invalid_transition(
+                        "Only a scheduled hearing can have an outcome recorded.",
+                    ));
+                }
+                let now = crate::time::now_utc();
+                let future = h["starts_at"].as_str().unwrap_or_default() > now.as_str();
+                if future && !demo {
+                    return Err(AppError::invalid_transition("The hearing has not taken place yet."));
+                }
+                let case_id = h["case_id"].as_i64().unwrap_or_default();
+                let when = human_local(h["starts_at"].as_str().unwrap_or_default());
+                if req.held {
+                    let summary = required(req.outcome_summary.as_deref().unwrap_or(""), "Outcome summary")?;
+                    tx.execute(
+                        "UPDATE hearings SET status = 'held', outcome_summary = ?2, next_step = ?3,
+                                outcome_recorded_by = ?4, outcome_recorded_at = ?5, version = version + 1
+                         WHERE id = ?1",
+                        params![id, summary, optional(&req.next_step), actor.user_id, now],
+                    )?;
+                } else {
+                    let why = reason(&req.reason)?;
+                    tx.execute(
+                        "UPDATE hearings SET status = 'cancelled', status_reason = ?2, outcome_summary = ?3, next_step = ?4,
+                                outcome_recorded_by = ?5, outcome_recorded_at = ?6, version = version + 1
+                         WHERE id = ?1",
+                        params![
+                            id,
+                            why,
+                            optional(&req.outcome_summary),
+                            optional(&req.next_step),
+                            actor.user_id,
+                            now
+                        ],
+                    )?;
+                }
+                for a in &req.attendance {
+                    let n = tx.execute(
+                        "UPDATE hearing_participants SET attended = ?3 WHERE id = ?1 AND hearing_id = ?2",
+                        params![a.participant_id, id, a.attended as i64],
+                    )?;
+                    if n == 0 {
+                        return Err(AppError::validation("A participant id does not belong to this hearing."));
+                    }
+                }
+                let mut task_v = Value::Null;
+                if let Some(nt) = &req.next_task {
+                    let tid = tasks::insert_task(
+                        tx,
+                        &actor,
+                        &NewTask {
+                            case_id: Some(case_id),
+                            intake_id: None,
+                            hearing_id: Some(id),
+                            kind: "follow_up".into(),
+                            title: nt.title.clone(),
+                            description: None,
+                            assignee_user_id: nt.assignee_user_id,
+                            due_date: nt.due_date.clone(),
+                        },
+                    )?;
+                    task_v = tasks::task_json(tx, tid)?;
+                }
+                let mut next_v = Value::Null;
+                if let Some(nh) = &req.next_hearing {
+                    // A continuation of the same case: type/room/judge/participants carry over by default.
+                    let htype = nh
+                        .hearing_type
+                        .clone()
+                        .unwrap_or_else(|| h["hearing_type"].as_str().unwrap_or_default().to_string());
+                    let slot = prepare_slot(
+                        tx,
+                        case_id,
+                        &htype,
+                        &nh.starts_local,
+                        &nh.ends_local,
+                        nh.room_id.or(h["room_id"].as_i64()),
+                        None,
+                        h["judge_user_id"].as_i64(),
+                    )?;
+                    let scheduled = actor.has(perm::HEARING_SCHEDULE);
+                    let over = if scheduled { conflict_gate(tx, &actor, None, &slot, optional(&nh.override_reason))? } else { None };
+                    let nid = insert_hearing(tx, &actor, case_id, &slot, if scheduled { "scheduled" } else { "draft" }, Some(id), over.as_deref(), None)?;
+                    if let Some(r) = &over {
+                        audit::record(tx, Some(&actor), Event::new("hearing.conflict_override", "hearing", nid,
+                            format!("Conflict overridden for the hearing on {}", human_local(&slot.starts_at)))
+                            .case(Some(case_id)).details(json!({"reason": r})))?;
+                    }
+                    copy_participants(tx, id, nid)?;
+                    next_v = hearing_json(tx, nid)?;
+                }
+                audit::record(
+                    tx,
+                    Some(&actor),
+                    Event::new(
+                        "hearing.outcome_recorded",
+                        "hearing",
                         id,
-                        why,
-                        optional(&req.outcome_summary),
-                        optional(&req.next_step),
-                        actor.user_id,
-                        now
-                    ],
+                        if req.held {
+                            format!("Hearing on {when} held — outcome recorded")
+                        } else {
+                            format!("Hearing on {when} did not take place")
+                        },
+                    )
+                    .case(Some(case_id))
+                    .details(
+                        json!({ "held": req.held, "reason": optional(&req.reason), "task_id": task_v["id"], "next_hearing_id": next_v["id"] }),
+                    ),
                 )?;
-            }
-            for a in &req.attendance {
-                let n = tx.execute(
-                    "UPDATE hearing_participants SET attended = ?3 WHERE id = ?1 AND hearing_id = ?2",
-                    params![a.participant_id, id, a.attended as i64],
-                )?;
-                if n == 0 {
-                    return Err(AppError::validation("A participant id does not belong to this hearing."));
+                super::dispatch::supersede_hearing_notices(tx, &actor, id)?;
+                let mut out = json!({ "hearing": hearing_json(tx, id)?, "task": task_v, "next_hearing": next_v });
+                if out["next_hearing"]["status"] == "draft" {
+                    out["next_hearing_note"] = json!("Next hearing saved as a draft for a scheduler to confirm.");
                 }
-            }
-            let mut task_v = Value::Null;
-            if let Some(nt) = &req.next_task {
-                let tid = tasks::insert_task(
-                    tx,
-                    &actor,
-                    &NewTask {
-                        case_id: Some(case_id),
-                        intake_id: None,
-                        hearing_id: Some(id),
-                        kind: "follow_up".into(),
-                        title: nt.title.clone(),
-                        description: None,
-                        assignee_user_id: nt.assignee_user_id,
-                        due_date: nt.due_date.clone(),
-                    },
-                )?;
-                task_v = tasks::task_json(tx, tid)?;
-            }
-            let mut next_v = Value::Null;
-            if let Some(nh) = &req.next_hearing {
-                // A continuation of the same case: type/room/judge/participants carry over by default.
-                let htype = nh
-                    .hearing_type
-                    .clone()
-                    .unwrap_or_else(|| h["hearing_type"].as_str().unwrap_or_default().to_string());
-                let slot = prepare_slot(
-                    tx,
-                    case_id,
-                    &htype,
-                    &nh.starts_local,
-                    &nh.ends_local,
-                    nh.room_id.or(h["room_id"].as_i64()),
-                    None,
-                    h["judge_user_id"].as_i64(),
-                )?;
-                let scheduled = actor.has(perm::HEARING_SCHEDULE);
-                let over = if scheduled { conflict_gate(tx, &actor, None, &slot, optional(&nh.override_reason))? } else { None };
-                let nid = insert_hearing(tx, &actor, case_id, &slot, if scheduled { "scheduled" } else { "draft" }, Some(id), over.as_deref(), None)?;
-                if let Some(r) = &over {
-                    audit::record(tx, Some(&actor), Event::new("hearing.conflict_override", "hearing", nid,
-                        format!("Conflict overridden for the hearing on {}", human_local(&slot.starts_at)))
-                        .case(Some(case_id)).details(json!({"reason": r})))?;
+                if future && demo {
+                    out["demo_note"] = json!("Recorded ahead of the hearing time (demo only)");
                 }
-                copy_participants(tx, id, nid)?;
-                next_v = hearing_json(tx, nid)?;
-            }
-            audit::record(
-                tx,
-                Some(&actor),
-                Event::new(
-                    "hearing.outcome_recorded",
-                    "hearing",
-                    id,
-                    if req.held {
-                        format!("Hearing on {when} held — outcome recorded")
-                    } else {
-                        format!("Hearing on {when} did not take place")
-                    },
-                )
-                .case(Some(case_id))
-                .details(
-                    json!({ "held": req.held, "reason": optional(&req.reason), "task_id": task_v["id"], "next_hearing_id": next_v["id"] }),
-                ),
-            )?;
-            let mut out = json!({ "hearing": hearing_json(tx, id)?, "task": task_v, "next_hearing": next_v });
-            if out["next_hearing"]["status"] == "draft" {
-                out["next_hearing_note"] = json!("Next hearing saved as a draft for a scheduler to confirm.");
-            }
-            if future && demo {
-                out["demo_note"] = json!("Recorded ahead of the hearing time (demo only)");
-            }
-            Ok(out)
+                Ok(out)
+            })
         })
         .await?;
     Ok(Json(v))
@@ -1056,6 +1068,7 @@ async fn correct(ctx: Ctx, Path(id): Path<i64>, JsonBody(req): JsonBody<CorrectR
                 .case(h["case_id"].as_i64())
                 .details(json!({ "before": h, "reason": why })),
             )?;
+            super::dispatch::supersede_hearing_notices(tx, &actor, id)?;
             hearing_json(tx, id)
         })
         .await?;

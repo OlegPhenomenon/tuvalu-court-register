@@ -80,7 +80,7 @@ async fn decision_finalisation_amendment_and_replay_are_atomic() {
     assert_eq!(d["document_version_id"], vid);
     assert_eq!(d["signed_file_uploaded"], false);
     let path = format!("/api/decisions/{id}/finalise");
-    let body = json!({"decision_date":today(),"signed_file_uploaded":true});
+    let body = json!({"decision_date":today(),"signed_file_uploaded":true,"version":d["version"],"document_version_id":d["document_version_id"]});
     denied(
         &olga,
         &path,
@@ -120,14 +120,14 @@ async fn decision_finalisation_amendment_and_replay_are_atomic() {
         .post_idem(
             &path,
             "finalise-original",
-            json!({"decision_date":"2026-01-01"}),
+            json!({"decision_date":"2026-01-01","version":d["version"],"document_version_id":d["document_version_id"]}),
         )
         .await;
     err(s, &b, StatusCode::CONFLICT, "idempotency_mismatch");
     denied(
         &viktor,
         &path,
-        json!({"decision_date":today()}),
+        json!({"decision_date":today(),"version":d["version"],"document_version_id":d["document_version_id"]}),
         StatusCode::CONFLICT,
         "invalid_transition",
     )
@@ -191,7 +191,7 @@ async fn decision_finalisation_amendment_and_replay_are_atomic() {
     posted(
         &viktor,
         &format!("/api/decisions/{new_id}/finalise"),
-        json!({"decision_date":today()}),
+        json!({"decision_date":today(),"version":amended["version"],"document_version_id":amended["document_version_id"]}),
     )
     .await;
     let old = fetched(&viktor, &format!("/api/decisions/{id}")).await;
@@ -201,7 +201,7 @@ async fn decision_finalisation_amendment_and_replay_are_atomic() {
     denied(
         &viktor,
         &format!("/api/decisions/{}/finalise", sibling["id"]),
-        json!({"decision_date":today()}),
+        json!({"decision_date":today(),"version":sibling["version"],"document_version_id":sibling["document_version_id"]}),
         StatusCode::CONFLICT,
         "invalid_transition",
     )
@@ -292,7 +292,7 @@ async fn decision_edits_withdrawal_and_close_blockers() {
     denied(
         &viktor,
         &format!("/api/decisions/{id}/finalise"),
-        json!({"decision_date":today()}),
+        json!({"decision_date":today(),"version":d["version"],"document_version_id":d["document_version_id"]}),
         StatusCode::CONFLICT,
         "invalid_transition",
     )
@@ -401,7 +401,7 @@ async fn decision_scope_and_document_checks() {
     denied(
         &viktor,
         &format!("/api/decisions/{id}/finalise"),
-        json!({"decision_date":today()}),
+        json!({"decision_date":today(),"version":d["version"],"document_version_id":d["document_version_id"]}),
         StatusCode::BAD_REQUEST,
         "validation",
     )
@@ -414,7 +414,7 @@ async fn decision_scope_and_document_checks() {
     denied(
         &viktor,
         &format!("/api/decisions/{id}/finalise"),
-        json!({"decision_date":today()}),
+        json!({"decision_date":today(),"version":d["version"],"document_version_id":d["document_version_id"]}),
         StatusCode::NOT_FOUND,
         "not_found",
     )
@@ -1298,7 +1298,7 @@ async fn concurrent_finalisation_queue_and_workers_do_not_duplicate_history() {
     let d = draft(&viktor, cid, vid).await;
     let id = d["id"].as_i64().unwrap();
     let path = format!("/api/decisions/{id}/finalise");
-    let body = json!({"decision_date":today()});
+    let body = json!({"decision_date":today(),"version":d["version"],"document_version_id":d["document_version_id"]});
     let (a, b) = tokio::join!(
         viktor.post_idem(&path, "concurrent-finalise", body.clone()),
         viktor.post_idem(&path, "concurrent-finalise", body.clone())
@@ -1393,7 +1393,7 @@ async fn decisions_reject_notes_and_hide_every_mutation_after_assignment_ends() 
     posted(
         &viktor,
         &format!("/api/decisions/{id}/finalise"),
-        json!({"decision_date":today()}),
+        json!({"decision_date":today(),"version":d["version"],"document_version_id":d["document_version_id"]}),
     )
     .await;
     for vid in notes {
@@ -1414,7 +1414,7 @@ async fn decisions_reject_notes_and_hide_every_mutation_after_assignment_ends() 
         )
         .unwrap();
     for (action, body) in [
-        ("finalise", json!({"decision_date":today()})),
+        ("finalise", json!({"decision_date":today(),"version":d["version"],"document_version_id":d["document_version_id"]})),
         ("withdraw", json!({"reason":"Withdraw"})),
         (
             "amend",
@@ -1539,7 +1539,8 @@ async fn restricted_dispatch_and_mailbox_inventory_is_redacted_and_patch_keeps_c
         .await;
     ok(s, &b);
     let body = b["body"].as_str().unwrap();
-    assert!(body.starts_with("Custom letter."));
+    assert!(body.starts_with("DRAFT / working material"));
+    assert!(body.contains("Custom letter."));
     assert!(body.contains("Public evidence (version 1, Public_evidence.pdf)"));
     assert!(!body.contains("Confidential medical file"));
 }

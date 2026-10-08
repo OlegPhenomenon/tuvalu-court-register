@@ -82,7 +82,15 @@ function tone(status: string): string {
   }
 }
 
-function Chip({ h }: { h: Hearing }) {
+function dayTime(h: Hearing, day: string): string {
+  const continued = h.starts_local < `${day}T00:00`;
+  const continues = h.ends_local > `${addDays(day, 1)}T00:00`;
+  const start = continued ? '00:00' : h.starts_local.slice(11, 16);
+  const end = h.ends_local >= `${addDays(day, 1)}T00:00` ? '24:00' : h.ends_local.slice(11, 16);
+  return `${start} – ${end}${continued ? ' (continued)' : ''}${continues ? ' (continues)' : ''}`;
+}
+
+function Chip({ h, day }: { h: Hearing; day: string }) {
   const dead = h.status === 'adjourned' || h.status === 'cancelled';
   return (
     <Link
@@ -90,7 +98,7 @@ function Chip({ h }: { h: Hearing }) {
       to={`/cases/${h.case_id}?tab=hearings&hearing=${h.id}`}
       title={`${h.hearing_type_label} — ${hearingTimeRange(h)}${h.judge_name ? `, ${h.judge_name}` : ''}`}
     >
-      <span className="cal-chip-time">{h.starts_local.slice(11, 16)}</span>{' '}
+      <span className="cal-chip-time">{dayTime(h, day)}</span>{' '}
       <span className="cal-chip-case">{h.case_number}</span>
       {h.room_name && <span className="cal-chip-room"> {h.room_name}</span>}
     </Link>
@@ -115,14 +123,11 @@ export default function Calendar() {
   const items = data?.items ?? [];
   const byDay = useMemo(() => {
     const map = new Map<string, Hearing[]>();
-    for (const h of items) {
-      const day = h.starts_local.slice(0, 10);
-      const list = map.get(day) ?? [];
-      list.push(h);
-      map.set(day, list);
+    for (const day of days) {
+      map.set(day, items.filter((h) => h.starts_local < `${addDays(day, 1)}T00:00` && h.ends_local > `${day}T00:00`));
     }
     return map;
-  }, [items]);
+  }, [items, from, to]);
 
   const today = courtToday();
   const step = (n: number) =>
@@ -211,7 +216,7 @@ export default function Calendar() {
                   return (
                     <tr key={h.id} className={dead ? 'cal-row--dead' : undefined}>
                       <td>
-                        {h.starts_local.slice(11, 16)} – {h.ends_local.slice(11, 16)}
+                        {dayTime(h, date)}
                       </td>
                       <td>
                         <Link to={`/cases/${h.case_id}?tab=hearings`}>{h.case_number}</Link>
@@ -240,7 +245,7 @@ export default function Calendar() {
                 <h3 className="cal-day-head">
                   {WDAYS[weekday(d)]} <span className="cal-daynum">{fmtDate(d)}</span>
                 </h3>
-                {(byDay.get(d) ?? []).map((h) => <Chip key={h.id} h={h} />)}
+                {(byDay.get(d) ?? []).map((h) => <Chip key={h.id} h={h} day={d} />)}
               </section>
             ))}
           </div>
@@ -258,7 +263,7 @@ export default function Calendar() {
                   className={`cal-cell${d.slice(0, 7) !== date.slice(0, 7) ? ' cal-cell--other' : ''}${d === today ? ' cal-day--today' : ''}`}
                 >
                   <span className="cal-daynum">{dayNum(d)}</span>
-                  {(byDay.get(d) ?? []).map((h) => <Chip key={h.id} h={h} />)}
+                  {(byDay.get(d) ?? []).map((h) => <Chip key={h.id} h={h} day={d} />)}
                 </div>
               ))}
             </div>
@@ -290,7 +295,7 @@ export default function Calendar() {
               {printItems.map((h) => (
                 <tr key={h.id}>
                   <td>
-                    {h.starts_local.slice(11, 16)} – {h.ends_local.slice(11, 16)}
+                    {dayTime(h, date)}
                   </td>
                   <td>{h.case_number}</td>
                   <td>{h.hearing_type_label}</td>

@@ -43,8 +43,9 @@ fn attachments(conn: &Connection, actor: &Actor, d: &Dispatch) -> AppResult<Vec<
     } else {
         return Err(AppError::not_found());
     }
+    crate::api::dispatch::require_current_material(conn, actor, d.id)?;
     let mut stmt = conn.prepare(
-        "SELECT v.id, v.document_id, v.filename, v.sha256, v.size_bytes, v.scan_status, doc.doc_type
+        "SELECT v.id, v.document_id, v.filename, v.sha256, v.size_bytes, v.scan_status, doc.doc_type, di.material_kind
          FROM dispatch_items di JOIN document_versions v ON v.id = di.document_version_id
          JOIN documents doc ON doc.id = v.document_id WHERE di.dispatch_id = ?1 ORDER BY di.id",
     )?;
@@ -57,11 +58,12 @@ fn attachments(conn: &Connection, actor: &Actor, d: &Dispatch) -> AppResult<Vec<
             r.get::<_, i64>(4)?,
             r.get::<_, String>(5)?,
             r.get::<_, String>(6)?,
+            r.get::<_, String>(7)?,
         ))
     })?;
     let mut out = Vec::new();
     for row in rows {
-        let (version_id, doc_id, filename, sha256, size_bytes, scan, doc_type) = row?;
+        let (version_id, doc_id, filename, sha256, size_bytes, scan, doc_type, material_kind) = row?;
         let doc = policy::require_document(conn, actor, doc_id)?;
         let belongs = match d.case_id {
             Some(cid) => doc.case_id == Some(cid),
@@ -74,7 +76,7 @@ fn attachments(conn: &Connection, actor: &Actor, d: &Dispatch) -> AppResult<Vec<
         {
             return Err(AppError::validation(CHANGED));
         }
-        out.push(json!({"filename": filename, "sha256": sha256, "size_bytes": size_bytes, "document_version_id": version_id}));
+        out.push(json!({"filename": filename, "sha256": sha256, "size_bytes": size_bytes, "document_version_id": version_id, "material_kind": material_kind}));
     }
     Ok(out)
 }
@@ -135,6 +137,11 @@ pub fn process(db: &Db) -> AppResult<usize> {
                 Some(uid) => auth::load_actor(tx, uid, None)?,
                 None => None,
             };
+            if let Some(why) = crate::api::dispatch::stale_reason(tx, id)? {
+                let attribution = audit_actor(tx, d.queued_by, &actor)?;
+                crate::api::dispatch::supersede(tx, attribution.as_ref(), id, why)?;
+                return Ok(1);
+            }
             let checked = match &actor {
                 Some(a) => attachments(tx, a, &d),
                 None => Err(AppError::forbidden(CHANGED)),

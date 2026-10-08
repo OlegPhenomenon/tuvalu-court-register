@@ -155,7 +155,7 @@ async fn draft_patch_confirm_and_boundary() {
     err(s, &b, StatusCode::CONFLICT, "version_conflict");
 
     // Confirm → scheduled.
-    let (s, b) = olga.post(&format!("/api/hearings/{hid}/confirm"), json!({})).await;
+    let (s, b) = olga.post(&format!("/api/hearings/{hid}/confirm"), json!({"version":v+1})).await;
     ok(s, &b);
     assert_eq!(b["status"], "scheduled");
     // A confirmed hearing can no longer be edited.
@@ -255,8 +255,8 @@ async fn concurrent_confirmation_lets_one_win() {
     let c1 = olga.clone();
     let c2 = olga.clone();
     let (r1, r2) = (
-        tokio::spawn(async move { c1.post(&format!("/api/hearings/{id1}/confirm"), json!({})).await }),
-        tokio::spawn(async move { c2.post(&format!("/api/hearings/{id2}/confirm"), json!({})).await }),
+        tokio::spawn(async move { c1.post(&format!("/api/hearings/{id1}/confirm"), json!({"version":1})).await }),
+        tokio::spawn(async move { c2.post(&format!("/api/hearings/{id2}/confirm"), json!({"version":1})).await }),
     );
     let (s1, b1) = r1.await.unwrap();
     let (s2, b2) = r2.await.unwrap();
@@ -762,7 +762,7 @@ async fn room_only_conflicts_and_buffer_on_both_sides() {
         .unwrap();
     for (start, end) in [("2026-11-17T08:00", "2026-11-17T08:46"), ("2026-11-17T10:14", "2026-11-17T11:00")] {
         let h = draft(&olga, cid2, start, end, room).await;
-        let (s, b) = olga.post(&format!("/api/hearings/{}/confirm", h["id"]), json!({})).await;
+        let (s, b) = olga.post(&format!("/api/hearings/{}/confirm", h["id"]), json!({"version":1})).await;
         err(s, &b, StatusCode::CONFLICT, "hearing_conflict");
         assert_eq!(b["error"]["details"]["conflicts"][0]["hearing_id"], original["id"]);
     }
@@ -826,7 +826,7 @@ async fn hearing_validation_and_draft_cancellation() {
     assert_eq!(cancelled["status"], "cancelled");
     assert_eq!(cancelled["starts_at"], h["starts_at"]);
     assert_eq!(cancelled["participants"], h["participants"]);
-    let (s, b) = olga.post(&format!("/api/hearings/{id}/confirm"), json!({})).await;
+    let (s, b) = olga.post(&format!("/api/hearings/{id}/confirm"), json!({"version":1})).await;
     err(s, &b, StatusCode::CONFLICT, "invalid_transition");
     let (s, b) = olga.post(&format!("/api/hearings/{id}/cancel"), json!({"reason": "Again"})).await;
     err(s, &b, StatusCode::CONFLICT, "invalid_transition");
@@ -1033,7 +1033,7 @@ async fn hearing_permissions_unassigned_users_and_sandboxes() {
         err(s, &b, StatusCode::NOT_FOUND, "not_found");
     }
     let actions = [
-        ("confirm", json!({})),
+        ("confirm", json!({"version":1})),
         ("cancel", json!({"reason": "x"})),
         (
             "adjourn",
@@ -1093,7 +1093,7 @@ async fn confirm_rechecks_judge_assignment_and_override_is_audited() {
         rusqlite::params![tuvalu_court::time::now_utc(), cid],
     )
     .unwrap();
-    let (s, b) = olga.post(&format!("/api/hearings/{id}/confirm"), json!({})).await;
+    let (s, b) = olga.post(&format!("/api/hearings/{id}/confirm"), json!({"version":1})).await;
     err(s, &b, StatusCode::BAD_REQUEST, "validation");
     let elena = olga.switch("elena").await;
     let (s, b) = elena
@@ -1105,16 +1105,16 @@ async fn confirm_rechecks_judge_assignment_and_override_is_audited() {
     ok(s, &b);
     scheduled(&olga, cid, "2026-11-17T09:15", "2026-11-17T10:15", room).await;
     let (s, b) = olga
-        .post(&format!("/api/hearings/{id}/confirm"), json!({"override_reason": " "}))
+        .post(&format!("/api/hearings/{id}/confirm"), json!({"version":1,"override_reason": " "}))
         .await;
     err(s, &b, StatusCode::CONFLICT, "hearing_conflict");
     let (s, b) = olga
-        .post(&format!("/api/hearings/{id}/confirm"), json!({"override_reason": "Urgent hearing"}))
+        .post(&format!("/api/hearings/{id}/confirm"), json!({"version":1,"override_reason": "Urgent hearing"}))
         .await;
     err(s, &b, StatusCode::FORBIDDEN, "forbidden");
     grant_perm(&elena, &app, "Elena", "hearing.schedule").await;
     let (s, b) = elena
-        .post(&format!("/api/hearings/{id}/confirm"), json!({"override_reason": "Urgent hearing"}))
+        .post(&format!("/api/hearings/{id}/confirm"), json!({"version":1,"override_reason": "Urgent hearing"}))
         .await;
     ok(s, &b);
     assert_eq!(b["conflict_override"], 1);
@@ -1127,7 +1127,7 @@ async fn confirm_rechecks_judge_assignment_and_override_is_audited() {
         .unwrap();
     let details: Value = serde_json::from_str(&details).unwrap();
     assert_eq!(details["reason"], "Urgent hearing");
-    let (s, b) = elena.post(&format!("/api/hearings/{id}/confirm"), json!({})).await;
+    let (s, b) = elena.post(&format!("/api/hearings/{id}/confirm"), json!({"version":1})).await;
     err(s, &b, StatusCode::CONFLICT, "invalid_transition");
 
     // A judge assigned after draft creation is resolved and persisted on confirmation.
@@ -1145,7 +1145,7 @@ async fn confirm_rechecks_judge_assignment_and_override_is_audited() {
         )
         .await;
     ok(s, &b);
-    let (s, b) = olga.post(&format!("/api/hearings/{}/confirm", later["id"]), json!({})).await;
+    let (s, b) = olga.post(&format!("/api/hearings/{}/confirm", later["id"]), json!({"version":1})).await;
     ok(s, &b);
     assert_eq!(b["judge_user_id"], judge);
 }
@@ -1459,7 +1459,7 @@ async fn continuation_requires_scheduler_confirmation_and_scheduled_outcome_chec
     assert_eq!(b["next_hearing"]["status"], "draft");
     let nid = b["next_hearing"]["id"].as_i64().unwrap();
     let (s, b) = olga
-        .post(&format!("/api/hearings/{nid}/confirm"), json!({}))
+        .post(&format!("/api/hearings/{nid}/confirm"), json!({"version":1}))
         .await;
     err(s, &b, StatusCode::CONFLICT, "hearing_conflict");
     let (s, b) = olga
@@ -1470,7 +1470,7 @@ async fn continuation_requires_scheduler_confirmation_and_scheduled_outcome_chec
         .await;
     ok(s, &b);
     let (s, b) = olga
-        .post(&format!("/api/hearings/{nid}/confirm"), json!({}))
+        .post(&format!("/api/hearings/{nid}/confirm"), json!({"version":1}))
         .await;
     ok(s, &b);
     assert_eq!(b["status"], "scheduled");
