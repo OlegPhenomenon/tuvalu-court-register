@@ -1,0 +1,214 @@
+/* Dispatch / Mailbox / History screens (FE-C). Reuses the global tokens and
+   classes; anything dispatch-specific lives here. */
+
+/* ---------- DispatchCard ---------- */
+
+.dispatch-headline {
+  font-size: 1.05rem;
+  font-weight: 600;
+  margin: 0 0 0.75rem;
+}
+
+.dispatch-grid {
+  display: grid;
+  grid-template-columns: 1fr 1fr;
+  gap: 0.75rem 1.5rem;
+  margin-top: 0.75rem;
+}
+
+.dispatch-section {
+  border-top: 1px solid var(--line);
+  padding-top: 0.5rem;
+  min-width: 0;
+}
+.dispatch-section h3 {
+  font-size: 0.95rem;
+  margin: 0 0 0.4rem;
+  color: var(--muted);
+}
+
+.dispatch-facts,
+.dispatch-items {
+  margin: 0;
+  padding-left: 1.25rem;
+}
+.dispatch-facts li,
+.dispatch-items li {
+  margin: 0.3rem 0;
+}
+
+.dispatch-body,
+.mailbox-body {
+  font: inherit;
+  white-space: pre-wrap;
+  overflow-wrap: anywhere;
+  background: #f6f8fb;
+  border: 1px solid var(--line);
+  border-radius: var(--radius);
+  padding: 0.75rem 1rem;
+  max-width: 100%;
+  overflow-x: auto;
+}
+
+.dispatch-preview {
+  margin-bottom: 0.5rem;
+}
+
+/* ---------- Dispatch page filters ---------- */
+
+.dispatch-filters {
+  display: flex;
+  gap: 1rem;
+  align-items: flex-end;
+  flex-wrap: wrap;
+}
+.dispatch-filters .field {
+  margin-bottom: 0;
+  min-width: 14rem;
+  flex: 1 1 14rem;
+}
+.dispatch-filters .actions {
+  margin-top: 0;
+  padding-bottom: 0.45rem;
+}
+
+/* ---------- Copy-package checklist ---------- */
+
+.doc-checklist {
+  list-style: none;
+  margin: 0.25rem 0 0.5rem;
+  padding: 0;
+  max-height: 16rem;
+  overflow-y: auto;
+  border: 1px solid var(--line);
+  border-radius: 6px;
+  background: var(--surface);
+}
+.doc-checklist li {
+  border-bottom: 1px solid var(--line);
+}
+.doc-checklist li:last-child {
+  border-bottom: none;
+}
+.doc-checklist label {
+  display: flex;
+  align-items: flex-start;
+  gap: 0.5rem;
+  padding: 0.45rem 0.6rem;
+  cursor: pointer;
+}
+.doc-checklist input[type='checkbox'] {
+  width: 1.1rem;
+  height: 1.1rem;
+  margin-top: 0.15rem;
+  flex: none;
+}
+
+.doc-warning {
+  background: #fdeacc;
+  border: 1px solid #ecc97e;
+  color: #5d3c00;
+}
+.doc-warning .doc-checklist {
+  border-color: #ecc97e;
+}
+.doc-warning .doc-checklist li {
+  border-color: #ecc97e;
+}
+
+/* ---------- Mailbox ---------- */
+
+.mailbox-banner {
+  background: #eef4fd;
+  border: 1px solid #c8d9f3;
+  border-left: 4px solid var(--accent);
+}
+
+.mailbox-layout {
+  display: grid;
+  grid-template-columns: minmax(14rem, 22rem) 1fr;
+  gap: 1rem;
+  align-items: start;
+}
+
+.mailbox-list {
+  display: flex;
+  flex-direction: column;
+  border: 1px solid var(--line);
+  border-radius: var(--radius);
+  background: var(--surface);
+  overflow: hidden;
+}
+
+.mailbox-item {
+  font: inherit;
+  text-align: left;
+  display: flex;
+  flex-direction: column;
+  gap: 0.1rem;
+  padding: 0.6rem 0.8rem;
+  border: none;
+  border-bottom: 1px solid var(--line);
+  background: var(--surface);
+  color: var(--ink);
+  cursor: pointer;
+}
+.mailbox-item:last-child {
+  border-bottom: none;
+}
+.mailbox-item:hover {
+  background: #eef1f6;
+}
+.mailbox-item.active {
+  background: #e8eefb;
+  border-left: 3px solid var(--accent);
+  padding-left: calc(0.8rem - 3px);
+}
+.mailbox-item-subject {
+  font-weight: 600;
+}
+.mailbox-item-meta {
+  font-size: 0.8rem;
+  color: var(--muted);
+}
+
+/* ---------- History ---------- */
+
+.history-toolbar {
+  align-items: flex-end;
+  margin-bottom: 1rem;
+}
+.history-toolbar .field {
+  margin-bottom: 0;
+  flex: 1 1 16rem;
+  max-width: 28rem;
+}
+.history-action {
+  font-size: 0.8rem;
+}
+
+/* ---------- Narrow screens ---------- */
+
+@media (max-width: 48rem) {
+  .dispatch-grid {
+    grid-template-columns: 1fr;
+  }
+  .mailbox-layout {
+    grid-template-columns: 1fr;
+  }
+}
+
+/* ---------- Print ---------- */
+
+@media print {
+  .dispatch-filters,
+  .mailbox-list,
+  .mailbox-banner,
+  .history-toolbar {
+    display: none !important;
+  }
+  .mailbox-layout,
+  .dispatch-grid {
+    display: block;
+  }
+}

@@ -1,0 +1,18 @@
+.doc-fieldset { border: 0; margin: 0; padding: 0; min-width: 0; }
+.doc-links { display: flex; flex-wrap: wrap; gap: .6rem; }
+.doc-quarantine { color: var(--danger); font-weight: 600; }
+.doc-checksum { display: block; overflow-wrap: anywhere; user-select: all; }
+.doc-form, .doc-upload-result { min-width: 0; }
+.doc-meta { display: grid; grid-template-columns: repeat(auto-fit, minmax(min(100%, 15rem), 1fr)); gap: .5rem 1rem; margin: .75rem 0; }
+.doc-meta dt { font-size: .85rem; color: var(--muted); }
+.doc-meta dd { margin: 0; overflow-wrap: anywhere; }
+.doc-filters { display: flex; align-items: end; gap: 1rem; flex-wrap: wrap; margin-bottom: 1rem; }
+.doc-filters .field { flex: 1 1 12rem; margin: 0; }
+.doc-record { min-width: 0; overflow-wrap: anywhere; }
+.doc-record .card-head { flex-wrap: wrap; }
+.doc-record .card-actions { display: flex; flex-wrap: wrap; gap: .5rem; }
+.doc-record h3 { margin: .75rem 0 .5rem; }
+.doc-sr-only { position: absolute; top: 0; left: 0; width: 1px; height: 1px; padding: 0; overflow: hidden; clip-path: inset(50%); white-space: nowrap; }
+.doc-reason-feedback { position: fixed; top: 1rem; left: 50%; transform: translateX(-50%); width: min(32rem, calc(100% - 2rem)); max-height: 24vh; overflow: auto; z-index: 60; }
+@media (max-width: 36rem) { .doc-record .card-head { align-items: start; } .doc-form input[type="file"] { font-size: .9rem; } }
+@media print { .doc-filters, .doc-form, .doc-reason-feedback { display: none; } .doc-record .table-wrap { overflow: visible; } .doc-record table { table-layout: fixed; font-size: .75rem; } .doc-record th { white-space: normal; } .doc-record td { overflow-wrap: anywhere; } .doc-links { display: none; } }

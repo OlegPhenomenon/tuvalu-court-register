@@ -1,0 +1,95 @@
+/* Calendar page (§8): toolbar, pure-CSS-grid week/month views, and the print
+   layout — on paper only the daily list shows, marked "internal use". */
+
+.cal-toolbar {
+  display: flex;
+  gap: 0.75rem;
+  flex-wrap: wrap;
+  align-items: flex-end;
+  margin-bottom: 0.75rem;
+}
+.cal-toolbar .field { margin-bottom: 0; }
+.cal-nav { display: flex; gap: 0.25rem; }
+.cal-views { display: flex; gap: 0.25rem; }
+.cal-range { font-weight: 600; margin: 0.25rem 0 0.5rem; }
+.cal-legend { font-size: 0.85rem; }
+
+/* ---------- grids ---------- */
+
+.cal-grid {
+  display: grid;
+  grid-template-columns: repeat(7, minmax(0, 1fr));
+  gap: 1px;
+  background: var(--line);
+  border: 1px solid var(--line);
+  border-radius: var(--radius);
+  overflow: hidden;
+}
+.cal-weekdays {
+  display: grid;
+  grid-template-columns: repeat(7, minmax(0, 1fr));
+  font-size: 0.8rem;
+  font-weight: 600;
+  color: var(--muted);
+  padding: 0.25rem 0;
+}
+.cal-weekdays span { padding: 0 0.45rem; }
+
+.cal-day, .cal-cell {
+  background: var(--surface);
+  padding: 0.4rem;
+  min-height: 5rem;
+  min-width: 0;
+}
+.cal-day-head { font-size: 0.85rem; margin: 0 0 0.35rem; }
+.cal-daynum { font-weight: 600; font-size: 0.85rem; }
+.cal-cell--other { background: #f0f2f6; color: var(--muted); }
+.cal-day--today { box-shadow: inset 0 0 0 2px var(--accent); }
+
+/* ---------- hearing chips ---------- */
+
+.cal-chip {
+  display: block;
+  font-size: 0.8rem;
+  line-height: 1.35;
+  padding: 0.15rem 0.4rem;
+  margin: 0.2rem 0;
+  border-left: 4px solid var(--line);
+  border-radius: 4px;
+  background: #eef1f6;
+  color: var(--ink);
+  text-decoration: none;
+  overflow-wrap: anywhere;
+}
+.cal-chip:hover { filter: brightness(0.96); }
+.cal-chip--info    { border-left-color: var(--accent); background: #e8eefb; }
+.cal-chip--success { border-left-color: #146c43; background: #e7f6ee; }
+.cal-chip--warn    { border-left-color: #b97c0f; background: #fdf1dc; }
+.cal-chip--neutral { border-left-color: #98a2b0; }
+.cal-chip--dead { text-decoration: line-through; opacity: 0.7; }
+.cal-chip-case { font-weight: 600; }
+.cal-chip-room { color: var(--muted); }
+
+.cal-row--dead td { text-decoration: line-through; color: var(--muted); }
+.cal-row--dead td:last-child { text-decoration: none; }
+
+/* ---------- phones: stack the days vertically ---------- */
+
+@media (max-width: 600px) {
+  .cal-grid, .cal-weekdays { grid-template-columns: 1fr; }
+  .cal-weekdays { display: none; }
+  .cal-cell--other { display: none; } /* drop neighbouring-month padding cells */
+  .cal-day, .cal-cell { min-height: 0; }
+}
+
+/* ---------- print: the daily list only ---------- */
+
+.cal-print { display: none; }
+
+@media print {
+  .cal-screen { display: none !important; }
+  .cal-print { display: block; }
+  .cal-print-title { font-size: 1.2rem; }
+  .cal-print-note { color: #444; font-size: 0.9rem; }
+  .cal-print table { font-size: 10pt; }
+}
