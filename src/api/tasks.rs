@@ -222,7 +222,8 @@ struct UpdateReq {
     version: i64,
     title: Option<String>,
     description: Option<String>,
-    assignee_user_id: Option<i64>,
+    #[serde(default, deserialize_with = "super::common::nullable")]
+    assignee_user_id: Option<Option<i64>>,
     due_date: Option<String>,
 }
 
@@ -240,22 +241,23 @@ async fn update(ctx: Ctx, Path(id): Path<i64>, JsonBody(req): JsonBody<UpdateReq
                 return Err(AppError::version_conflict(current));
             }
             let title = req.title.as_deref().map(|t| required(t, "Title")).transpose()?;
-            if let Some(uid) = req.assignee_user_id {
+            if let Some(Some(uid)) = req.assignee_user_id {
                 check_assignee(tx, uid, current["case_id"].as_i64())?;
             }
             tx.execute(
                 "UPDATE tasks SET title = COALESCE(?2, title),
                         description = CASE WHEN ?3 IS NULL THEN description ELSE NULLIF(?3, '') END,
-                        assignee_user_id = COALESCE(?4, assignee_user_id),
+                        assignee_user_id = CASE WHEN ?7 THEN ?4 ELSE assignee_user_id END,
                         due_date = CASE WHEN ?6 THEN ?5 ELSE due_date END, version = version + 1
                  WHERE id = ?1",
                 params![
                     id,
                     title,
                     req.description.as_deref().map(str::trim),
-                    req.assignee_user_id,
+                    req.assignee_user_id.flatten(),
                     crate::time::parse_opt_date(req.due_date.as_deref())?,
-                    req.due_date.is_some()
+                    req.due_date.is_some(),
+                    req.assignee_user_id.is_some()
                 ],
             )?;
             audit::record(

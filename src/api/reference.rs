@@ -21,11 +21,15 @@ async fn reference(ctx: Ctx) -> JsonResult {
                 let entry = lists.entry(kind).or_insert_with(|| json!([]));
                 entry.as_array_mut().expect("array").push(json!({ "code": item["code"], "label": item["label"] }));
             }
+            let mut staff = query_json(c, "SELECT id, display_name, title, is_judge FROM users WHERE active = 1 ORDER BY display_name", [])?;
+            for person in &mut staff {
+                person["assignable"] = json!(crate::policy::user_assignable(c, person["id"].as_i64().unwrap_or_default())?);
+            }
             Ok(json!({
                 "lists": Value::Object(lists),
                 "rooms": query_json(c, "SELECT id, name, location FROM rooms WHERE active = 1 ORDER BY name", [])?,
                 "registries": query_json(c, "SELECT id, series, name FROM registries WHERE active = 1 ORDER BY series", [])?,
-                "staff": query_json(c, "SELECT id, display_name, title, is_judge FROM users WHERE active = 1 ORDER BY display_name", [])?,
+                "staff": staff,
                 "templates": query_json(c, "SELECT code, name FROM message_templates WHERE active = 1 ORDER BY name", [])?,
                 "court_name": crate::db::setting(c, "court_name", "Court Registry")?,
                 "court_timezone": crate::time::COURT_TZ_NAME,

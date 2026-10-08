@@ -36,6 +36,15 @@ pub fn required(value: &str, field: &str) -> AppResult<String> {
     Ok(v.to_string())
 }
 
+/// PATCH field: absent means unchanged; explicit null means clear the value.
+pub fn nullable<'de, D, T>(deserializer: D) -> Result<Option<Option<T>>, D::Error>
+where
+    D: serde::Deserializer<'de>,
+    T: serde::Deserialize<'de>,
+{
+    <Option<T> as serde::Deserialize>::deserialize(deserializer).map(Some)
+}
+
 /// Optional text: trimmed, empty → None.
 pub fn optional(value: &Option<String>) -> Option<String> {
     value.as_deref().map(str::trim).filter(|s| !s.is_empty()).map(str::to_string)
@@ -122,9 +131,26 @@ pub fn render_template(conn: &rusqlite::Connection, code: &str, vars: &[(&str, S
     let fill = |s: &str| {
         let mut out = s.replace("{court}", &court);
         for (k, v) in vars {
-            out = out.replace(&format!("{{{k}}}"), v);
+            let rendered = if matches!(*k, "hearing_local" | "previous_local") && !v.is_empty() {
+                crate::time::human_court_local(v, false)
+            } else {
+                v.clone()
+            };
+            out = out.replace(&format!("{{{k}}}"), &rendered);
         }
         out
     };
     Ok((fill(&subject), fill(&body)))
+}
+
+/// Recipient-focused dispatch wording shared by API mutations, the worker and demo seed.
+pub fn dispatch_activity(conn: &rusqlite::Connection, id: i64, activity: &str) -> AppResult<String> {
+    let (kind, recipient, count): (String, String, i64) = conn.query_row(
+        "SELECT kind, recipient_name, (SELECT COUNT(*) FROM dispatch_items WHERE dispatch_id = d.id)
+         FROM dispatches d WHERE id = ?1", [id], |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?)))?;
+    Ok(if kind == "copies" {
+        format!("Copies of {count} {} {activity} to {recipient}", if count == 1 { "document" } else { "documents" })
+    } else {
+        format!("{} to {recipient} {activity}", if kind == "information_request" { "Information request" } else { "Notice" })
+    })
 }

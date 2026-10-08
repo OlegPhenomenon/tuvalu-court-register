@@ -366,9 +366,9 @@ async fn restricted_document_grant_revoke_and_view_audit() {
             |r| r.get(0),
         )
         .unwrap();
-    assert_eq!(views, 2, "detail and download must both be audited");
+    assert_eq!(views, 1, "only the download is audited");
     let detail_views: i64 = conn.query_row("SELECT COUNT(*) FROM audit_events WHERE action = 'document.viewed_restricted' AND entity_id = ?1 AND json_extract(details, '$.via') = 'detail'", [doc_id], |r| r.get(0)).unwrap();
-    assert_eq!(detail_views, 1);
+    assert_eq!(detail_views, 0);
 
     // Revoking (with a reason) removes access again; the row is kept.
     let (s, b) = delete_json(

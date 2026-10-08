@@ -207,29 +207,10 @@ async fn list_all(ctx: Ctx, Query(q): Query<ListQuery>) -> JsonResult {
 
 async fn detail(ctx: Ctx, Path(id): Path<i64>) -> JsonResult {
     let actor = ctx.actor;
-    let v = ctx
-        .db
-        .write(move |tx| {
-            let doc = policy::require_document(tx, &actor, id)?;
-            let value = detail_json(tx, &actor, id)?;
-            if doc.is_sensitive() {
-                audit::record(
-                    tx,
-                    Some(&actor),
-                    Event::new(
-                        "document.viewed_restricted",
-                        "document",
-                        id,
-                        format!("{} opened", document_label(id, &doc.visibility, &doc.title)),
-                    )
-                    .case(doc.case_id)
-                    .details(json!({ "via": "detail" })),
-                )?;
-            }
-            Ok(value)
-        })
-        .await?;
-    Ok(Json(v))
+    Ok(Json(ctx.db.read(move |c| {
+        policy::require_document(c, &actor, id)?;
+        detail_json(c, &actor, id)
+    }).await?))
 }
 
 // ------------------------------------------------------------------ uploads
@@ -948,6 +929,12 @@ async fn download(ctx: Ctx, Path(id): Path<i64>, Query(q): Query<DownloadQuery>)
             "This file failed the safety check and cannot be opened.",
         ));
     }
+    let storage_key = v["storage_key"].as_str().unwrap_or_default().to_string();
+    let sha256 = v["sha256"].as_str().unwrap_or_default().to_string();
+    let file_db = db.clone();
+    let bytes = tokio::task::spawn_blocking(move || crate::storage::read(&file_db, &storage_key, &sha256))
+        .await
+        .map_err(|e| AppError::internal(e.to_string()))??;
     if doc.is_sensitive() {
         let actor_w = actor.clone();
         let doc_w = doc.clone();
@@ -961,17 +948,13 @@ async fn download(ctx: Ctx, Path(id): Path<i64>, Query(q): Query<DownloadQuery>)
                     doc_w.id,
                     format!("{} opened", document_label(doc_w.id, &doc_w.visibility, &doc_w.title)),
                 )
-                .case(doc_w.case_id),
+                .case(doc_w.case_id)
+                    .details(json!({"version_id": id})),
             )?;
             Ok(())
         })
         .await?;
     }
-    let storage_key = v["storage_key"].as_str().unwrap_or_default().to_string();
-    let sha256 = v["sha256"].as_str().unwrap_or_default().to_string();
-    let bytes = tokio::task::spawn_blocking(move || crate::storage::read(&db, &storage_key, &sha256))
-        .await
-        .map_err(|e| AppError::internal(e.to_string()))??;
     let filename = v["filename"].as_str().unwrap_or("file").to_string();
     let content_type = v["content_type"].as_str().unwrap_or("application/octet-stream").to_string();
     // Inline display is honoured only for types a browser can show without scripting risk.

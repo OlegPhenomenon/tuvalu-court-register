@@ -21,6 +21,7 @@ struct Dispatch {
     subject: String,
     body: String,
     method: String,
+    kind: String,
     reviewed: bool,
 }
 
@@ -123,10 +124,10 @@ pub fn process(db: &Db) -> AppResult<usize> {
         processed += db.write_blocking(|tx| {
             let d = tx.query_row(
                 "SELECT case_id, intake_id, queued_by, address, subject, body, method,
-                        reviewed_by IS NOT NULL AND reviewed_at IS NOT NULL
+                        reviewed_by IS NOT NULL AND reviewed_at IS NOT NULL, kind
                  FROM dispatches WHERE id = ?1 AND status = 'queued'", [id], |r| {
                     Ok(Dispatch { id, case_id: r.get(0)?, intake_id: r.get(1)?, queued_by: r.get(2)?, address: r.get(3)?,
-                        subject: r.get(4)?, body: r.get(5)?, method: r.get(6)?, reviewed: r.get(7)? })
+                        subject: r.get(4)?, body: r.get(5)?, method: r.get(6)?, reviewed: r.get(7)?, kind: r.get(8)? })
                 },
             ).optional()?;
             let Some(d) = d else { return Ok(0) };
@@ -171,7 +172,7 @@ pub fn process(db: &Db) -> AppResult<usize> {
                 tx.execute("INSERT INTO delivery_attempts (dispatch_id, attempt_no, status, technical_receipt, at) VALUES (?1, ?2, 'sent', ?3, ?4)",
                     params![id, attempt_no, format!("local-mailbox:{mailbox_id}"), now])?;
                 tx.execute("UPDATE dispatches SET status = 'sent', sent_at = ?2, failure_reason = NULL, version = version + 1 WHERE id = ?1", params![id, now])?;
-                audit::record(tx, attribution.as_ref(), Event::new("dispatch.sent", "dispatch", id, "Delivered to the local mailbox").case(d.case_id)
+                audit::record(tx, attribution.as_ref(), Event::new("dispatch.sent", "dispatch", id, format!("{} ({address})", crate::api::common::dispatch_activity(tx, id, if d.kind == "copies" { "sent" } else { "delivered to the local mailbox" })?)).case(d.case_id)
                     .details(json!({"attempt_no": attempt_no, "mailbox_id": mailbox_id})))?;
             }
             Ok(1)

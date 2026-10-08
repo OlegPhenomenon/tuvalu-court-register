@@ -447,7 +447,7 @@ fn dispatch(tx: &Transaction, a: &Actor, d: Out) -> AppResult<i64> {
         let attachments = json!(d
             .items
             .iter()
-            .map(|i| json!({ "filename": i.filename, "sha256": i.sha256, "size_bytes": i.size_bytes }))
+            .map(|i| json!({ "filename": i.filename, "sha256": i.sha256, "size_bytes": i.size_bytes, "document_version_id": i.version_id }))
             .collect::<Vec<Value>>());
         tx.execute(
             "INSERT INTO mailbox (dispatch_id, attempt_no, to_address, subject, body, attachments, delivered_at)
@@ -466,7 +466,7 @@ fn dispatch(tx: &Transaction, a: &Actor, d: Out) -> AppResult<i64> {
                 "dispatch.sent",
                 "dispatch",
                 id,
-                format!("Sent to {}", d.recipient),
+                format!("{} ({})", crate::api::common::dispatch_activity(tx, id, if d.kind == "copies" { "sent" } else { "delivered to the local mailbox" })?, d.address.unwrap_or(d.recipient)),
             )
             .case(d.case_id),
         )?;
@@ -1004,7 +1004,7 @@ pub fn seed_cases(tx: &Transaction, db: &Db) -> AppResult<()> {
         tx,
         db,
         case4,
-        "DEMO — Care arrangements order",
+        "DEMO - Care arrangements order",
         "decision",
         "court",
         "administrative",
@@ -1020,7 +1020,7 @@ pub fn seed_cases(tx: &Transaction, db: &Db) -> AppResult<()> {
     tx.execute(
         "INSERT INTO decisions (case_id, title, decision_date, status, document_id, document_version_id, hearing_id,
                                 author_user_id, finalised_by, finalised_at, created_at)
-         VALUES (?1, 'DEMO — Care arrangements order', ?2, 'finalised', ?3, ?4, ?5, ?6, ?6, ?7, ?7)",
+         VALUES (?1, 'DEMO - Care arrangements order', ?2, 'finalised', ?3, ?4, ?5, ?6, ?6, ?7, ?7)",
         params![case4, ldate(-18), dec_doc, dec_v.version_id, h4, viktor, ts(-18)],
     )?;
     let dec_id = tx.last_insert_rowid();
@@ -1047,7 +1047,7 @@ pub fn seed_cases(tx: &Transaction, db: &Db) -> AppResult<()> {
                 ("case_number", num4.clone()),
                 (
                     "items",
-                    "DEMO — Care arrangements order (version 1)".to_string(),
+                    "DEMO - Care arrangements order (version 1)".to_string(),
                 ),
             ],
         )?;

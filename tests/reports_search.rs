@@ -189,7 +189,7 @@ async fn hearings_dispatch_and_workload_are_case_filtered() {
     );
 }
 #[tokio::test]
-async fn search_and_history_redact_sensitive_materials() {
+async fn search_and_history_omit_sensitive_materials() {
     let app = TestApp::demo();
     let olga = app.persona("olga").await;
     let (cid, _) = register_case(&olga, "Visible search").await;
@@ -264,17 +264,7 @@ async fn search_and_history_redact_sensitive_materials() {
     assert_eq!(b, json!({"cases":[],"documents":[],"intakes":[]}));
     let (s, h) = elena.get(&format!("/api/cases/{cid}/history")).await;
     ok(s, &h);
-    let ev = h["events"]
-        .as_array()
-        .unwrap()
-        .iter()
-        .find(|r| r["action"] == "document.viewed_restricted")
-        .unwrap();
-    assert_eq!(
-        ev["summary"],
-        "Activity on a document you do not have access to"
-    );
-    assert!(ev.get("details").is_none());
+    assert!(h["events"].as_array().unwrap().iter().all(|r| r["action"] != "document.viewed_restricted"));
     let (_, a) = elena.get("/api/audit").await;
     assert!(!a.to_string().contains("Secret search"));
     assert!(!a.to_string().contains("Sensitive-needle"));
@@ -298,7 +288,7 @@ async fn search_and_history_redact_sensitive_materials() {
 }
 
 #[tokio::test]
-async fn hidden_counterpart_case_is_redacted_in_history_and_audit() {
+async fn hidden_counterpart_case_is_omitted_from_history_and_audit() {
     let app = TestApp::demo();
     let olga = app.persona("olga").await;
     let (visible, _) = register_case(&olga, "Visible relation").await;
@@ -332,17 +322,7 @@ async fn hidden_counterpart_case_is_redacted_in_history_and_audit() {
     ] {
         let (s, b) = elena.get(&path).await;
         ok(s, &b);
-        let event = b["events"]
-            .as_array()
-            .unwrap()
-            .iter()
-            .find(|e| e["action"] == "case.related")
-            .unwrap();
-        assert_eq!(
-            event["summary"],
-            "Activity on a case you do not have access to"
-        );
-        assert!(event["details"].is_null());
+        assert!(b["events"].as_array().unwrap().iter().all(|e| e["action"] != "case.related"));
         assert!(!b.to_string().contains(&number));
     }
     let (s, b) = olga.get(&format!("/api/cases/{visible}/history")).await;

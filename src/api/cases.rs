@@ -111,6 +111,9 @@ fn insert_assignment(tx: &Transaction, actor: &Actor, case_id: i64, user_id: i64
     if !active {
         return Err(AppError::validation("This user account is deactivated."));
     }
+    if !policy::user_assignable(tx, user_id)? {
+        return Err(AppError::validation("This person administers the system and cannot be assigned to cases."));
+    }
     let existing: Option<i64> = tx
         .query_row(
             "SELECT id FROM case_assignments WHERE case_id = ?1 AND user_id = ?2 AND role = ?3 AND end_at IS NULL",
@@ -346,7 +349,7 @@ pub fn next_actions(c: &Connection, actor: &Actor, case_id: i64) -> AppResult<Ve
         |r| r.get(0),
     )?;
     if !has_judge {
-        out.push(action("assign_judge", "Assign a judge to this case.".into(), format!("{base}?tab=summary")));
+        out.push(action("assign_judge", "Assign a judge to this case.".into(), format!("{base}?tab=summary&action=assign-judge")));
     }
     let now = crate::time::now_utc();
     // Hearings that ended but have no outcome.
@@ -356,7 +359,7 @@ pub fn next_actions(c: &Connection, actor: &Actor, case_id: i64) -> AppResult<Ve
         params![case_id, now],
     )? {
         let when = crate::time::utc_to_local(h["starts_at"].as_str().unwrap_or_default());
-        out.push(action("record_outcome", format!("Record the outcome of the hearing on {when}."), format!("{base}?tab=hearings")));
+        out.push(action("record_outcome", format!("Record the outcome of the hearing on {when}."), format!("{base}?tab=hearings&hearing={}", h["id"])));
     }
     let has_hearing: bool = c.query_row(
         "SELECT EXISTS (SELECT 1 FROM hearings WHERE case_id = ?1 AND status IN ('scheduled','held'))",
@@ -368,16 +371,17 @@ pub fn next_actions(c: &Connection, actor: &Actor, case_id: i64) -> AppResult<Ve
     if !has_hearing && !has_final && has_judge && matches!(status.as_str(), "registered" | "active") {
         out.push(action("schedule_hearing", "Schedule the first hearing.".into(), format!("{base}?tab=hearings")));
     }
-    for d in query_json(c, "SELECT id, kind, recipient_name, subject, status FROM dispatches WHERE case_id = ?1 AND status IN ('draft','failed','sent') ORDER BY id", [case_id])? {
+    for d in query_json(c, "SELECT d.id, d.kind, d.recipient_name, d.subject, d.status, h.starts_at AS hearing_at FROM dispatches d LEFT JOIN hearings h ON h.id = d.hearing_id WHERE d.case_id = ?1 AND d.status IN ('draft','failed','sent') ORDER BY d.id", [case_id])? {
         let who = d["recipient_name"].as_str().unwrap_or_default();
         let what = match d["kind"].as_str() {
             Some("notice") => "notice",
             Some("copies") => "copy package",
             _ => "message",
         };
+        let link = format!("{base}?tab=dispatch&dispatch={}", d["id"]);
         match d["status"].as_str() {
-            Some("draft") => out.push(action("review_dispatch", format!("Check the recipient and contents of the {what} for {who}, then send it."), format!("{base}?tab=dispatch"))),
-            Some("failed") => out.push(action("retry_dispatch", format!("Delivery of the {what} to {who} failed — retry or use another method."), format!("{base}?tab=dispatch"))),
+            Some("draft") => out.push(action("review_dispatch", format!("Check the recipient and contents of the {what} for {who}, then send it."), link.clone())),
+            Some("failed") => out.push(action("retry_dispatch", format!("Delivery of the {what} to {who} failed — retry or use another method."), link.clone())),
             Some("sent") => {
                 let confirmed: bool = c.query_row(
                     "SELECT EXISTS (SELECT 1 FROM delivery_confirmations WHERE dispatch_id = ?1 AND kind = 'human_handover')",
@@ -385,7 +389,13 @@ pub fn next_actions(c: &Connection, actor: &Actor, case_id: i64) -> AppResult<Ve
                     |r| r.get(0),
                 )?;
                 if !confirmed {
-                    out.push(action("confirm_delivery", format!("Confirm that the {what} reached {who}."), format!("{base}?tab=dispatch")));
+                    let message = if let Some(at) = d["hearing_at"].as_str() {
+                        let date = crate::time::human_court_local(&crate::time::utc_to_local(at), true);
+                        format!("Confirm that the hearing notice for {date} reached {who}.")
+                    } else {
+                        format!("Confirm that the {what} “{}” reached {who}.", d["subject"].as_str().unwrap_or_default())
+                    };
+                    out.push(action("confirm_delivery", message, link));
                 }
             }
             _ => {}
@@ -395,18 +405,23 @@ pub fn next_actions(c: &Connection, actor: &Actor, case_id: i64) -> AppResult<Ve
         out.push(action("finalise_decision", format!("Finalise or withdraw the draft decision “{}”.", d["title"].as_str().unwrap_or_default()), format!("{base}?tab=decisions")));
     }
     if has_final {
-        // Parties who have not been sent a copy package containing the latest finalised decision.
+        // Each party needs each current finalised decision, with its exact bound version.
         for p in query_json(
             c,
-            "SELECT p.name FROM case_participations cp JOIN parties p ON p.id = cp.party_id
-             WHERE cp.case_id = ?1 AND cp.active = 1 AND cp.role IN ('claimant','respondent','applicant','defendant')
-               AND NOT EXISTS (
-                 SELECT 1 FROM dispatches dp JOIN dispatch_items di ON di.dispatch_id = dp.id
-                 JOIN decisions dc ON dc.document_version_id = di.document_version_id AND dc.status = 'finalised'
-                 WHERE dp.case_id = ?1 AND dp.kind = 'copies' AND dp.recipient_party_id = cp.party_id AND dp.status <> 'cancelled')",
+            &format!("SELECT DISTINCT p.id AS party_id, p.name, dc.id AS decision_id, dc.title
+             FROM decisions dc JOIN case_participations cp ON cp.case_id = dc.case_id
+             JOIN parties p ON p.id = cp.party_id
+             JOIN document_versions v ON v.id = dc.document_version_id JOIN documents doc ON doc.id = v.document_id
+             WHERE dc.case_id = ?1 AND dc.status = 'finalised' AND cp.active = 1
+               AND cp.role IN ('claimant','respondent','applicant','defendant') AND {visible}
+               AND NOT EXISTS (SELECT 1 FROM dispatches dp JOIN dispatch_items di ON di.dispatch_id = dp.id
+                 WHERE dp.case_id = ?1 AND dp.kind = 'copies' AND dp.recipient_party_id = p.id
+                   AND dp.status <> 'cancelled' AND di.document_version_id = dc.document_version_id)
+             ORDER BY dc.id, p.id", visible = policy::document_visible_sql(actor, "doc")),
             [case_id],
         )? {
-            out.push(action("send_decision", format!("Send a copy of the decision to {}.", p["name"].as_str().unwrap_or_default()), format!("{base}?tab=dispatch")));
+            out.push(action("send_decision", format!("Send a copy of the decision “{}” to {}.", p["title"].as_str().unwrap_or_default(), p["name"].as_str().unwrap_or_default()),
+                format!("{base}?tab=dispatch&action=copies&decision={}&party={}", p["decision_id"], p["party_id"])));
         }
     }
     for t in query_json(
@@ -538,7 +553,11 @@ pub fn open_items(c: &Connection, case_id: i64) -> AppResult<Vec<Value>> {
          UNION ALL
          SELECT 'dispatch', id, subject || ' → ' || recipient_name, status FROM dispatches WHERE case_id = ?1 AND status IN ('draft','queued','failed')
          UNION ALL
-         SELECT 'decision', id, title, status FROM decisions WHERE case_id = ?1 AND status = 'draft'",
+         SELECT 'decision', id, title, status FROM decisions WHERE case_id = ?1 AND status = 'draft'
+         UNION ALL
+         SELECT 'unconfirmed_dispatch', d.id, d.subject || ' → ' || d.recipient_name, d.status
+         FROM dispatches d WHERE d.case_id = ?1 AND d.status = 'sent'
+           AND NOT EXISTS (SELECT 1 FROM delivery_confirmations dc WHERE dc.dispatch_id = d.id AND dc.kind = 'human_handover')",
         [case_id],
     )?;
     for it in &mut items {
@@ -553,10 +572,20 @@ pub fn open_items(c: &Connection, case_id: i64) -> AppResult<Vec<Value>> {
 }
 
 #[derive(Deserialize, Serialize)]
+struct Acknowledgement {
+    kind: String,
+    id: i64,
+    #[serde(default)]
+    reason: String,
+}
+
+#[derive(Deserialize, Serialize)]
 struct CloseReq {
     basis: String,
     note: Option<String>,
     closed_date: Option<String>,
+    #[serde(default)]
+    acknowledge: Vec<Acknowledgement>,
 }
 
 async fn close(ctx: Ctx, Path(id): Path<i64>, IdemKey(key): IdemKey, JsonBody(req): JsonBody<CloseReq>) -> JsonResult {
@@ -570,15 +599,29 @@ async fn close(ctx: Ctx, Path(id): Path<i64>, IdemKey(key): IdemKey, JsonBody(re
                     return Err(AppError::invalid_transition("This case is already closed."));
                 }
                 require_ref(tx, "closure_basis", &req.basis)?;
-                let note = optional(&req.note);
+                let mut note = optional(&req.note);
                 if req.basis == "other" && note.is_none() {
                     return Err(AppError::validation("Explain the basis for closing.").with_details(json!({ "field": "note" })));
                 }
-                let blockers = open_items(tx, id)?;
+                let mut blockers = open_items(tx, id)?;
+                let mut acknowledged = Vec::new();
+                for ack in &req.acknowledge {
+                    let position = blockers.iter().position(|item| item["kind"] == "unconfirmed_dispatch"
+                        && ack.kind == "unconfirmed_dispatch" && item["id"].as_i64() == Some(ack.id))
+                        .ok_or_else(|| AppError::validation("Only an unconfirmed dispatch on this case can be acknowledged, once."))?;
+                    if ack.reason.trim().is_empty() {
+                        continue; // An unexplained dispatch stays in the 409 open-items response.
+                    }
+                    let why = required(&ack.reason, "Reason")?;
+                    let item = blockers.remove(position);
+                    let line = format!("Left unconfirmed: {} — {why}", item["label"].as_str().unwrap_or_default());
+                    note = Some(match note { Some(n) => format!("{n}\n{line}"), None => line });
+                    acknowledged.push(json!({"kind": ack.kind, "id": ack.id, "reason": why}));
+                }
                 if !blockers.is_empty() {
                     return Err(AppError::conflict(
                         "open_items",
-                        "Some actions are still open. Complete them, cancel them with a reason, or carry tasks forward explicitly.",
+                        "Some actions are still open. Complete them, cancel them with a reason, carry tasks forward, or acknowledge unconfirmed dispatches with a reason.",
                     )
                     .with_details(json!({ "items": blockers })));
                 }
@@ -596,7 +639,7 @@ async fn close(ctx: Ctx, Path(id): Path<i64>, IdemKey(key): IdemKey, JsonBody(re
                     Some(&actor),
                     Event::new("case.closed", "case", id, format!("Case {} closed ({})", case.number, req.basis))
                         .case(Some(id))
-                        .details(json!({ "basis": req.basis, "note": note, "closed_date": date })),
+                        .details(json!({ "basis": req.basis, "note": note, "closed_date": date, "acknowledge": acknowledged })),
                 )?;
                 Ok(json!({ "ok": true, "closed_date": date }))
             })

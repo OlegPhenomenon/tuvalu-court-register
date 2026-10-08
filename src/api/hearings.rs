@@ -546,8 +546,10 @@ struct UpdateReq {
     hearing_type: Option<String>,
     starts_local: Option<String>,
     ends_local: Option<String>,
-    room_id: Option<i64>,
-    judge_user_id: Option<i64>,
+    #[serde(default, deserialize_with = "super::common::nullable")]
+    room_id: Option<Option<i64>>,
+    #[serde(default, deserialize_with = "super::common::nullable")]
+    judge_user_id: Option<Option<i64>>,
     notes: Option<String>,
 }
 
@@ -580,16 +582,19 @@ async fn update(ctx: Ctx, Path(id): Path<i64>, JsonBody(req): JsonBody<UpdateReq
                 .ends_local
                 .clone()
                 .unwrap_or_else(|| h["ends_local"].as_str().unwrap_or_default().to_string());
-            let slot = prepare_slot(
+            let judge = req.judge_user_id.unwrap_or(h["judge_user_id"].as_i64());
+            let mut slot = prepare_slot(
                 tx,
                 case_id,
                 &htype,
                 &starts,
                 &ends,
-                req.room_id.or(h["room_id"].as_i64()),
-                req.judge_user_id,
-                h["judge_user_id"].as_i64(),
+                req.room_id.unwrap_or(h["room_id"].as_i64()),
+                judge,
+                None,
             )?;
+            // Unlike creation, PATCH never chooses a judge when the field is cleared or omitted.
+            slot.judge_user_id = judge;
             tx.execute(
                 "UPDATE hearings SET hearing_type = ?2, starts_at = ?3, ends_at = ?4, room_id = ?5, judge_user_id = ?6,
                         notes = CASE WHEN ?7 IS NULL THEN notes ELSE NULLIF(?7, '') END, version = version + 1
@@ -696,6 +701,7 @@ struct AdjournReq {
     judge_user_id: Option<i64>,
     reason: String,
     authorised_by: String,
+    override_reason: Option<String>,
 }
 
 /// Adjourn: the old hearing stays as 'adjourned' with reason + authoriser, a new linked hearing is
@@ -728,13 +734,21 @@ async fn adjourn(ctx: Ctx, Path(id): Path<i64>, IdemKey(key): IdemKey, JsonBody(
                     req.judge_user_id,
                     h["judge_user_id"].as_i64(),
                 )?;
+                if slot.starts_at == h["starts_at"].as_str().unwrap_or_default() {
+                    return Err(AppError::validation("Choose a new date or time"));
+                }
                 // Free the old slot first so the new booking cannot clash with it.
                 tx.execute(
                     "UPDATE hearings SET status = 'adjourned', status_reason = ?2, status_authorised_by = ?3, version = version + 1 WHERE id = ?1",
                     params![id, why, authorised],
                 )?;
-                let over = conflict_gate(tx, &actor, None, &slot, None)?;
+                let over = conflict_gate(tx, &actor, None, &slot, optional(&req.override_reason))?;
                 let new_id = insert_hearing(tx, &actor, case_id, &slot, "scheduled", Some(id), over.as_deref(), h["notes"].as_str().map(str::to_string))?;
+                if let Some(r) = &over {
+                    audit::record(tx, Some(&actor), Event::new("hearing.conflict_override", "hearing", new_id,
+                        format!("Conflict overridden for the hearing on {}", human_local(&slot.starts_at)))
+                        .case(Some(case_id)).details(json!({"reason": r})))?;
+                }
                 copy_participants(tx, id, new_id)?;
                 tx.execute("UPDATE hearings SET adjourned_to_id = ?2 WHERE id = ?1", params![id, new_id])?;
                 let assignee = service_officer(tx, case_id)?.unwrap_or(actor.user_id);
@@ -834,6 +848,7 @@ struct NextHearingIn {
     ends_local: String,
     room_id: Option<i64>,
     hearing_type: Option<String>,
+    override_reason: Option<String>,
 }
 
 #[derive(Deserialize)]
@@ -945,8 +960,13 @@ async fn outcome(
                     h["judge_user_id"].as_i64(),
                 )?;
                 let scheduled = actor.has(perm::HEARING_SCHEDULE);
-                let over = if scheduled { conflict_gate(tx, &actor, None, &slot, None)? } else { None };
+                let over = if scheduled { conflict_gate(tx, &actor, None, &slot, optional(&nh.override_reason))? } else { None };
                 let nid = insert_hearing(tx, &actor, case_id, &slot, if scheduled { "scheduled" } else { "draft" }, Some(id), over.as_deref(), None)?;
+                if let Some(r) = &over {
+                    audit::record(tx, Some(&actor), Event::new("hearing.conflict_override", "hearing", nid,
+                        format!("Conflict overridden for the hearing on {}", human_local(&slot.starts_at)))
+                        .case(Some(case_id)).details(json!({"reason": r})))?;
+                }
                 copy_participants(tx, id, nid)?;
                 next_v = hearing_json(tx, nid)?;
             }

@@ -1068,8 +1068,8 @@ async fn notices_use_case_participants_and_hearing_templates() {
     assert_eq!(d["recipient_name"], "Alexei Fenwick");
     let body = d["body"].as_str().unwrap();
     for expected in [
-        "2026-11-17T09:00",
-        "2026-11-19T09:00",
+        "Tuesday 17 November 2026 at 09:00",
+        "Thursday 19 November 2026 at 09:00",
         "Witness unavailable",
         &number,
     ] {
@@ -1212,6 +1212,8 @@ async fn intake_dispatches_follow_intake_access_even_after_linking() {
         .unwrap();
     let case = posted(&olga,&format!("/api/intakes/{iid}/register"),json!({"registry_id":reg,"category":"civil_contract","title":"Linked information request DEMO"})).await;
     let cid = case["case_id"].as_i64().unwrap();
+    assert_eq!(case["cancelled_requests"][0]["id"], second_id);
+    assert_eq!(case["cancelled_requests"][0]["status"], "cancelled");
     // Linked intake follows case visibility, while dispatch/mailbox still need intake.manage.
     let elena = olga.switch("elena").await;
     let (s, b) = elena.get(&format!("/api/mailbox/{mid}")).await;
@@ -1229,14 +1231,14 @@ async fn intake_dispatches_follow_intake_access_even_after_linking() {
     .await;
     let (s, b) = olga.get(&format!("/api/dispatches/{id}")).await;
     err(s, &b, StatusCode::NOT_FOUND, "not_found");
-    assert_eq!(tuvalu_court::outbox::process(&db).unwrap(), 1);
+    assert_eq!(tuvalu_court::outbox::process(&db).unwrap(), 0);
     assert_eq!(
         scalar(
             &db,
             "SELECT COUNT(*) FROM delivery_attempts WHERE dispatch_id=?1 AND status='failed'",
             second_id
         ),
-        1
+        0
     );
     assert_eq!(
         scalar(

@@ -85,6 +85,20 @@ pub fn utc_to_local(utc: &str) -> String {
     }
 }
 
+/// Court wall-clock text in English, for correspondence or a short next-action date.
+pub fn human_court_local(local: &str, short_date: bool) -> String {
+    let Ok(t) = PrimitiveDateTime::parse(local, LOCAL_FMT) else {
+        return local.to_string();
+    };
+    let weekday = t.weekday().to_string();
+    let month = t.month().to_string();
+    if short_date {
+        format!("{} {} {} {}", &weekday[..3], t.day(), &month[..3], t.year())
+    } else {
+        format!("{weekday} {} {month} {} at {:02}:{:02}", t.day(), t.year(), t.hour(), t.minute())
+    }
+}
+
 /// UTC text → court-local date `YYYY-MM-DD`.
 pub fn utc_to_local_date(utc: &str) -> String {
     match parse_utc(utc) {

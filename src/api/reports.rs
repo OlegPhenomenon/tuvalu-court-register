@@ -141,7 +141,31 @@ fn case_rows(rows: &[Value], extra: &[(&str, &str)]) -> (Vec<Value>, Vec<Value>)
 }
 
 /// The records behind a metric. Returns `(columns, rows)`; the count is `rows.len()`.
-fn fetch_items(
+fn fetch_items(c: &Connection, actor: &Actor, key: &str, p: &Period) -> AppResult<(Vec<Value>, Vec<Value>)> {
+    let (mut columns, mut rows) = raw_items(c, actor, key, p)?;
+    for row in &mut rows {
+        for (field, kind) in [("category", "case_category"), ("closure_basis", "closure_basis"), ("hearing_type", "hearing_type")] {
+            if let Some(code) = row[field].as_str() {
+                row[format!("{field}_label")] = json!(super::common::ref_label(c, kind, code)?);
+            }
+        }
+        for field in ["status", "state_as_of"] {
+            if let Some(code) = row[field].as_str() {
+                let label = code.replace('_', " ");
+                row[format!("{field}_label")] = json!(format!("{}{}", label[..1].to_uppercase(), &label[1..]));
+            }
+        }
+    }
+    for column in &mut columns {
+        if let Some(key) = column["key"].as_str()
+            && matches!(key, "category" | "status" | "closure_basis" | "state_as_of" | "hearing_type") {
+            column["key"] = json!(format!("{key}_label"));
+        }
+    }
+    Ok((columns, rows))
+}
+
+fn raw_items(
     c: &Connection,
     actor: &Actor,
     key: &str,
@@ -208,13 +232,16 @@ fn fetch_items(
                 "SELECT c.id, c.number, c.title, c.category, c.status, c.registered_date
                  FROM cases c
                  WHERE c.status <> 'closed' AND {}
-                   AND NOT EXISTS (SELECT 1 FROM hearings h WHERE h.case_id = c.id AND h.status = 'scheduled')
-                   AND NOT EXISTS (SELECT 1 FROM tasks t WHERE t.case_id = c.id AND t.status = 'open')
-                   AND NOT EXISTS (SELECT 1 FROM dispatches d WHERE d.case_id = c.id AND d.status IN ('draft','queued'))
                  ORDER BY c.registered_date, c.number",
                 vis()
             );
-            Ok(case_rows(&query_json(c, &sql, [])?, &[]))
+            let mut rows = Vec::new();
+            for row in query_json(c, &sql, [])? {
+                if super::cases::next_actions(c, actor, row["id"].as_i64().unwrap_or_default())?.is_empty() {
+                    rows.push(row);
+                }
+            }
+            Ok(case_rows(&rows, &[]))
         }
         "upcoming_hearings" => {
             let sql = format!(
@@ -245,10 +272,10 @@ fn fetch_items(
                         "ends_local": crate::time::utc_to_local(r["ends_at"].as_str().unwrap_or_default()),
                         "case_number": r["case_number"],
                         "case_title": r["case_title"],
-                        "hearing_type": r["hearing_type"],
+                        "hearing_type": r["hearing_type"], "status": r["status"],
                         "room": r["room"],
                         "judge": r["judge"],
-                        "link": format!("/cases/{}?tab=hearings", r["case_id"].as_i64().unwrap_or_default()),
+                        "link": format!("/cases/{}?tab=hearings&hearing={}", r["case_id"].as_i64().unwrap_or_default(), r["id"]),
                     })
                 })
                 .collect();
@@ -280,7 +307,7 @@ fn fetch_items(
                 .iter()
                 .map(|r| {
                     let link = match (r["case_id"].as_i64(), r["intake_id"].as_i64()) {
-                        (Some(cid), _) => format!("/cases/{cid}?tab=dispatch"),
+                        (Some(cid), _) => format!("/cases/{cid}?tab=dispatch&dispatch={}", r["id"]),
                         (None, Some(iid)) => format!("/intakes/{iid}"),
                         _ => "/".to_string(),
                     };

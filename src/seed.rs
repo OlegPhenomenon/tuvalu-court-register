@@ -67,25 +67,25 @@ const TEMPLATES: &[(&str, &str, &str, &str)] = &[
         "hearing_notice",
         "Notice of hearing",
         "{court}: hearing in {case_number}",
-        "Dear {recipient},\n\nA {hearing_type} in case {case_number} ({case_title}) is listed for {hearing_local} in {room}.\n\nPlease contact the registry if you cannot attend.\n\n{court} Registry",
+        "Dear {recipient},\n\nA {hearing_type} in case {case_number} ({case_title}) is listed for {hearing_local} in {room}.\n\nPlease contact the registry if you cannot attend.\n\n{court}",
     ),
     (
         "hearing_rescheduled",
         "Hearing rescheduled",
         "{court}: new hearing date in {case_number}",
-        "Dear {recipient},\n\nThe hearing in case {case_number} ({case_title}) previously listed for {previous_local} has been moved to {hearing_local} in {room}.\n\nReason: {reason}\n\n{court} Registry",
+        "Dear {recipient},\n\nThe hearing in case {case_number} ({case_title}) previously listed for {previous_local} has been moved to {hearing_local} in {room}.\n\nReason: {reason}\n\n{court}",
     ),
     (
         "information_request",
         "Request for missing information",
         "{court}: documents needed for your filing {intake_reference}",
-        "Dear {recipient},\n\nThank you for your filing received on {received_date}. Before it can be considered for registration the registry needs:\n\n{missing_items}\n\n{court} Registry",
+        "Dear {recipient},\n\nThank you for your filing received on {received_date}. Before it can be considered for registration the registry needs:\n\n{missing_items}\n\n{court}",
     ),
     (
         "copy_dispatch",
         "Copies of documents",
         "{court}: documents in {case_number}",
-        "Dear {recipient},\n\nPlease find attached copies of the documents listed below in case {case_number}.\n\n{items}\n\n{court} Registry",
+        "Dear {recipient},\n\nPlease find attached copies of the documents listed below in case {case_number}.\n\n{items}\n\n{court}",
     ),
 ];
 

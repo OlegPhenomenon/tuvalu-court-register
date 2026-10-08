@@ -120,6 +120,8 @@ Personas (demo): **Olga** (clerk): intake.manage, case.register, case.edit, hear
 Active assignment (`case_assignments.end_at IS NULL`) **or** (`case.view_all` and case not restricted) **or** `case.view_restricted`.
 Applies to lists, search suggestions, report counts (count only visible cases), exports, file downloads, the worker.
 Ending an assignment immediately ends access (including old file URLs — downloads re-check on every request).
+An assignment requires an active user with a case, hearing, task, document, decision, dispatch or case-export permission.
+System-only administrators cannot be assigned, including through the responsible-officer field. `/api/ref` staff entries include `assignable: bool`.
 
 ### Document access (policy::can_view_document) — on top of case access
 | visibility | who |
@@ -128,7 +130,9 @@ Ending an assignment immediately ends access (including old file URLs — downlo
 | `party_material` | anyone with case access |
 | `restricted` | uploader, or active `document_grants` row |
 | `judicial_note` | author only, or explicit active share (`document_grants`) — never via admin role |
-Viewing a restricted document or judicial note writes an audit event `document.viewed_restricted`.
+Opening/downloading a restricted file or judicial-note version writes `document.viewed_restricted` after its bytes are loaded.
+Document metadata/detail and list reads do not record views. Case history, exports and `/audit` omit document events
+outside the viewer's document access and `case.related` events whose counterpart case is hidden.
 Intake documents (no case yet): `intake.manage` holders.
 
 ## 5. State machines (server-enforced; invalid → 409 `invalid_transition`)
@@ -144,13 +148,40 @@ Intake documents (no case yet): `intake.manage` holders.
   human confirmation and legal service assessment are **separate** records.
 - Task: `open → done|cancelled(reason)|carried_forward(reason)`.
 
-Closing a case with open tasks/draft or queued dispatches/scheduled hearings → 409 `open_items` listing them; client resolves each
-(complete, cancel with reason, or carry forward with reason) then closes.
+Closing a case with open tasks, draft decisions, draft/queued/failed dispatches, draft/scheduled hearings or sent dispatches
+without a `human_handover` confirmation → 409 `open_items`, with `details.items: [{kind,id,label,status}]`.
+Sent dispatches have kind `unconfirmed_dispatch`; close accepts optional
+`acknowledge: [{kind:"unconfirmed_dispatch",id,reason}]`. Each must be confirmed or explicitly acknowledged with a non-empty reason.
+Other blockers must be resolved (complete, cancel with reason, or carry tasks forward with reason).
+Acknowledgements are stored in `case.closed` audit details under `acknowledge` and appended to `closure_note` as
+`Left unconfirmed: <label> — <reason>`. All changes and audit records are atomic; close is idempotent.
+
+Registering or linking an intake cancels its and its supplements' draft/queued information requests, recording
+`status_reason: "Not sent: the filing was registered"` and an audit event per request. Already sent/failed requests remain.
+The response includes `cancelled_requests: [{id,kind,recipient_name,status,status_reason}]`; obsolete `missing_items` are cleared.
+Intake detail has `next_actions: [{code,message,link}]`, including a draft request's review/send link `/dispatch?dispatch=<id>`.
+Request-info still returns `{ok,dispatch_id}`.
+
+Adjournment requires a changed start (`400`, "Choose a new date or time"). Adjourn and `outcome.next_hearing`
+accept `override_reason`, with the same conflict checks, permission and audit rules as creation.
+Draft hearing PATCH accepts `room_id: null` and `judge_user_id: null`; task PATCH accepts `assignee_user_id: null`;
+draft decision PATCH accepts `decision_date: null`. Null clears these values; omission preserves them.
 
 ## 6. Next-action messages
 `GET /api/cases/:id` returns `next_actions: [{code, message, link}]` computed server-side, e.g.
 "Confirm delivery of the hearing notice to Maria Tanaka", "Record the outcome of the hearing on 19 Nov 2026", "Finalise or withdraw the draft decision".
-Work queue aggregates these for the current user.
+Work queue aggregates these for the current user. Assignment links include `?tab=summary&action=assign-judge`;
+copy links include `?tab=dispatch&action=copies&decision=<id>&party=<id>` to select the decision's exact bound version and recipient.
+Dispatch and hearing actions include `dispatch=<id>` or `hearing=<id>` on their respective case tabs.
+Delivery messages identify the recipient and hearing's court-local date (or subject when no hearing is bound);
+decision-copy messages include the decision title and recipient.
+
+Templates render `{hearing_local}` and `{previous_local}` as English court-local text, e.g.
+"Tuesday 17 November 2026 at 09:00". Seeded sign-offs use `{court}` once. Dispatch audit summaries identify
+kind, recipient and document count instead of repeating the subject's court name; mailbox delivery adds the address.
+Mailbox attachments include `document_version_id`. Missing/unknown versions are redacted instead of causing a 404.
+Report drill-down rows keep codes and add `category_label`, `status_label`, `closure_basis_label` (when applicable);
+display/CSV columns use labels. `without_next_step` counts open visible cases with an empty computed `next_actions` list.
 
 ## 7. API surface (all JSON, prefix `/api`)
 ```

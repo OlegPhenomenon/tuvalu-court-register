@@ -166,27 +166,16 @@ pub(super) fn redact_items(
             let visible: i64 = conn.query_row(&sql, [vid], |r| r.get(0))?;
             if visible == 0 {
                 // Version metadata is immutable; the document title may have changed since send.
-                let metadata = query_one_json(
-                    conn,
-                    "SELECT version_no, filename FROM document_versions WHERE id=?1",
-                    [vid],
-                )?;
-                let suffix = format!(
-                    " (version {}, {})",
-                    metadata["version_no"],
-                    metadata["filename"].as_str().unwrap_or_default()
-                );
-                body = body
-                    .lines()
-                    .map(|line| {
-                        if line.starts_with("- ") && line.ends_with(&suffix) {
-                            "- Restricted document"
-                        } else {
-                            line
-                        }
-                    })
-                    .collect::<Vec<_>>()
-                    .join("\n");
+                let metadata = query_json(conn,
+                    "SELECT version_no, filename FROM document_versions WHERE id=?1", [vid])?.into_iter().next();
+                let suffix = metadata.as_ref().map(|m| format!(" (version {}, {})", m["version_no"], m["filename"].as_str().unwrap_or_default()));
+                // Legacy/malformed attachments may have no version at all. Fail closed for
+                // their inventory text, without aborting the mailbox list or leaking filenames.
+                body = body.lines().map(|line| {
+                    if line.starts_with("- ") && suffix.as_ref().is_none_or(|s| line.ends_with(s)) {
+                        "- Restricted document"
+                    } else { line }
+                }).collect::<Vec<_>>().join("\n");
                 *item = json!({"document_version_id":vid,"restricted":true,"document_title":"Restricted document"});
             }
         }
@@ -570,7 +559,7 @@ async fn create(
                     "dispatch.prepared",
                     "dispatch",
                     id,
-                    format!("Prepared {} to {recipient_name}", if req.kind == "copies" { "a copy package" } else { "a notice" }),
+                    super::common::dispatch_activity(tx, id, "prepared")?,
                 )
                 .case(Some(case_id)),
             )?;
@@ -689,7 +678,7 @@ async fn preview(ctx: Ctx, Path(id): Path<i64>) -> JsonResult {
                     "dispatch.reviewed",
                     "dispatch",
                     id,
-                    format!("Reviewed {} to {}", d["subject"].as_str().unwrap_or_default(), d["recipient_name"].as_str().unwrap_or_default()),
+                    super::common::dispatch_activity(tx, id, "reviewed")?,
                 )
                 .case(d["case_id"].as_i64()),
             )?;
@@ -734,7 +723,7 @@ async fn queue(
                 audit::record(
                     tx,
                     Some(&actor),
-                    Event::new("dispatch.queued", "dispatch", id, format!("Queued for delivery to {}", d["recipient_name"].as_str().unwrap_or_default()))
+                    Event::new("dispatch.queued", "dispatch", id, super::common::dispatch_activity(tx, id, "queued for delivery")?)
                         .case(d["case_id"].as_i64()),
                 )?;
                 dispatch_json(tx, &actor, id)
@@ -793,7 +782,7 @@ async fn record_sent(
             audit::record(
                 tx,
                 Some(&actor),
-                Event::new("dispatch.sent", "dispatch", id, format!("Recorded as sent to {}", d["recipient_name"].as_str().unwrap_or_default()))
+                Event::new("dispatch.sent", "dispatch", id, super::common::dispatch_activity(tx, id, "sent")?)
                     .case(d["case_id"].as_i64())
                     .details(json!({ "method": d["method"], "manual": true, "occurred_date": date, "attempt_no": attempt_no })),
             )?;

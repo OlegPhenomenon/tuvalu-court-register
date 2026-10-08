@@ -1,5 +1,5 @@
 //! C15 history & audit. Every actor who can see a case may read its history; events touching a
-//! document the actor cannot see are redacted (the event stays, the content is hidden).
+//! document the actor cannot see are omitted.
 //! The global audit browser and chain verification require `audit.view`.
 
 use super::common::{JsonResult, optional, query_json};
@@ -20,8 +20,6 @@ pub fn routes() -> Router<AppState> {
         .route("/audit", get(list))
         .route("/audit/verify", get(verify))
 }
-
-const REDACTED: &str = "Activity on a document you do not have access to";
 
 /// True when the event concerns a document the actor may not see.
 fn touches_hidden_document(
@@ -51,8 +49,8 @@ fn touches_hidden_document(
     Ok(c.query_row(&sql, [doc_id], |r| r.get::<_, i64>(0))? == 0)
 }
 
-/// Shape one audit row for the case history, redacting document events the actor may not see.
-fn event_json(c: &Connection, actor: &Actor, ev: &Value, with_details: bool) -> AppResult<Value> {
+/// Shape one audit row for the case history, omitting events the actor may not see.
+fn event_json(c: &Connection, actor: &Actor, ev: &Value, with_details: bool) -> AppResult<Option<Value>> {
     let entity_type = ev["entity_type"].as_str().unwrap_or_default();
     let entity_id = ev["entity_id"].as_i64();
     let action = ev["action"].as_str().unwrap_or_default();
@@ -61,7 +59,7 @@ fn event_json(c: &Connection, actor: &Actor, ev: &Value, with_details: bool) -> 
         if let Some(other) = details["related_case_id"].as_i64() {
             policy::require_case(c, actor, other).is_err()
         } else {
-            // Old events have no counterpart id: redact if any related case is hidden.
+            // Old events have no counterpart id: omit if any related case is hidden.
             let sql = format!(
                 "SELECT COUNT(*) FROM case_relations r WHERE (r.from_case_id=?1 OR r.to_case_id=?1) AND NOT ({})",
                 policy::case_visible_sql(
@@ -76,6 +74,9 @@ fn event_json(c: &Connection, actor: &Actor, ev: &Value, with_details: bool) -> 
     };
     let hidden =
         hidden_relation || touches_hidden_document(c, actor, entity_type, entity_id, action)?;
+    if hidden {
+        return Ok(None);
+    }
     let mut out = json!({
         "id": ev["id"],
         "at": ev["at"],
@@ -83,21 +84,19 @@ fn event_json(c: &Connection, actor: &Actor, ev: &Value, with_details: bool) -> 
         "user_id": ev["user_id"],
         "user_name": ev["user_name"],
         "action": ev["action"],
-        "summary": if hidden_relation { "Activity on a case you do not have access to" } else if hidden { REDACTED } else { ev["summary"].as_str().unwrap_or_default() },
+        "summary": ev["summary"],
     });
     if with_details {
         out["entity_type"] = ev["entity_type"].clone();
         out["entity_id"] = ev["entity_id"].clone();
         out["case_id"] = ev["case_id"].clone();
         out["ip"] = ev["ip"].clone();
-        if !hidden {
-            out["details"] = serde_json::from_str(ev["details"].as_str().unwrap_or("{}"))?;
-        }
+        out["details"] = details;
     }
-    Ok(out)
+    Ok(Some(out))
 }
 
-/// Audit events of one case, oldest first, redacted for the given actor.
+/// Audit events of one case, oldest first, filtered for the given actor.
 /// Shared with the case export (chronology section).
 pub fn case_history(c: &Connection, actor: &Actor, case_id: i64) -> AppResult<Vec<Value>> {
     history(c, actor, case_id, None)
@@ -141,6 +140,7 @@ fn history(
     )?;
     let mut events = Vec::with_capacity(rows.len());
     for ev in &rows {
+        let Some(event) = event_json(c, actor, ev, false)? else { continue };
         if let Some(ids) = package_ids {
             let entity = ev["entity_type"].as_str().unwrap_or_default();
             if matches!(entity, "document" | "document_version") {
@@ -180,7 +180,7 @@ fn history(
                 }
             }
         }
-        events.push(event_json(c, actor, ev, false)?);
+        events.push(event);
     }
     Ok(events)
 }
@@ -259,7 +259,9 @@ async fn list(ctx: Ctx, Query(q): Query<AuditQuery>) -> JsonResult {
             let rows = query_json(c, &sql, params![q.case_id, q.user_id, optional(&q.action), from_utc, to_utc, limit])?;
             let mut events = Vec::with_capacity(rows.len());
             for ev in &rows {
-                events.push(event_json(c, &actor, ev, true)?);
+                if let Some(event) = event_json(c, &actor, ev, true)? {
+                    events.push(event);
+                }
             }
             Ok(json!({ "events": events }))
         })

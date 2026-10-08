@@ -77,6 +77,18 @@ pub mod perm {
     ];
 }
 
+/// A system-only administrator cannot gain case access through an assignment.
+pub fn user_assignable(conn: &Connection, user_id: i64) -> AppResult<bool> {
+    Ok(conn.query_row(
+        "SELECT EXISTS (SELECT 1 FROM users u JOIN user_permissions p ON p.user_id = u.id
+         WHERE u.id = ?1 AND u.active = 1 AND (p.permission LIKE 'case.%'
+         OR p.permission LIKE 'hearing.%' OR p.permission LIKE 'task.%'
+         OR p.permission LIKE 'document.%' OR p.permission LIKE 'decision.%'
+         OR p.permission LIKE 'dispatch.%' OR p.permission = 'export.case'))",
+        [user_id], |r| r.get(0),
+    )?)
+}
+
 /// SQL boolean expression: "actor can see the case whose id is `case_id_expr`".
 /// Only integer literals derived from the actor are interpolated.
 pub fn case_visible_sql(actor: &Actor, case_id_expr: &str) -> String {
@@ -184,7 +196,7 @@ pub struct DocRef {
 }
 
 impl DocRef {
-    /// Restricted documents and judicial notes are logged on every view.
+    /// Restricted files and judicial notes are logged when their bytes are opened or downloaded.
     pub fn is_sensitive(&self) -> bool {
         matches!(self.visibility.as_str(), "restricted" | "judicial_note")
     }

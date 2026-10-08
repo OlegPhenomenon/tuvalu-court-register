@@ -239,7 +239,8 @@ async fn create(
 struct UpdateReq {
     version: i64,
     title: Option<String>,
-    decision_date: Option<String>,
+    #[serde(default, deserialize_with = "super::common::nullable")]
+    decision_date: Option<Option<String>>,
     document_version_id: Option<i64>,
 }
 
@@ -267,16 +268,17 @@ async fn update(ctx: Ctx, Path(id): Path<i64>, JsonBody(req): JsonBody<UpdateReq
                 None => None,
             };
             tx.execute(
-                "UPDATE decisions SET title = COALESCE(?2, title), decision_date = COALESCE(?3, decision_date),
+                "UPDATE decisions SET title = COALESCE(?2, title), decision_date = CASE WHEN ?6 THEN ?3 ELSE decision_date END,
                         document_id = COALESCE(?4, document_id), document_version_id = COALESCE(?5, document_version_id),
                         version = version + 1
                  WHERE id = ?1",
                 params![
                     id,
                     title,
-                    crate::time::parse_opt_date(req.decision_date.as_deref())?,
+                    crate::time::parse_opt_date(req.decision_date.as_ref().and_then(|d| d.as_deref()))?,
                     new_doc,
-                    req.document_version_id
+                    req.document_version_id,
+                    req.decision_date.is_some()
                 ],
             )?;
             audit::record(

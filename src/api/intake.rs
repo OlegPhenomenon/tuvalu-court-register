@@ -204,6 +204,13 @@ async fn detail(ctx: Ctx, Path(id): Path<i64>) -> JsonResult {
             let created_by = super::common::user_name(c, intake["created_by"].as_i64())?;
             intake["created_by_name"] = json!(created_by);
             let actions = allowed_actions(&actor, &intake);
+            let next_actions: Vec<Value> = query_json(c,
+                "SELECT id, recipient_name FROM dispatches WHERE intake_id = ?1 AND kind = 'information_request' AND status = 'draft' ORDER BY id", [id])?
+                .iter().map(|d| json!({
+                    "code": "review_dispatch",
+                    "message": format!("Review and send the information request to {}.", d["recipient_name"].as_str().unwrap_or_default()),
+                    "link": format!("/dispatch?dispatch={}", d["id"]),
+                })).collect();
             Ok(json!({
                 "intake": intake,
                 "case": case,
@@ -216,6 +223,7 @@ async fn detail(ctx: Ctx, Path(id): Path<i64>) -> JsonResult {
                     "SELECT id, kind, recipient_name, method, subject, status, prepared_at FROM dispatches WHERE intake_id = ?1 ORDER BY id", [id])?,
                 "checksum_matches": checksum_matches(c, &actor, id)?,
                 "allowed_actions": actions,
+                "next_actions": next_actions,
             }))
         })
         .await?;
@@ -501,6 +509,27 @@ fn attach_documents(tx: &Transaction, intake_id: i64, case_id: i64) -> AppResult
     )?)
 }
 
+/// Once a filing is linked, unsent requests are obsolete. The worker and this change share
+/// the same immediate transaction, so queued requests cannot be delivered after cancellation.
+fn cancel_information_requests(tx: &Transaction, actor: &Actor, intake_id: i64, case_id: i64) -> AppResult<Vec<Value>> {
+    let mut requests = query_json(tx,
+        "SELECT id, kind, recipient_name, status FROM dispatches WHERE kind = 'information_request'
+         AND status IN ('draft','queued') AND (intake_id = ?1 OR intake_id IN (SELECT id FROM intakes WHERE parent_intake_id = ?1)) ORDER BY id",
+        [intake_id])?;
+    let why = "Not sent: the filing was registered";
+    for request in &mut requests {
+        let id = request["id"].as_i64().unwrap_or_default();
+        tx.execute("UPDATE dispatches SET status = 'cancelled', status_reason = ?2, version = version + 1 WHERE id = ?1", params![id, why])?;
+        audit::record(tx, Some(actor), Event::new("dispatch.cancelled", "dispatch", id,
+            format!("Information request to {} cancelled", request["recipient_name"].as_str().unwrap_or_default()))
+            .case(Some(case_id)).details(json!({"reason": why, "intake_id": intake_id})))?;
+        request["status"] = json!("cancelled");
+        request["status_reason"] = json!(why);
+    }
+    tx.execute("UPDATE intakes SET missing_items = NULL WHERE id = ?1 OR parent_intake_id = ?1", [intake_id])?;
+    Ok(requests)
+}
+
 #[derive(Deserialize, Serialize)]
 struct LinkReq {
     case_id: i64,
@@ -512,9 +541,11 @@ async fn link(ctx: Ctx, Path(id): Path<i64>, IdemKey(key): IdemKey, JsonBody(req
     let v = ctx
         .db
         .write(move |tx| {
-            let intake = load_for_change(tx, &actor, id, OPEN_STATES)?;
+            let intake = require_intake(tx, &actor, id)?;
+            actor.require(perm::INTAKE_MANAGE)?;
             let case = policy::require_case(tx, &actor, req.case_id)?;
             idempotent(tx, &actor, &key, "intake.link", &(id, &req), || {
+                load_for_change(tx, &actor, id, OPEN_STATES)?;
                 tx.execute("UPDATE intakes SET case_id = ?2 WHERE id = ?1", params![id, case.id])?;
                 set_status(tx, id, "linked_to_case", optional(&req.note).as_deref())?;
                 tx.execute(
@@ -522,6 +553,7 @@ async fn link(ctx: Ctx, Path(id): Path<i64>, IdemKey(key): IdemKey, JsonBody(req
                     params![id, case.id],
                 )?;
                 let docs = attach_documents(tx, id, case.id)?;
+                let cancelled_requests = cancel_information_requests(tx, &actor, id, case.id)?;
                 audit::record(
                     tx,
                     Some(&actor),
@@ -534,7 +566,7 @@ async fn link(ctx: Ctx, Path(id): Path<i64>, IdemKey(key): IdemKey, JsonBody(req
                     .case(Some(case.id))
                     .details(json!({ "documents_attached": docs })),
                 )?;
-                Ok(json!({ "case_id": case.id, "number": case.number }))
+                Ok(json!({ "case_id": case.id, "number": case.number, "cancelled_requests": cancelled_requests }))
             })
         })
         .await?;
@@ -622,6 +654,7 @@ async fn register(ctx: Ctx, Path(id): Path<i64>, IdemKey(key): IdemKey, JsonBody
                     params![id, ncase.id],
                 )?;
                 let docs = attach_documents(tx, id, ncase.id)?;
+                let cancelled_requests = cancel_information_requests(tx, &actor, id, ncase.id)?;
                 if let Some(rel) = &related {
                     tx.execute(
                         "INSERT INTO case_relations (from_case_id, to_case_id, kind, note, created_by, created_at)
@@ -636,7 +669,7 @@ async fn register(ctx: Ctx, Path(id): Path<i64>, IdemKey(key): IdemKey, JsonBody
                         .case(Some(ncase.id))
                         .details(json!({ "intake_id": id, "documents_attached": docs, "related_case_id": req.related_case_id })),
                 )?;
-                Ok(json!({ "case_id": ncase.id, "number": ncase.number }))
+                Ok(json!({ "case_id": ncase.id, "number": ncase.number, "cancelled_requests": cancelled_requests }))
             })
         })
         .await?;
