@@ -100,6 +100,17 @@ router against a temporary data directory; no external services needed.
 | 57 | Users, rooms, registries, reference lists, templates and settings are editable without the developer | `tests/admin_seed.rs::admin_reference_data`, `admin_settings_validation`, `admin_user_management_in_demo` |
 | 58 | Install/upgrade/backup/restore verified on a clean environment | `tests/backup.rs::encrypted_backup_restore_checks_all_data_and_failure_paths` + manual — follow `docs/OPERATIONS.md` on a fresh server |
 
+## H. Added after the C01–C18 walkthrough and the review of `136d796`
+
+| # | Check | Covered by |
+|---|---|---|
+| 59 | Cancelling an announced hearing records who must be told (one task per required participant), completed by a queued or sent cancellation notice or by hand; open "new date" tasks for that hearing are retired with a reason (C08) | `tests/hearings_tasks.rs::cancelling_scheduled_hearing_creates_notify_tasks_completed_by_cancellation_notice`, `cancelling_an_adjourned_to_hearing_retires_its_open_new_date_tasks` |
+| 60 | A hearing outcome can link its minutes as an exact, visible, clean version of the same case (not a judicial note); others see it redacted (C10) | `tests/hearings_tasks.rs::outcome_record_must_be_visible_same_case_version_and_is_redacted_for_others` |
+| 61 | Ending the responsible clerk's assignment or deactivating the user clears the responsible officer; the response states whether the person can still open the case and on what basis (C05) | `tests/audit_access.rs::c05_ending_responsible_clerk_clears_responsibility_and_reports_no_access`, `c05_residual_access_reports_case_view_all_and_deactivation_clears_responsible` |
+| 62 | Staff workload numbers open the matching accessible cases or tasks, with CSV; undelivered notices exclude superseded invitations exactly like the case screen (§11) | `tests/reports_search.rs::workload_counts_open_their_accessible_cases_and_csv`, `undelivered_report_skips_invitations_for_adjourned_hearings` |
+| 63 | A decision lists the copies issued to recipients the viewer may see (§5) | `tests/decisions_dispatch.rs::finalised_decision_lists_its_issued_copies` |
+| 64 | Import batches follow document access: another importer never sees the title or filename of restricted material in a package, and only the uploader commits such a package (R04) | `tests/import_visibility_regression.rs` (3 tests) |
+
 ## Notes
 
 - Items marked "manual" are UI-layer behaviours verified in the recorded

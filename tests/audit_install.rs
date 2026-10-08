@@ -991,7 +991,7 @@ async fn f16_t33_t36_env_file_cli_backup_restore_and_real_server_login() {
         .unwrap();
     let mut server = RunningServer(child);
     let mut ready = false;
-    for _ in 0..100 {
+    for _ in 0..500 {
         if tokio::net::TcpStream::connect(("127.0.0.1", port)).await.is_ok() {
             ready = true;
             break;
@@ -1987,11 +1987,13 @@ async fn r3_restore_revokes_source_sessions_and_allows_password_totp_login() {
         .spawn()
         .unwrap();
     let mut server = RunningServer(child);
-    for _ in 0..100 {
+    let mut ready = false;
+    for _ in 0..500 {
         if tokio::net::TcpStream::connect(("127.0.0.1", port))
             .await
             .is_ok()
         {
+            ready = true;
             break;
         }
         assert!(
@@ -2000,6 +2002,7 @@ async fn r3_restore_revokes_source_sessions_and_allows_password_totp_login() {
         );
         tokio::time::sleep(std::time::Duration::from_millis(20)).await;
     }
+    assert!(ready, "restored server did not start listening within 10 s");
     for cookie in [c.session.as_deref().unwrap(), &pending_cookie] {
         assert_eq!(
             network_http(port, "GET", "/api/auth/me", json!({}), Some(cookie))
