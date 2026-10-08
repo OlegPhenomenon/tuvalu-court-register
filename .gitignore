@@ -6,3 +6,4 @@ data/
 *.key
 .orch/
 .worktrees/
+.playwright-mcp/
