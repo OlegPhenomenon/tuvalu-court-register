@@ -107,9 +107,20 @@ timeout or interrupted scan produces `quarantined`. Pending/quarantined files
 cannot be downloaded, previewed, exported or attached to outgoing mail. A server
 restart quarantines interrupted scans; submit a new version when the scanner is
 healthy. File imports commit pending versions, then use the same scanner path
-outside the import transaction. A detached task completes scans for every imported
-version even if the request disconnects. Format checks and
-antivirus reduce risk; neither proves a file absolutely safe.
+outside the import transaction. A detached task completes scans for every
+imported version even if the request disconnects. PDF checks allow ordinary
+destinations, GoTo/URI links and duplicate metadata keys, while resolving
+indirect actions (including compressed objects) and rejecting active content,
+attachments, encryption, ambiguous security keys and malformed/unresolvable
+constructs. Flate, ASCIIHex, ASCII85, RunLength and LZW filter chains and common
+8-bit TIFF/PNG predictors are decoded with small streaming buffers. The shared
+decoding work budget is 64 times the configured upload byte limit
+(`TCR_UPLOAD_MAX_MB`); object-stream buffers and the retained object table are
+each capped at 32 MiB, parsed values at 8 MiB, predictor rows at 1 MiB and
+filter chains at eight stages. Non-image encodings that cannot be inspected and
+files exceeding these bounds are quarantined. Declared image data may remain
+uninspected; image codecs never exempt non-image or object streams. Format
+checks and antivirus reduce risk; neither proves a file absolutely safe.
 
 ## Backup, restore, upgrade and audit
 

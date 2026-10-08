@@ -220,21 +220,32 @@ quarantines interrupted pending checks. Download, inline preview, export, dispat
 SMTP attachments and mailbox links cannot retrieve pending/quarantined bytes.
 Imports commit pending versions before contacting clamd outside the writer
 transaction; their detached scan task continues through every imported version
-even if the request disconnects; full backups retain verdicts. Built-in checks
-include PDF dictionary
-tokenisation (comments, escaped/nested strings, hex strings, nested dictionaries,
-escaped names) at the document level and inside `/Type /ObjStm` streams. Other
-stream payloads (content, fonts, images, xref and functions) receive an active-name
-scan of complete names at PDF lexical boundaries, including `#xx` decoding,
-without object tokenisation. Flate-only streams have bounded inflation (8 MiB per stage, 32 MiB total); work on ordinary
-object syntax is bounded by the upload byte limit and nesting limits, without a
-token-count cap. Common 8-bit TIFF/PNG predictors are reversed before inspecting
-non-image data. Unsupported predictors and decode parameters fail closed for
-non-image streams, as do non-Flate filters unless the stream is clearly image
-data (`/Subtype /Image` or a recognised image codec). Object streams cannot use
-the image exception. Unparsable dictionaries are quarantined. Built-in checks
-also cover PNG CRC/structure, JPEG segments/EOI and DOCX macros/ActiveX/OLE. Neither
-these checks nor antivirus prove absolute file safety.
+even if the request disconnects; full backups retain verdicts.
+Built-in checks include PDF dictionary tokenisation (comments, escaped/nested
+strings, hex strings, nested dictionaries and escaped names), including bounded
+`/Type /ObjStm` parsing and an indirect-object table. OpenAction destinations,
+GoTo and URI links are allowed; action dictionaries are checked through indirect
+references, including compressed objects and `/S` references. JavaScript names,
+attachments, RichMedia, XFA, launch/form submission, import, rendition and
+embedded/remote executable actions are quarantined. Encrypted files, unresolved
+actions and malformed syntax fail closed. Duplicate security-relevant keys
+(including action, stream decoding and file-specification keys) fail closed;
+duplicate ordinary metadata keys are allowed. Content/font/xref streams receive
+a complete-name scan at PDF lexical boundaries, with `#xx` escapes and bounded
+lookahead across chunks, rather than object tokenisation. Flate, ASCIIHex,
+ASCII85, RunLength and LZW (EarlyChange 0/1) decode through streaming filter
+chains of at most eight stages. Common 8-bit TIFF/PNG predictors are reversed
+row by row (at most 1 MiB per row). Decoded bytes across all stages share a per-
+file budget of 64 times the configured upload limit; object-stream buffers and
+the retained object table each have a 32 MiB cap, with an 8 MiB allocation
+budget per parsed value. Large scalar arrays are summarised, and fail closed if
+used as actions or decoding parameters. Clearly declared image data may remain
+uninspected for image codecs, byte-oriented image encodings or unsupported
+predictors; object streams cannot use that exception, and an image codec alone
+never exempts a non-image stream. Unsupported non-image encodings/parameters
+fail closed. Built-in checks also cover PNG CRC/structure, JPEG segments/EOI and
+DOCX macros/ActiveX/OLE. Neither these checks nor antivirus prove absolute file
+safety.
 
 SMTP requires STARTTLS or implicit TLS with rustls/ring and bundled webpki roots;
 credentials never appear in Settings. Demo ignores SMTP configuration. Production

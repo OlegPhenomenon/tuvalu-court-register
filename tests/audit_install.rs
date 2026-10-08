@@ -2283,3 +2283,367 @@ fn r3_pdf_xml_thumbnail_names_are_not_action_keys() {
     .unwrap();
     assert_eq!(stored.scan_status, "clean", "{:?}", stored.scan_note);
 }
+
+// Follow-up PDF compatibility and fail-closed action/encoding regressions.
+fn r3_followup_pdf_status(bytes: &[u8], expected: &str, limit: u64) {
+    let app = TestApp::production();
+    let db = app.state.main_db.as_ref().unwrap();
+    let stored = tuvalu_court::storage::store(db, bytes, "demo.pdf", limit).unwrap();
+    assert_eq!(stored.scan_status, expected, "{:?}", stored.scan_note);
+}
+
+#[test]
+fn r3_followup_pdf_actions_and_duplicate_keys() {
+    for body in [
+        "1 0 obj <</OpenAction[3 0 R/Fit]>> endobj",
+        "1 0 obj <</OpenAction 2 0 R>> endobj 2 0 obj [3 0 R/Fit] endobj",
+        "1 0 obj <</AA<</O<</S/GoTo/D[3 0 R/Fit]>>>>>> endobj",
+        "1 0 obj <</OpenAction 2 0 R>> endobj 2 0 obj <</S 4 0 R/D[3 0 R/Fit]>> endobj 4 0 obj /GoTo endobj",
+        "1 0 obj <</Type/Annot/Subtype/Link/A<</S/URI/URI(https://example.test/)>>>> endobj",
+        "1 0 obj <</OpenAction<</S/GoToR/F(other.pdf)/D[0/Fit]>>>> endobj",
+        "1 0 obj <</OpenAction<</S/ResetForm>>>> endobj",
+        "1 0 obj <</OpenAction<</S/Sound>>>> endobj",
+        "1 0 obj <</OpenAction<</S/Movie>>>> endobj",
+        "1 0 obj <</Producer(DEMO first)/Producer(DEMO second)>> endobj",
+        "1 0 obj <</Note/Launch/Label/SubmitForm>> endobj",
+        "1 0 obj <</Note/Encrypt/Encrypt null>> endobj",
+        "1 0 obj <</Subtype/Link/A 2 0 R>> endobj 2 0 obj <</S 4 0 R/URI(https://example.test/)>> endobj 4 0 obj /URI endobj",
+        "1 0 obj <</Type/Font/CharProcs<</A 9 0 R>>>> endobj",
+    ] {
+        r3_followup_pdf_status(
+            format!("%PDF-1.5\n{body}\n%%EOF").as_bytes(),
+            "clean",
+            1_000_000,
+        );
+    }
+    for body in [
+        "1 0 obj <</OpenAction 2 0 R>> endobj 2 0 obj <</S 4 0 R>> endobj 4 0 obj /JavaScript endobj",
+        "1 0 obj <</OpenAction 2 0 R>> endobj 2 0 obj <</S/Launch>> endobj",
+        "1 0 obj <</OpenAction 2 0 R>> endobj",
+        "1 0 obj <</OpenAction 2 0 R>> endobj 2 0 obj <</S 4 0 R>> endobj",
+        "1 0 obj <</AA<</O 7 0 R>>>> endobj",
+        "1 0 obj <</OpenAction<</S/URI/Next 2 0 R>>>> endobj 2 0 obj <</S/Launch>> endobj",
+        "1 0 obj <</OpenAction<</S/GoToR/F 2 0 R>>>> endobj 2 0 obj <</F(DEMO.cmd)>> endobj",
+        "1 0 obj <</OpenAction<</S/GoToR/F<FEFF00640065006D006F002E006500780065>>>>>> endobj",
+        "1 0 obj <</S/URI/S/Launch>> endobj",
+        "1 0 obj <</S/URI/#53/URI>> endobj",
+        "1 0 obj <</Note/J#53>> endobj",
+        "1 0 obj <</Encrypt 2 0 R>> endobj",
+        "1 0 obj <</Subtype/Link/A 9 0 R>> endobj",
+        "1 0 obj <</Title(DEMO outline)/A 9 0 R>> endobj",
+        "1 0 obj <</OpenAction<</S/GoToR/F<</FS/URL/F(file:///DEMO%2Eexe)>>>>>> endobj",
+        "1 0 obj <</OpenAction<</S/GoToR/F(DEMO.exe:Zone.Identifier)>>>> endobj",
+        "1 0 obj <</OpenAction 2 0 R>> endobj 2 0 obj <</S/URI/Next 2 0 R>> endobj",
+    ] {
+        r3_followup_pdf_status(
+            format!("%PDF-1.5\n{body}\n%%EOF").as_bytes(),
+            "quarantined",
+            1_000_000,
+        );
+    }
+    for action in [
+        "JavaScript",
+        "Launch",
+        "SubmitForm",
+        "ImportData",
+        "Rendition",
+        "GoToE",
+    ] {
+        r3_followup_pdf_status(
+            format!("%PDF-1.5\n1 0 obj <</OpenAction<</S/{action}>>>> endobj\n%%EOF").as_bytes(),
+            "quarantined",
+            1_000_000,
+        );
+    }
+}
+
+fn r3_followup_ascii85(bytes: &[u8]) -> Vec<u8> {
+    let mut encoded = Vec::new();
+    for group in bytes.chunks(4) {
+        let mut word = [0; 4];
+        word[..group.len()].copy_from_slice(group);
+        let mut value = u32::from_be_bytes(word);
+        if value == 0 && group.len() == 4 {
+            encoded.push(b'z');
+            continue;
+        }
+        let mut digits = [0; 5];
+        for digit in digits.iter_mut().rev() {
+            *digit = (value % 85) as u8 + b'!';
+            value /= 85;
+        }
+        encoded.extend_from_slice(&digits[..group.len() + 1]);
+    }
+    encoded.extend_from_slice(b"~>");
+    encoded
+}
+fn r3_followup_runlength(bytes: &[u8]) -> Vec<u8> {
+    let mut encoded = Vec::new();
+    for group in bytes.chunks(128) {
+        encoded.push(group.len() as u8 - 1);
+        encoded.extend_from_slice(group);
+    }
+    encoded.push(128);
+    encoded
+}
+// Literal LZW codes exercise all width transitions and dictionary saturation,
+// without coupling the fixture to a compression library or the production decoder.
+fn r3_followup_lzw(bytes: &[u8], early: usize) -> Vec<u8> {
+    let mut encoded = Vec::new();
+    let mut bits = 0u32;
+    let mut available = 0usize;
+    let mut width = 9;
+    let mut next = 258usize;
+    for (index, code) in std::iter::once(256u16)
+        .chain(bytes.iter().map(|b| *b as u16))
+        .chain(std::iter::once(257))
+        .enumerate()
+    {
+        bits = (bits << width) | code as u32;
+        available += width;
+        while available >= 8 {
+            available -= 8;
+            encoded.push((bits >> available) as u8);
+            bits &= (1 << available) - 1;
+        }
+        if index > 1 && code != 257 && next < 4096 {
+            next += 1;
+            if width < 12 && next + early == 1 << width {
+                width += 1;
+            }
+        }
+    }
+    if available > 0 {
+        encoded.push((bits << (8 - available)) as u8);
+    }
+    encoded
+}
+
+#[test]
+fn r3_followup_pdf_encoded_object_streams() {
+    for active in [false, true] {
+        let content = if active {
+            b"8 0 <</JS(DEMO)>>".as_slice()
+        } else {
+            b"8 0 <</Producer(DEMO)>>"
+        };
+        let expected = if active { "quarantined" } else { "clean" };
+        for (filter, params, encoded) in [
+            (
+                "ASCIIHexDecode",
+                "",
+                format!("{}>", hex::encode(content)).into_bytes(),
+            ),
+            ("ASCII85Decode", "", r3_followup_ascii85(content)),
+            ("RunLengthDecode", "", r3_followup_runlength(content)),
+            (
+                "LZWDecode",
+                "/DecodeParms<</EarlyChange 0>>",
+                r3_followup_lzw(content, 0),
+            ),
+            (
+                "LZWDecode",
+                "/DecodeParms<</EarlyChange 1>>",
+                r3_followup_lzw(content, 1),
+            ),
+        ] {
+            let dict = format!("/Type/ObjStm/N 1/First 4/Filter/{filter}{params}");
+            r3_followup_pdf_status(&r3_stream(&dict, &encoded), expected, 1_000_000);
+        }
+        let flate = miniz_oxide::deflate::compress_to_vec_zlib(content, 6);
+        let encoded = r3_followup_ascii85(&flate);
+        r3_followup_pdf_status(
+            &r3_stream(
+                "/Type/ObjStm/N 1/First 4/Filter[/ASCII85Decode/FlateDecode]/DecodeParms[null null]",
+                &encoded,
+            ),
+            expected,
+            1_000_000,
+        );
+    }
+    // The action dictionary and /S target both live in compressed objects.
+    for action in ["GoTo", "Launch", "JavaScript"] {
+        let first_object = b"<</S 9 0 R/D[3 0 R/Fit]>>";
+        let header = format!("8 0 9 {} ", first_object.len() + 1);
+        let content = [
+            header.as_bytes(),
+            first_object,
+            b" ",
+            format!("/{action}").as_bytes(),
+        ]
+        .concat();
+        let compressed = miniz_oxide::deflate::compress_to_vec_zlib(&content, 6);
+        let mut pdf = r3_stream(
+            &format!("/Type/ObjStm/N 2/First {}/Filter/FlateDecode", header.len()),
+            &compressed,
+        );
+        pdf.extend_from_slice(b"\n10 0 obj <</OpenAction 8 0 R>> endobj\n%%EOF");
+        r3_followup_pdf_status(
+            &pdf,
+            if action == "GoTo" {
+                "clean"
+            } else {
+                "quarantined"
+            },
+            1_000_000,
+        );
+    }
+    for early in [0, 1] {
+        let mut content = b"8 0 <</Note(".to_vec();
+        content.extend_from_slice(&b"DEMO literal text ".repeat(500));
+        content.extend_from_slice(b")>>");
+        r3_followup_pdf_status(
+            &r3_stream(
+                &format!(
+                    "/Type/ObjStm/N 1/First 4/Filter/LZWDecode/DecodeParms<</EarlyChange {early}>>"
+                ),
+                &r3_followup_lzw(&content, early),
+            ),
+            "clean",
+            1_000_000,
+        );
+    }
+    // LZW KwKwK: clear, A, new-code 258, EOD decodes to AAA.
+    let codes = [256u16, 65, 258, 257];
+    let bits = codes
+        .iter()
+        .fold(0u64, |bits, code| (bits << 9) | *code as u64)
+        << 4;
+    r3_followup_pdf_status(
+        &r3_stream("/Filter/LZWDecode", &bits.to_be_bytes()[3..]),
+        "clean",
+        1_000_000,
+    );
+    r3_followup_pdf_status(
+        &r3_stream("/Filter/RunLengthDecode", &[255, b'A', 128]),
+        "clean",
+        1_000_000,
+    );
+    r3_followup_pdf_status(
+        &r3_stream("/Filter/ASCII85Decode", b"z~>"),
+        "clean",
+        1_000_000,
+    );
+    r3_followup_pdf_status(
+        &r3_stream("/Filter/ASCIIHexDecode", b"4>"),
+        "clean",
+        1_000_000,
+    );
+}
+
+#[test]
+fn r3_followup_pdf_streaming_limits_and_boundaries() {
+    // Drop the 30 MiB source before scanning: only a tiny encoded stream remains.
+    let compressed = {
+        let content = vec![b' '; 30 * 1024 * 1024];
+        miniz_oxide::deflate::compress_to_vec_zlib(&content, 6)
+    };
+    let pdf = r3_stream("/Filter/FlateDecode", &compressed);
+    r3_followup_pdf_status(&pdf, "clean", 1_000_000);
+    r3_followup_pdf_status(&pdf, "quarantined", 100_000);
+    for offset in 8180..8200 {
+        let mut content = vec![b' '; offset];
+        content.extend_from_slice(b"/J#53(DEMO)");
+        let compressed = miniz_oxide::deflate::compress_to_vec_zlib(&content, 6);
+        r3_followup_pdf_status(
+            &r3_stream("/Filter/FlateDecode", &compressed),
+            "quarantined",
+            1_000_000,
+        );
+        let mut content = vec![b' '; offset];
+        content.extend_from_slice(b"/JavaScriptLongBenignName ");
+        let compressed = miniz_oxide::deflate::compress_to_vec_zlib(&content, 6);
+        r3_followup_pdf_status(
+            &r3_stream("/Filter/FlateDecode", &compressed),
+            "clean",
+            1_000_000,
+        );
+    }
+    for (filter, data) in [
+        ("ASCIIHexDecode", b"xyz>".as_slice()),
+        ("ASCII85Decode", b"!~>"),
+        ("ASCII85Decode", b"uuuuu~>"),
+        ("RunLengthDecode", b"\x05abc"),
+        ("LZWDecode", b"\xff\xff"),
+        ("DCTDecode", b"DEMO uninspectable non-image"),
+    ] {
+        r3_followup_pdf_status(
+            &r3_stream(&format!("/Filter/{filter}"), data),
+            "quarantined",
+            1_000_000,
+        );
+    }
+}
+
+#[test]
+fn r3_followup_pdf_predictor_chains_and_type_ambiguity() {
+    for active in [false, true] {
+        let content = if active {
+            b"8 0 <</JS(DEMO)>>".as_slice()
+        } else {
+            b"8 0 <</Producer(DEMO)>>"
+        };
+        let mut predicted = vec![0];
+        predicted.extend_from_slice(content);
+        for early in [0, 1] {
+            let lzw = r3_followup_lzw(&predicted, early);
+            let encoded = r3_followup_ascii85(&lzw);
+            let dict = format!(
+                "/Type/ObjStm/N 1/First 4/Filter[/ASCII85Decode/LZWDecode]/DecodeParms[null<</EarlyChange {early}/Predictor 15/Columns {}>>]",
+                content.len()
+            );
+            r3_followup_pdf_status(
+                &r3_stream(&dict, &encoded),
+                if active { "quarantined" } else { "clean" },
+                1_000_000,
+            );
+        }
+    }
+    r3_followup_pdf_status(
+        &r3_stream(
+            "/Type 9 0 R/Subtype/Image/Filter/ASCIIHexDecode",
+            b"2F4A53>",
+        ),
+        "quarantined",
+        1_000_000,
+    );
+    for dict in [
+        "/Filter/FlateDecode/Filter/FlateDecode",
+        "/Filter/FlateDecode/DecodeParms<</Predictor 1/Predictor 1>>",
+        "/Type/ObjStm/N 1/First 4/First 4/Filter/FlateDecode",
+    ] {
+        let compressed = miniz_oxide::deflate::compress_to_vec_zlib(b"8 0 <</Producer(DEMO)>>", 6);
+        r3_followup_pdf_status(&r3_stream(dict, &compressed), "quarantined", 1_000_000);
+    }
+    // A missing object-stream header remains malformed even when its body is benign.
+    r3_followup_pdf_status(
+        &r3_stream("/Type/ObjStm", b"<</Producer(DEMO)>>"),
+        "quarantined",
+        1_000_000,
+    );
+}
+
+#[test]
+fn r3_followup_pdf_stream_names_are_not_xml_paths() {
+    let compressed = miniz_oxide::deflate::compress_to_vec_zlib(b"/J#53/DEMO", 6);
+    r3_followup_pdf_status(
+        &r3_stream("/Filter/FlateDecode", &compressed),
+        "quarantined",
+        1_000_000,
+    );
+}
+
+#[test]
+fn r3_followup_pdf_image_exception_requires_image_syntax() {
+    for dict in [
+        "/Type/Metadata/Subtype/Image/Filter/ASCIIHexDecode",
+        "/Type/XObject/Subtype/Image/N 1/First 4/Filter/ASCIIHexDecode",
+    ] {
+        let encoded = format!("{}>", hex::encode(b"8 0 <</S/Launch>>"));
+        r3_followup_pdf_status(
+            &r3_stream(dict, encoded.as_bytes()),
+            "quarantined",
+            1_000_000,
+        );
+    }
+}
