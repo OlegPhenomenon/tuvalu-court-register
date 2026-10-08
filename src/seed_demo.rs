@@ -449,15 +449,17 @@ fn dispatch(tx: &Transaction, a: &Actor, d: Out) -> AppResult<i64> {
             .iter()
             .map(|i| json!({ "filename": i.filename, "sha256": i.sha256, "size_bytes": i.size_bytes, "document_version_id": i.version_id }))
             .collect::<Vec<Value>>());
-        tx.execute(
-            "INSERT INTO mailbox (dispatch_id, attempt_no, to_address, subject, body, attachments, delivered_at)
-             VALUES (?1, 1, ?2, ?3, ?4, ?5, ?6)",
-            params![id, d.address.unwrap_or(d.recipient), d.subject, d.body, attachments.to_string(), ts(-n)],
-        )?;
-        let mailbox_id = tx.last_insert_rowid();
+        let receipt = if d.method == "email" {
+            tx.execute(
+                "INSERT INTO mailbox (dispatch_id, attempt_no, to_address, subject, body, attachments, delivered_at)
+                 VALUES (?1, 1, ?2, ?3, ?4, ?5, ?6)",
+                params![id, d.address.unwrap_or_default(), d.subject, d.body, attachments.to_string(), ts(-n)],
+            )?;
+            format!("local-mailbox:{}", tx.last_insert_rowid())
+        } else { "manual".to_string() };
         tx.execute(
             "INSERT INTO delivery_attempts (dispatch_id, attempt_no, status, technical_receipt, at) VALUES (?1, 1, 'sent', ?2, ?3)",
-            params![id, format!("mailbox:{mailbox_id}"), ts(-n)],
+            params![id, receipt, ts(-n)],
         )?;
         audit::record(
             tx,
@@ -466,7 +468,7 @@ fn dispatch(tx: &Transaction, a: &Actor, d: Out) -> AppResult<i64> {
                 "dispatch.sent",
                 "dispatch",
                 id,
-                format!("{} ({})", crate::api::common::dispatch_activity(tx, id, if d.kind == "copies" { "sent" } else { "delivered to the local mailbox" })?, d.address.unwrap_or(d.recipient)),
+                format!("{} ({})", crate::api::common::dispatch_activity(tx, id, if d.method == "email" && d.kind != "copies" { "delivered to the local mailbox" } else { "sent" })?, d.address.unwrap_or(d.recipient)),
             )
             .case(d.case_id),
         )?;
@@ -604,8 +606,8 @@ pub fn seed_cases(tx: &Transaction, db: &Db) -> AppResult<()> {
             template: Some("information_request"),
             party: Some(tavita),
             recipient: "Jonah Whitlock (DEMO)",
-            method: "post",
-            address: Some("Nukufetau, Tuvalu (DEMO)"),
+            method: "email",
+            address: Some("jonah.whitlock@example.invalid"),
             subject: &subject,
             body: &body,
             sent_days_ago: Some(2),
@@ -724,7 +726,7 @@ pub fn seed_cases(tx: &Transaction, db: &Db) -> AppResult<()> {
         .case(Some(case2)),
     )?;
     for (party_id, name, method, confirmed) in [
-        (tomasi, "Edwin Marlowe (DEMO)", "hand", true),
+        (tomasi, "Edwin Marlowe (DEMO)", "email", true),
         (selima, "Clara Bennett (DEMO)", "post", false),
     ] {
         let (subject, body) = crate::api::common::render_template(
@@ -754,7 +756,7 @@ pub fn seed_cases(tx: &Transaction, db: &Db) -> AppResult<()> {
                 party: Some(party_id),
                 recipient: name,
                 method,
-                address: Some("Funafuti, Tuvalu (DEMO)"),
+                address: Some(if method == "email" { "edwin.marlowe@example.invalid" } else { "Funafuti, Tuvalu (DEMO)" }),
                 subject: &subject,
                 body: &body,
                 sent_days_ago: Some(3),
@@ -1036,7 +1038,7 @@ pub fn seed_cases(tx: &Transaction, db: &Db) -> AppResult<()> {
         .case(Some(case4)),
     )?;
     for (party_id, name, method) in [
-        (ana, "Nina Hartley (DEMO)", "collection"),
+        (ana, "Nina Hartley (DEMO)", "email"),
         (keli, "Owen Hartley (DEMO)", "post"),
     ] {
         let (subject, body) = crate::api::common::render_template(
@@ -1063,7 +1065,7 @@ pub fn seed_cases(tx: &Transaction, db: &Db) -> AppResult<()> {
                 party: Some(party_id),
                 recipient: name,
                 method,
-                address: Some("Funafuti, Tuvalu (DEMO)"),
+                address: Some(if method == "email" { "nina.hartley@example.invalid" } else { "Funafuti, Tuvalu (DEMO)" }),
                 subject: &subject,
                 body: &body,
                 sent_days_ago: Some(17),
@@ -1087,6 +1089,7 @@ pub fn seed_cases(tx: &Transaction, db: &Db) -> AppResult<()> {
                 closed_date = ?2, closed_at = ?3, closed_by = ?4, basis_decision_id = ?5 WHERE id = ?1",
         params![case4, ldate(-15), ts(-15), olga, dec_id],
     )?;
+    tx.execute("UPDATE case_status_history SET basis_decision_id=?2 WHERE case_id=?1 AND to_status='closed'",params![case4,dec_id])?;
     audit::record(
         tx,
         Some(&a_olga),
@@ -1172,6 +1175,7 @@ pub fn seed_cases(tx: &Transaction, db: &Db) -> AppResult<()> {
                 closed_date = ?2, closed_at = ?3, closed_by = ?4, basis_document_version_id = ?5 WHERE id = ?1",
         params![case5, ldate(-30), ts(-30), olga, settlement_basis.version_id],
     )?;
+    tx.execute("UPDATE case_status_history SET basis_document_version_id=?2 WHERE case_id=?1 AND to_status='closed'",params![case5,settlement_basis.version_id])?;
     audit::record(
         tx,
         Some(&a_olga),

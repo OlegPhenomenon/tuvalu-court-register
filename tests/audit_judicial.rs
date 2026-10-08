@@ -691,3 +691,89 @@ async fn f13_service_assessment_retry_records_once_and_rechecks_access() {
     let (s, b) = v.post_idem(&path, "service-assess", body).await;
     err(s, &b, StatusCode::NOT_FOUND, "not_found");
 }
+
+#[tokio::test]
+async fn e2e_d7_decision_date_respects_linked_hearing_local_date_on_every_write() {
+    let app = TestApp::demo();
+    let (o, v, cid, vid) = setup(&app).await;
+    // 09:00 Funafuti is the previous UTC day: validate against court-local time.
+    let h = hearing(&o, cid, "scheduled", "2027-08-02T09:00", "2027-08-02T10:00").await;
+    let create = format!("/api/cases/{cid}/decisions");
+    let body = json!({"title":"Date rule DEMO","document_version_id":vid,"hearing_id":h["id"],"decision_date":"2027-08-01"});
+    let (s,b) = v.post(&create,body.clone()).await;
+    err(s,&b,StatusCode::BAD_REQUEST,"validation");
+    assert!(b["error"]["message"].as_str().unwrap().contains("2027-08-02"));
+    let mut body = body;
+    body["decision_date"] = Value::Null;
+    let d = post(&v,&create,body).await;
+    assert_eq!(d["hearing_date"],"2027-08-02");
+    let path = format!("/api/decisions/{}",d["id"]);
+    let (s,b) = v.patch(&path,json!({"version":d["version"],"decision_date":"2027-08-01"})).await;
+    err(s,&b,StatusCode::BAD_REQUEST,"validation");
+    let mut body = review(&d);
+    body["decision_date"] = json!("2027-08-01");
+    let (s,b) = v.post(&format!("{path}/finalise"),body.clone()).await;
+    err(s,&b,StatusCode::BAD_REQUEST,"validation");
+    assert_eq!(get(&v,&path).await["status"],"draft");
+    body["decision_date"] = json!("2027-08-02");
+    post(&v,&format!("{path}/finalise"),body).await;
+    let (_,replacement) = insert_document(&o.db(&app),cid,"Amendment DEMO","decision","administrative",user_id(&o,"Viktor").await);
+    let amend = json!({"document_version_id":replacement,"amendment_basis":"DEMO correction","decision_date":"2027-08-01"});
+    let (s,b) = v.post(&format!("{path}/amend"),amend.clone()).await;
+    err(s,&b,StatusCode::BAD_REQUEST,"validation");
+    let mut amend = amend;
+    amend["decision_date"] = json!("2027-08-03");
+    post(&v,&format!("{path}/amend"),amend).await;
+}
+
+#[tokio::test]
+async fn e2e_d5_renotify_completes_only_for_new_hearing_and_same_party() {
+    let app = TestApp::demo();
+    let (o, _, cid, _) = setup(&app).await;
+    let case = get(&o,&format!("/api/cases/{cid}")).await;
+    let parties = case["participants"].as_array().unwrap();
+    let first = parties[0]["party_id"].as_i64().unwrap();
+    let second = parties[1]["party_id"].as_i64().unwrap();
+    let h = post(&o,&format!("/api/cases/{cid}/hearings"),json!({"hearing_type":"hearing","confirm":true,
+        "starts_local":"2027-08-04T09:00","ends_local":"2027-08-04T10:00",
+        "participants":[{"party_id":first,"role":"claimant","required":true},{"party_id":second,"role":"respondent","required":true}]})).await;
+    let moved = post(&o,&format!("/api/hearings/{}/adjourn",h["id"]),json!({"starts_local":"2027-08-05T09:00","ends_local":"2027-08-05T10:00","reason":"DEMO move","authorised_by":"Judge DEMO"})).await;
+    assert_eq!(moved["tasks"].as_array().unwrap().len(),2);
+    // The party name may be corrected after adjournment; the durable party binding still matches.
+    o.db(&app).open().unwrap().execute("UPDATE parties SET name='Renamed DEMO' WHERE id=?1",[first]).unwrap();
+    for (party,method) in [(first,"email"),(second,"post")] {
+        let d = post(&o,&format!("/api/cases/{cid}/dispatches"),json!({"kind":"notice","hearing_id":moved["new"]["id"],"recipient_party_id":party,
+            "recipient_name":"Recipient DEMO","method":method,"address":if method=="email" {"party@example.invalid"} else {"Funafuti (DEMO)"},"subject":"New date DEMO","body":"DEMO invitation"})).await;
+        post(&o,&format!("/api/dispatches/{}/preview",d["id"]),json!({})).await;
+        let before = get(&o,&format!("/api/cases/{cid}/tasks")).await;
+        assert_eq!(before["items"].as_array().unwrap().iter().filter(|t|t["status"]=="open").count(),if party==first {2} else {1});
+        if method=="email" { queued(&o,&d).await; } else {
+            post(&o,&format!("/api/dispatches/{}/record-sent",d["id"]),json!({"occurred_date":today(),"note":"Posted DEMO"})).await;
+        }
+        let done = get(&o,&format!("/api/cases/{cid}/tasks")).await;
+        let task = done["items"].as_array().unwrap().iter().find(|t| t["result"].as_str()==Some(&format!("completed automatically: notice #{} queued for the new hearing",d["id"]))).unwrap();
+        assert_eq!(task["status"],"done");
+        assert_eq!(o.db(&app).open().unwrap().query_row("SELECT COUNT(*) FROM audit_events WHERE action='task.completed' AND entity_id=?1 AND json_extract(details,'$.dispatch_id')=?2",
+            rusqlite::params![task["id"].as_i64(),d["id"].as_i64()],|r|r.get::<_,i64>(0)).unwrap(),1);
+    }
+    assert!(get(&o,&format!("/api/cases/{cid}/tasks")).await["items"].as_array().unwrap().iter().all(|t|t["status"]=="done"));
+}
+
+#[tokio::test]
+async fn e2e_d6_manual_delivery_cannot_reach_email_mailbox_even_if_queued() {
+    let app = TestApp::demo();
+    let (o, _, cid, _) = setup(&app).await;
+    let h = hearing(&o,cid,"scheduled","2027-08-06T09:00","2027-08-06T10:00").await;
+    let d = post(&o,&format!("/api/cases/{cid}/dispatches"),json!({"kind":"notice","hearing_id":h["id"],"recipient_name":"DEMO postal recipient",
+        "method":"post","address":"Funafuti DEMO","subject":"DEMO notice","body":"DEMO invitation"})).await;
+    post(&o,&format!("/api/dispatches/{}/preview",d["id"]),json!({})).await;
+    let (s,b) = o.post(&format!("/api/dispatches/{}/queue",d["id"]),json!({})).await;
+    err(s,&b,StatusCode::CONFLICT,"invalid_transition");
+    let db = o.db(&app);
+    // Exercise the worker's independent guard with an invalid queued row.
+    db.open().unwrap().execute("UPDATE dispatches SET status='queued',queued_by=?2,queued_at=?3 WHERE id=?1",
+        rusqlite::params![d["id"].as_i64(),user_id(&o,"Olga").await,tuvalu_court::time::now_utc()]).unwrap();
+    tuvalu_court::outbox::process(&db).unwrap();
+    assert_eq!(get(&o,&format!("/api/dispatches/{}",d["id"])).await["status"],"failed");
+    assert_eq!(db.open().unwrap().query_row("SELECT COUNT(*) FROM mailbox WHERE dispatch_id=?1",[d["id"].as_i64()],|r|r.get::<_,i64>(0)).unwrap(),0);
+}

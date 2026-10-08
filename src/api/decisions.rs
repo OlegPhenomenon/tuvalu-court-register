@@ -49,6 +49,10 @@ fn decorate(conn: &Connection, actor: &Actor, mut d: Value) -> AppResult<Value> 
         d["document_title"]=json!("Restricted document");
         d["title"]=json!("Restricted document");
     }
+    if let Some(id) = d["hearing_id"].as_i64() {
+        let starts: String = conn.query_row("SELECT starts_at FROM hearings WHERE id=?1",[id],|r|r.get(0))?;
+        d["hearing_date"] = json!(crate::time::utc_to_local_date(&starts));
+    }
     d["signed_file_uploaded"] = json!(d["signed_file_uploaded"].as_i64() == Some(1));
     if matches!(d["status"].as_str(), Some("finalised") | Some("superseded")) {
         d["note"] = json!(FINALISED_NOTE);
@@ -141,6 +145,18 @@ fn check_hearing_belongs(
     Ok(())
 }
 
+fn check_decision_date(conn: &Connection, hearing_id: Option<i64>, date: Option<&str>) -> AppResult<()> {
+    if let (Some(hid), Some(date)) = (hearing_id, date) {
+        let starts: String = conn.query_row("SELECT starts_at FROM hearings WHERE id=?1", [hid], |r|r.get(0))?;
+        let hearing_date = crate::time::utc_to_local_date(&starts);
+        if date < hearing_date.as_str() {
+            return Err(AppError::validation(format!("Decision date cannot precede the linked hearing's court-local date ({hearing_date})."))
+                .with_details(json!({"field":"decision_date"})));
+        }
+    }
+    Ok(())
+}
+
 // ------------------------------------------------------------------ lists & detail
 
 async fn list_for_case(ctx: Ctx, Path(case_id): Path<i64>) -> JsonResult {
@@ -217,6 +233,8 @@ async fn create(
                 let document_id = require_case_version(tx, &actor, case_id, req.document_version_id)?;
                 check_hearing_belongs(tx, case_id, req.hearing_id)?;
                 let title = required(&req.title, "Title")?;
+                let date = crate::time::parse_opt_date(req.decision_date.as_deref())?;
+                check_decision_date(tx, req.hearing_id, date.as_deref())?;
                 tx.execute(
                     "INSERT INTO decisions (case_id, title, decision_date, status, document_id, document_version_id,
                                             hearing_id, author_user_id, created_at)
@@ -224,7 +242,7 @@ async fn create(
                     params![
                         case_id,
                         title,
-                        crate::time::parse_opt_date(req.decision_date.as_deref())?,
+                        date,
                         document_id,
                         req.document_version_id,
                         req.hearing_id,
@@ -273,6 +291,10 @@ async fn update(ctx: Ctx, Path(id): Path<i64>, JsonBody(req): JsonBody<UpdateReq
                 Some(t) => Some(required(t, "Title")?),
                 None => None,
             };
+            let date = crate::time::parse_opt_date(req.decision_date.as_ref().and_then(|d| d.as_deref()))?;
+            if req.decision_date.is_some() {
+                check_decision_date(tx, current["hearing_id"].as_i64(), date.as_deref())?;
+            }
             let new_doc = match req.document_version_id {
                 Some(vid) => Some(require_case_version(tx, &actor, case_id, vid)?),
                 None => None,
@@ -285,7 +307,7 @@ async fn update(ctx: Ctx, Path(id): Path<i64>, JsonBody(req): JsonBody<UpdateReq
                 params![
                     id,
                     title,
-                    crate::time::parse_opt_date(req.decision_date.as_ref().and_then(|d| d.as_deref()))?,
+                    date,
                     new_doc,
                     req.document_version_id,
                     req.decision_date.is_some()
@@ -346,6 +368,7 @@ async fn finalise(
                     }
                 }
                 let date = crate::time::parse_date(&req.decision_date)?;
+                check_decision_date(tx, current["hearing_id"].as_i64(), Some(&date))?;
                 let now = crate::time::now_utc();
                 tx.execute(
                     "UPDATE decisions SET status = 'finalised', decision_date = ?2,
@@ -453,6 +476,8 @@ async fn amend(ctx: Ctx, Path(id): Path<i64>, IdemKey(key): IdemKey, JsonBody(re
                     return Err(AppError::invalid_transition("Only a finalised decision can be amended."));
                 }
                 let basis = required(&req.amendment_basis, "Amendment basis")?;
+                let date = crate::time::parse_opt_date(req.decision_date.as_deref())?;
+                check_decision_date(tx, old["hearing_id"].as_i64(), date.as_deref())?;
                 let document_id = require_case_version(tx, &actor, case_id, req.document_version_id)?;
                 let title = match &req.title {
                     Some(t) => required(t, "Title")?,
@@ -465,7 +490,7 @@ async fn amend(ctx: Ctx, Path(id): Path<i64>, IdemKey(key): IdemKey, JsonBody(re
                     params![
                         case_id,
                         title,
-                        crate::time::parse_opt_date(req.decision_date.as_deref())?,
+                        date,
                         document_id,
                         req.document_version_id,
                         old["hearing_id"].as_i64(),

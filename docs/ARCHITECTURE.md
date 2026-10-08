@@ -411,3 +411,11 @@ validation again, so an older preview cannot publish a future closure (`409 impo
 closures remain supported. `POST /dispatches/:id/assess {assessment,basis}` accepts `Idempotency-Key`,
 rechecks dispatch visibility and assessment permission before replay, and atomically stores the assessment,
 audit event and response. The UI retains one key per opened assessment form through retries.
+
+### Browser workflow corrections
+
+- Modal widths respect the viewport, form controls shrink, and the dialog header stays visible during internal scrolling. At widths ≤640px the compact application header scrolls with the page.
+- Closure evidence is stored per status-history entry, resolved with current document permissions, and returned as a label/link in the case summary and status history. Decision evidence names its bound document version; hidden evidence is labelled “Restricted document”. Migration 0013 recovers previous closure references from audit records.
+- `GET /documents/{id}/grants/candidates` shares the grant endpoint's eligibility checks and excludes existing grants, inactive staff, and technical administrators.
+- Adjournment tasks store the new hearing and recipient party IDs. Queueing an invitation or recording its manual delivery completes the matching task with an audited notice reference. A shared dispatch predicate excludes invitations to adjourned/cancelled hearings from next steps, the no-next-step report, and closing blockers; dispatch history is retained.
+- Decision writes validate dates against the linked hearing's court-local date. The API returns that date to support the form's default and minimum. Demo mailbox copies are seeded only for e-mail delivery, with fictional `@example.invalid` recipients; manual deliveries use manual receipts.

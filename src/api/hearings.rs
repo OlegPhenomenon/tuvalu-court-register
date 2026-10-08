@@ -452,15 +452,15 @@ fn copy_participants(tx: &Connection, from_hearing: i64, to_hearing: i64) -> App
 }
 
 /// Names of required participants (party or staff user), for re-notification tasks.
-fn required_participant_names(tx: &Connection, hearing_id: i64) -> AppResult<Vec<String>> {
+fn required_participants(tx: &Connection, hearing_id: i64) -> AppResult<Vec<Value>> {
     let rows = query_json(
         tx,
-        "SELECT COALESCE(p.name, u.display_name) AS name FROM hearing_participants hp
+        "SELECT hp.party_id, COALESCE(p.name, u.display_name) AS name FROM hearing_participants hp
          LEFT JOIN parties p ON p.id = hp.party_id LEFT JOIN users u ON u.id = hp.user_id
          WHERE hp.hearing_id = ?1 AND hp.required = 1 ORDER BY hp.id",
         [hearing_id],
     )?;
-    Ok(rows.iter().filter_map(|r| r["name"].as_str().map(str::to_string)).collect())
+    Ok(rows)
 }
 
 // ------------------------------------------------------------------ create & edit
@@ -760,7 +760,8 @@ async fn adjourn(ctx: Ctx, Path(id): Path<i64>, IdemKey(key): IdemKey, JsonBody(
                 let assignee = service_officer(tx, case_id)?.unwrap_or(actor.user_id);
                 let new_when = human_local(&slot.starts_at);
                 let mut made = Vec::new();
-                for name in required_participant_names(tx, id)? {
+                for participant in required_participants(tx, id)? {
+                    let name = participant["name"].as_str().unwrap_or_default();
                     let tid = tasks::insert_task(
                         tx,
                         &actor,
@@ -775,6 +776,7 @@ async fn adjourn(ctx: Ctx, Path(id): Path<i64>, IdemKey(key): IdemKey, JsonBody(
                             due_date: None,
                         },
                     )?;
+                    tx.execute("UPDATE tasks SET renotify_party_id=?2 WHERE id=?1",params![tid,participant["party_id"].as_i64()])?;
                     made.push(tasks::task_json(tx, tid)?);
                 }
                 audit::record(

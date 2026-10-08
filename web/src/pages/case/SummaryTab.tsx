@@ -22,9 +22,15 @@ import { fmtDate, fmtLocal, courtToday } from '../../time';
 import { FormErrors } from '../intake/FormErrors';
 import { CasePicker } from '../intake/pickers';
 import type { CaseHit } from '../intake/pickers';
-import type { Assignment, CaseData, CaseTabProps, OpenItem } from './types';
+import type { Assignment, CaseData, CaseTabProps, ClosureEvidence, OpenItem } from './types';
 import ExportDialog from './ExportDialog';
 import { useApi } from '../../components/useApi';
+
+function EvidenceLink({ evidence }: { evidence: ClosureEvidence }) {
+  return evidence.link ? (evidence.link.startsWith('/api/')
+    ? <a href={evidence.link}>{evidence.label}</a>
+    : <Link to={evidence.link}>{evidence.label}</Link>) : <>{evidence.label}</>;
+}
 
 function Detail({ term, children }: { term: string; children: ReactNode }) {
   return (
@@ -665,6 +671,7 @@ export default function SummaryTab({ caseId, caseData, reload }: CaseTabProps) {
                     {label(refList(ref, 'closure_basis'), c.closure_basis)}
                     {c.closure_note ? ` — ${c.closure_note}` : ''}
                   </Detail>
+                  {c.closure_evidence && <Detail term="Closure evidence"><EvidenceLink evidence={c.closure_evidence} /></Detail>}
                 </>
               )}
             </tbody>
@@ -761,6 +768,7 @@ export default function SummaryTab({ caseId, caseData, reload }: CaseTabProps) {
                 {h.by_name ? ` — ${h.by_name}` : ''}
               </span>
               {h.basis && <> — {label(refList(ref, 'closure_basis'), h.basis)}</>}
+              {h.closure_evidence && <> — <EvidenceLink evidence={h.closure_evidence} /></>}
               {h.reason && <div className="muted">{h.reason}</div>}
             </li>
           ))}

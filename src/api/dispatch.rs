@@ -763,6 +763,25 @@ async fn preview(ctx: Ctx, Path(id): Path<i64>) -> JsonResult {
     Ok(Json(v))
 }
 
+/// Completing re-notification means preparing delivery, not proving legal service.
+fn complete_renotify(conn: &Connection, actor: &Actor, dispatch_id: i64) -> AppResult<()> {
+    let tasks = query_json(conn, "SELECT t.id FROM tasks t JOIN dispatches d
+        ON d.hearing_id=t.hearing_id AND d.recipient_party_id=t.renotify_party_id AND d.case_id=t.case_id
+        JOIN hearings h ON h.id=d.hearing_id
+        WHERE d.id=?1 AND d.kind='notice' AND d.notice_purpose='invitation' AND d.status IN ('queued','sent')
+        AND h.status IN ('scheduled','held') AND t.kind='renotify' AND t.status='open'",[dispatch_id])?;
+    let result = format!("completed automatically: notice #{dispatch_id} queued for the new hearing");
+    for task in tasks {
+        let id = task["id"].as_i64().unwrap_or_default();
+        conn.execute("UPDATE tasks SET status='done',result=?2,closed_by=?3,closed_at=?4,version=version+1 WHERE id=?1",
+            params![id,result,actor.user_id,crate::time::now_utc()])?;
+        audit::record(conn,Some(actor),Event::new("task.completed","task",id,&result)
+            .case(conn.query_row("SELECT case_id FROM tasks WHERE id=?1",[id],|r|r.get(0))?)
+            .details(json!({"automatic":true,"dispatch_id":dispatch_id,"result":result})))?;
+    }
+    Ok(())
+}
+
 /// Queue an e-mail dispatch for the outbox worker (local mailbox). Manual methods are sent via
 /// record-sent instead.
 async fn queue(
@@ -803,6 +822,7 @@ async fn queue(
                     Event::new("dispatch.queued", "dispatch", id, super::common::dispatch_activity(tx, id, "queued for delivery")?)
                         .case(d["case_id"].as_i64()),
                 )?;
+                complete_renotify(tx, &actor, id)?;
                 dispatch_json(tx, &actor, id)
             })
         })
@@ -865,6 +885,7 @@ async fn record_sent(
                         .case(d["case_id"].as_i64())
                         .details(json!({ "method": d["method"], "manual": true, "occurred_date": date, "attempt_no": attempt_no })),
                 )?;
+                complete_renotify(tx, &actor, id)?;
                 dispatch_json(tx, &actor, id)
             })
         })

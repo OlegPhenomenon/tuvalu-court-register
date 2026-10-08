@@ -9,7 +9,7 @@ import { DataTable } from '../../components/DataTable';
 import { ErrorBanner } from '../../components/ErrorBanner';
 import { Modal } from '../../components/Modal';
 import { CheckboxField, SelectField, TextField } from '../../components/fields';
-import { staffOptions, useRef as useRefData } from '../../components/refdata';
+import { staffOptions } from '../../components/refdata';
 import { useApi } from '../../components/useApi';
 import { DocumentUpload, DocumentVersions, DocumentReasonDialog, VisibilityBadge, useDocumentDetails, visibilityHelp, visibilityOptions } from '../../components/DocumentUpload';
 import type { DocumentDetail, DocumentGrant } from '../../components/DocumentUpload';
@@ -49,9 +49,8 @@ function EditDocument({ document: d, canRestrict, onClose, onSaved }: {
 }
 
 function GrantManagement({ document, judicial, onChanged }: { document: GrantDocument; judicial?: boolean; onChanged: () => void }) {
-  const { session } = useSession();
-  const { data: ref, error: refError, reload: reloadRef } = useRefData();
   const [open, setOpen] = useState(false);
+  const candidates = useApi<{ items: { id: number; display_name: string; title: string | null; is_judge: number }[] }>(open ? `/documents/${document.id}/grants/candidates` : null);
   const [user, setUser] = useState('');
   const [action, setAction] = useState<'grant' | DocumentGrant | null>(null);
   const [busy, setBusy] = useState(false);
@@ -66,7 +65,7 @@ function GrantManagement({ document, judicial, onChanged }: { document: GrantDoc
     } catch (e) { setError(e); } finally { setBusy(false); }
   };
   return <>
-    <ErrorBanner error={refError} onRetry={reloadRef} />
+    <ErrorBanner error={candidates.error} onRetry={candidates.reload} />
     <Button variant="secondary" onClick={() => { setOpen(true); setError(null); }}>{judicial ? 'Share with…' : 'Grant access'}</Button>
     <DataTable rows={document.grants ?? []} rowKey={(g) => String(g.id)} empty="No explicit access grants." columns={[
       { key: 'user_name', header: 'Person' }, { key: 'reason', header: 'Reason' },
@@ -76,8 +75,8 @@ function GrantManagement({ document, judicial, onChanged }: { document: GrantDoc
     ]} />
     {open && !action && <Modal title={judicial ? `Share ${document.title}` : `Grant access to ${document.title}`} open onClose={() => setOpen(false)}>
       <p>Choose staff who already have access to this case. The server checks their current case access before sharing.</p>
-      <SelectField label="Staff member" value={user} onChange={setUser} options={staffOptions(ref?.staff.filter((s) => s.id !== Number(session.user.id) && !(document.grants ?? []).some((g) => !g.revoked_at && g.user_id === s.id)))} placeholder="Choose a staff member" required />
-      <div className="actions"><Button disabled={!user} onClick={() => setAction('grant')}>Continue</Button><Button variant="secondary" onClick={() => setOpen(false)}>Cancel</Button></div>
+      <SelectField label="Staff member" value={user} onChange={setUser} options={staffOptions(candidates.data?.items)} placeholder="Choose a staff member" required />
+      <div className="actions"><Button disabled={!user || candidates.loading || !!candidates.error} onClick={() => setAction('grant')}>Continue</Button><Button variant="secondary" onClick={() => setOpen(false)}>Cancel</Button></div>
     </Modal>}
     {action && <DocumentReasonDialog open title={action === 'grant' ? `${judicial ? 'Share' : 'Grant access to'} ${document.title}` : `Revoke access for ${action.user_name}`} label="Reason" confirmLabel={action === 'grant' ? 'Grant access' : 'Revoke access'} danger={action !== 'grant'} busy={busy} error={error} onConfirm={(r) => void run(r)} onClose={() => { if (!busy) { setAction(null); setError(null); } }} />}
   </>;

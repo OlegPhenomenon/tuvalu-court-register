@@ -18,6 +18,7 @@ import '../documents.css';
 
 export const finalisedNote = 'Finalised in this register. This is not a qualified electronic signature.';
 export interface Decision {
+  hearing_date?: string;
   id: number; case_id: number; case_number: string; title: string; decision_date: string | null;
   restricted?: boolean;
   status: string; status_reason?: string | null; document_id?: number; document_title: string;
@@ -51,6 +52,9 @@ function DecisionForm({ mode, decision, caseId, caseData, onClose, onSaved }: Ca
   const [versionId, setVersionId] = useState(mode === 'edit' ? String(decision?.document_version_id ?? '') : '');
   const [recordVersion, setRecordVersion] = useState(decision?.version ?? 0);
   const [hearing, setHearing] = useState('');
+  const hearingDate = mode === 'draft'
+    ? hearings.data?.items.find(h => String(h.id) === hearing)?.starts_local?.slice(0, 10)
+    : decision?.hearing_date;
   const [busy, setBusy] = useState(false);
   const [uploadBusy, setUploadBusy] = useState(false);
   const [error, setError] = useState<unknown>(null);
@@ -88,10 +92,14 @@ function DecisionForm({ mode, decision, caseId, caseData, onClose, onSaved }: Ca
       {mode === 'amend' && <p>This creates a draft amendment. Finalise it separately to supersede the original decision. Upload a separate document for the corrected text; the original file remains unchanged.</p>}
       <form onSubmit={submit}><fieldset disabled={busy || uploadBusy} className="doc-fieldset">
         <TextField label="Decision title" value={title} onChange={setTitle} required />
-        <DateField label="Decision date" value={date} onChange={setDate} help={mode === 'edit' ? 'Leave blank to clear the saved decision date.' : undefined} />
+        <DateField label="Decision date" value={date} onChange={setDate} min={hearingDate} help={hearingDate ? `Must be on or after the linked hearing’s court-local date (${fmtDate(hearingDate)}).` : mode === 'edit' ? 'Leave blank to clear the saved decision date.' : undefined} />
         <SelectField label="Bound document version" value={versionId} onChange={setVersionId} options={cleanVersions} placeholder={docs.loading ? 'Loading document versions…' : 'Choose a clean document version'} required help="Only visible, clean versions from this case can be used. This exact version will be bound to the decision." />
         {!docs.loading && !docs.error && cleanVersions.length === 0 && <p>No clean document versions are available. A staff member with document upload permission must add the decision document.</p>}
-        {mode === 'draft' && <SelectField label="Hearing (optional)" value={hearing} onChange={setHearing} placeholder="No hearing — decision without a hearing" options={(hearings.data?.items ?? []).map((h) => ({ value: String(h.id), label: `${h.hearing_type_label} — ${h.starts_local ? fmtCourtLocal(h.starts_local) : fmtLocal(h.starts_at)} (${h.status.replace(/_/g, ' ')})` }))} />}
+        {mode === 'draft' && <SelectField label="Hearing (optional)" value={hearing} onChange={(id) => {
+          setHearing(id);
+          const day = hearings.data?.items.find(h => String(h.id) === id)?.starts_local?.slice(0, 10);
+          setDate([courtToday(), day ?? ''].sort().at(-1)!);
+        }} placeholder="No hearing — decision without a hearing" options={(hearings.data?.items ?? []).map((h) => ({ value: String(h.id), label: `${h.hearing_type_label} — ${h.starts_local ? fmtCourtLocal(h.starts_local) : fmtLocal(h.starts_at)} (${h.status.replace(/_/g, ' ')})` }))} />}
         <div className="actions"><Button type="submit" busy={busy} disabled={docs.loading || !!docs.error || !title.trim() || !cleanVersions.some((v) => v.value === versionId)}> {mode === 'amend' ? 'Continue to amendment basis' : mode === 'edit' ? 'Save draft' : 'Create draft'}</Button>
           <Button type="button" variant="secondary" onClick={close}>Cancel</Button></div>
       </fieldset></form>
@@ -107,7 +115,7 @@ function DecisionForm({ mode, decision, caseId, caseData, onClose, onSaved }: Ca
 function FinaliseForm({ decision: initialDecision, onClose, onSaved }: { decision: Decision; onClose: () => void; onSaved: () => void }) {
   const [decision, setDecision] = useState(initialDecision);
   const [reviewChanged, setReviewChanged] = useState(false);
-  const [date, setDate] = useState(decision.decision_date ?? courtToday());
+  const [date, setDate] = useState([decision.decision_date ?? courtToday(), decision.hearing_date ?? ''].sort().at(-1)!);
   const [signed, setSigned] = useState(decision.signed_file_uploaded);
   const [key] = useState(newKey);
   const [busy, setBusy] = useState(false);
@@ -133,7 +141,7 @@ function FinaliseForm({ decision: initialDecision, onClose, onSaved }: { decisio
     <p>Decision revision {decision.version}. Bound file: <DecisionFile decision={decision} /></p><p>{finalisedNote}</p>
     <p>After finalisation, corrections require a linked amendment.</p>
     <form onSubmit={submit}><fieldset disabled={busy} className="doc-fieldset">
-      <DateField label="Decision date" value={date} onChange={setDate} required />
+      <DateField label="Decision date" value={date} onChange={setDate} min={decision.hearing_date ?? undefined} required help={decision.hearing_date ? `Must be on or after the linked hearing’s court-local date (${fmtDate(decision.hearing_date)}).` : undefined} />
       <CheckboxField label="Signed scan uploaded" checked={signed} onChange={setSigned} help="Confirm only if the bound file already contains the signed scan. This checkbox does not upload or sign a file." />
       <div className="actions"><Button type="submit" busy={busy} disabled={reviewChanged || decision.status !== 'draft'}>Finalise decision</Button><Button type="button" variant="secondary" onClick={onClose}>Cancel</Button></div>
     </fieldset></form>

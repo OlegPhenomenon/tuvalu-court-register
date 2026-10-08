@@ -272,6 +272,35 @@ async fn list(ctx: Ctx, Query(q): Query<ListQuery>) -> JsonResult {
     Ok(Json(v))
 }
 
+/// Resolve evidence on each read so revoked grants immediately hide its title and link.
+fn closing_evidence(c: &Connection, actor: &Actor, value: &Value) -> AppResult<Value> {
+    let case_id = value["case_id"].as_i64().or(value["id"].as_i64()).unwrap_or_default();
+    let (version_id, decision_id) = if let Some(id) = value["basis_decision_id"].as_i64() {
+        (Some(c.query_row("SELECT document_version_id FROM decisions WHERE id=?1", [id], |r|r.get::<_,i64>(0))?), Some(id))
+    } else { (value["basis_document_version_id"].as_i64(), None) };
+    if let Some(vid) = version_id {
+        if policy::require_version(c, actor, vid).is_err() {
+            return Ok(json!({"label":"Restricted document", "link":null}));
+        }
+        let row = query_one_json(c, "SELECT d.title, v.version_no FROM document_versions v JOIN documents d ON d.id=v.document_id WHERE v.id=?1", [vid])?;
+        let document = format!("{} · v{}", row["title"].as_str().unwrap_or_default(), row["version_no"]);
+        return Ok(match decision_id {
+            Some(id) => {
+                let title: String = c.query_row("SELECT title FROM decisions WHERE id=?1", [id], |r|r.get(0))?;
+                json!({"label":format!("{title} — {document}"),"link":format!("/cases/{case_id}?tab=decisions#decision-{id}")})
+            }
+            None => json!({"label":document,"link":format!("/api/document-versions/{vid}/download")}),
+        });
+    }
+    if let Some(id) = value["basis_hearing_id"].as_i64() {
+        let row = query_one_json(c,"SELECT hearing_type, starts_at, outcome_summary FROM hearings WHERE id=?1",[id])?;
+        return Ok(json!({"label":format!("{} — {} — {}",row["hearing_type"].as_str().unwrap_or_default(),
+            crate::time::human_court_local(&crate::time::utc_to_local(row["starts_at"].as_str().unwrap_or_default()),true),
+            row["outcome_summary"].as_str().unwrap_or_default()),"link":format!("/cases/{case_id}?tab=hearings&hearing={id}")}));
+    }
+    Ok(Value::Null)
+}
+
 /// Full case card (workspace header + summary tab). Other tabs come from their own modules.
 pub fn case_json(c: &Connection, actor: &Actor, id: i64) -> AppResult<Value> {
     policy::require_case(c, actor, id)?;
@@ -287,7 +316,16 @@ pub fn case_json(c: &Connection, actor: &Actor, id: i64) -> AppResult<Value> {
         [id],
     )?;
     case["category_label"] = json!(super::common::ref_label(c, "case_category", case["category"].as_str().unwrap_or_default())?);
+    case["closure_evidence"] = closing_evidence(c, actor, &case)?;
     redact_closing_basis(c, actor, &mut case)?;
+    let mut history = query_json(c,
+        "SELECT h.case_id, h.from_status, h.to_status, h.reason, h.basis, h.at, h.effective_date,
+            h.basis_document_version_id, h.basis_decision_id, h.basis_hearing_id, u.display_name AS by_name
+         FROM case_status_history h LEFT JOIN users u ON u.id=h.by_user WHERE h.case_id=?1 ORDER BY h.id", [id])?;
+    for item in &mut history {
+        item["closure_evidence"] = closing_evidence(c, actor, item)?;
+        redact_closing_basis(c, actor, item)?;
+    }
     let rel_vis_to = policy::case_visible_sql(actor, "r.to_case_id");
     let rel_vis_from = policy::case_visible_sql(actor, "r.from_case_id");
     Ok(json!({
@@ -311,9 +349,7 @@ pub fn case_json(c: &Connection, actor: &Actor, id: i64) -> AppResult<Value> {
              UNION ALL
              SELECT r.id, r.kind, r.note, r.created_at, 'incoming', oc.id, oc.number, oc.title
                FROM case_relations r JOIN cases oc ON oc.id = r.from_case_id WHERE r.to_case_id = ?1 AND {rel_vis_from}"), [id])?,
-        "status_history": query_json(c,
-            "SELECT h.from_status, h.to_status, h.reason, h.basis, h.at, h.effective_date, u.display_name AS by_name
-             FROM case_status_history h LEFT JOIN users u ON u.id = h.by_user WHERE h.case_id = ?1 ORDER BY h.id", [id])?,
+        "status_history": history,
         "intakes": query_json(c,
             "SELECT id, reference, received_date, sender_name, description, parent_intake_id FROM intakes WHERE case_id = ?1 ORDER BY id", [id])?,
         "decision_state": query_one_json(c,
@@ -357,22 +393,26 @@ fn action(code: &str, message: String, link: String) -> Value {
     json!({ "code": code, "message": message, "link": link })
 }
 
+/// Invitations for replaced/cancelled hearings remain history, not pending work.
+const CURRENT_DISPATCH: &str = "NOT (d.kind='notice' AND d.notice_purpose='invitation' AND EXISTS(
+    SELECT 1 FROM hearings old WHERE old.id=d.hearing_id AND old.status IN ('adjourned','cancelled')))";
+
 /// Recorded planned or pending work, independent of urgency and document visibility.
 /// Callers still require case access; private decision details remain redacted in prompts.
 pub fn has_next_step(c: &Connection, actor: &Actor, case_id: i64) -> AppResult<bool> {
     policy::require_case(c, actor, case_id)?;
-    let sql = "SELECT status <> 'closed' AND (
+    let sql = format!("SELECT status <> 'closed' AND (
         status='reopened'
         OR EXISTS(SELECT 1 FROM hearings WHERE case_id=?1 AND (
             status='draft' OR (status='scheduled' AND (ends_at > ?2 OR outcome_recorded_at IS NULL))))
         OR EXISTS(SELECT 1 FROM tasks WHERE case_id=?1 AND status='open')
-        OR EXISTS(SELECT 1 FROM dispatches d WHERE d.case_id=?1 AND (
+        OR EXISTS(SELECT 1 FROM dispatches d WHERE d.case_id=?1 AND {CURRENT_DISPATCH} AND (
             d.status IN ('draft','queued','failed') OR (d.status='sent' AND (
                 NOT EXISTS(SELECT 1 FROM delivery_confirmations WHERE dispatch_id=d.id AND kind='human_handover')
                 OR NOT EXISTS(SELECT 1 FROM service_assessments WHERE dispatch_id=d.id)))))
         OR EXISTS(SELECT 1 FROM decisions WHERE case_id=?1 AND status='draft'))
-        FROM cases WHERE id=?1";
-    Ok(c.query_row(sql, params![case_id, crate::time::now_utc()], |r| r.get(0))?)
+        FROM cases WHERE id=?1");
+    Ok(c.query_row(&sql, params![case_id, crate::time::now_utc()], |r| r.get(0))?)
 }
 
 /// Plain-language next steps for a case, computed from its records (spec §5: explain the next step,
@@ -462,7 +502,7 @@ pub fn next_actions(c: &Connection, actor: &Actor, case_id: i64) -> AppResult<Ve
     }
     for d in query_json(
         c,
-        "SELECT d.id, d.kind, d.recipient_name, d.subject, d.status, h.starts_at AS hearing_at FROM dispatches d LEFT JOIN hearings h ON h.id = d.hearing_id WHERE d.case_id = ?1 AND d.status IN ('draft','queued','failed','sent') ORDER BY d.id",
+        &format!("SELECT d.id, d.kind, d.recipient_name, d.subject, d.status, h.starts_at AS hearing_at FROM dispatches d LEFT JOIN hearings h ON h.id = d.hearing_id WHERE d.case_id = ?1 AND {CURRENT_DISPATCH} AND d.status IN ('draft','queued','failed','sent') ORDER BY d.id"),
         [case_id],
     )? {
         let who = d["recipient_name"].as_str().unwrap_or_default();
@@ -725,7 +765,7 @@ async fn change_status(ctx: Ctx, Path(id): Path<i64>, JsonBody(req): JsonBody<St
 pub fn open_items(c: &Connection, case_id: i64) -> AppResult<Vec<Value>> {
     let mut items = query_json(
         c,
-        "SELECT 'task' AS kind, id, title AS label, status, NULL AS dispatch_kind, NULL AS recipient, NULL AS hearing_starts
+        &format!("SELECT 'task' AS kind, id, title AS label, status, NULL AS dispatch_kind, NULL AS recipient, NULL AS hearing_starts
          FROM tasks WHERE case_id = ?1 AND status = 'open'
          UNION ALL
          SELECT 'hearing', id, hearing_type || ' at ' || starts_at, status, NULL, NULL, NULL
@@ -733,14 +773,14 @@ pub fn open_items(c: &Connection, case_id: i64) -> AppResult<Vec<Value>> {
          UNION ALL
          SELECT 'dispatch', d.id, '', d.status, d.kind, d.recipient_name, h.starts_at
          FROM dispatches d LEFT JOIN hearings h ON h.id = d.hearing_id
-         WHERE d.case_id = ?1 AND d.status IN ('draft','queued','failed')
+         WHERE d.case_id = ?1 AND {CURRENT_DISPATCH} AND d.status IN ('draft','queued','failed')
          UNION ALL
          SELECT 'decision', id, title, status, NULL, NULL, NULL FROM decisions WHERE case_id = ?1 AND status = 'draft'
          UNION ALL
          SELECT 'unconfirmed_dispatch', d.id, '', d.status, d.kind, d.recipient_name, h.starts_at
          FROM dispatches d LEFT JOIN hearings h ON h.id = d.hearing_id
-         WHERE d.case_id = ?1 AND d.status = 'sent'
-           AND NOT EXISTS (SELECT 1 FROM delivery_confirmations dc WHERE dc.dispatch_id = d.id AND dc.kind = 'human_handover')",
+         WHERE d.case_id = ?1 AND {CURRENT_DISPATCH} AND d.status = 'sent'
+           AND NOT EXISTS (SELECT 1 FROM delivery_confirmations dc WHERE dc.dispatch_id = d.id AND dc.kind = 'human_handover')"),
         [case_id],
     )?;
     for it in &mut items {
@@ -981,6 +1021,9 @@ async fn close(ctx: Ctx, Path(id): Path<i64>, IdemKey(key): IdemKey, JsonBody(re
                 }
                 validate_closing_basis(tx, &actor, id, &req, &date)?;
                 record_status(tx, &actor, id, &case.status, "closed", note.as_deref(), Some(&req.basis), &date)?;
+                tx.execute("UPDATE case_status_history SET basis_document_version_id=?2, basis_decision_id=?3, basis_hearing_id=?4
+                    WHERE id=(SELECT MAX(id) FROM case_status_history WHERE case_id=?1)",
+                    params![id,req.basis_document_version_id,req.basis_decision_id,req.basis_hearing_id])?;
                 tx.execute(
                     "UPDATE cases SET closure_basis = ?2, closure_note = ?3, closed_date = ?4, closed_at = ?5, closed_by = ?6,
                             basis_document_version_id = ?7, basis_decision_id = ?8, basis_hearing_id = ?9 WHERE id = ?1",

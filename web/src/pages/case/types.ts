@@ -3,7 +3,10 @@
  * Every tab component takes `{ caseId, caseData, reload }`.
  */
 
+export interface ClosureEvidence { label: string; link: string | null }
+
 export interface CaseRecord {
+  closure_evidence: ClosureEvidence | null;
   id: number;
   registry_id: number;
   year: number;
@@ -84,6 +87,7 @@ export interface CaseRelation {
 }
 
 export interface StatusHistoryItem {
+  closure_evidence: ClosureEvidence | null;
   from_status: string | null;
   to_status: string;
   reason: string | null;

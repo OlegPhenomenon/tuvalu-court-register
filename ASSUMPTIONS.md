@@ -156,3 +156,6 @@ Recorded next steps include awaiting a hearing outcome, confirming a draft heari
 service assessment, and deciding the status after reopening. Draft decisions count even when their
 private documents are hidden from the viewer. This is a registry workflow metric, not a legal conclusion.
 A new closure cannot precede the latest effective status date; imported closures cannot be in the future.
+
+- A re-notification task is fulfilled when an invitation for its replacement hearing and party is queued for e-mail or recorded as manually sent. Completion records the notice ID and actor; it does not establish receipt or legal service. Invitations to adjourned/cancelled hearings remain dispatch history but no longer request handover/service assessment or block closing. Cancellation messages still require follow-up.
+- A decision date must be on or after the linked hearing's court-local calendar date, including when the demo permits recording an outcome ahead of time. Draft dates may be blank. Finalisation requires a date; the form defaults to the later of today and the hearing date (or a valid saved date).

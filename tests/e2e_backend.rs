@@ -516,7 +516,7 @@ async fn next_action_links_templates_reports_and_dispatch_wording_match_the_cont
     let (s, b) = olga.post(&format!("/api/cases/{cid}/close"), json!({"basis":"decided"})).await;
     err(s, &b, StatusCode::CONFLICT, "open_items");
     let items = b["error"]["details"]["items"].as_array().unwrap();
-    assert!(items.iter().any(|i| i["kind"] == "unconfirmed_dispatch" && i["label"] == "Hearing notice for Tue 17 Nov 2026 → Alexei Fenwick"), "items: {items:?}");
+    assert!(!items.iter().any(|i| i["kind"] == "unconfirmed_dispatch" && i["label"] == "Hearing notice for Tue 17 Nov 2026 → Alexei Fenwick"), "items: {items:?}");
     assert!(items.iter().any(|i| i["kind"] == "dispatch" && i["label"] == "Hearing notice for Thu 19 Nov 2026 → Alexei Fenwick"), "items: {items:?}");
     assert!(items.iter().any(|i| i["kind"] == "unconfirmed_dispatch" && i["label"] == "Copy package → Maria Calder"), "items: {items:?}");
     assert!(items.iter().all(|i| i["recipient"].is_null() && i["dispatch_kind"].is_null() && i["hearing_starts"].is_null()));

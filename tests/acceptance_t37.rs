@@ -228,15 +228,15 @@ async fn t37_new_intake_through_full_chain_changes_reports() {
         &format!("{case_path}/hearings"),
         "t37-hearing",
         json!({
-            "hearing_type":"hearing", "confirm":true, "starts_local":"2026-12-14T10:00", "ends_local":"2026-12-14T11:00", "room_id":room,
+            "hearing_type":"hearing", "confirm":true, "starts_local":format!("{date}T08:00"), "ends_local":format!("{date}T09:00"), "room_id":room,
             "participants":[{"party_id":claimant,"role":"claimant"},{"party_id":respondent,"role":"respondent"}]
         }),
     )
     .await;
     let hearing_id = hearing["id"].as_i64().unwrap();
     assert_eq!(hearing["status"], "scheduled");
-    assert_eq!(hearing["starts_local"], "2026-12-14T10:00");
-    assert_eq!(hearing["ends_local"], "2026-12-14T11:00");
+    assert_eq!(hearing["starts_local"], format!("{date}T08:00"));
+    assert_eq!(hearing["ends_local"], format!("{date}T09:00"));
     assert_eq!(hearing["room_id"], room);
     assert_eq!(hearing["judge_user_id"], viktor_id);
     assert_eq!(hearing["conflict_override"], 0);
@@ -244,7 +244,7 @@ async fn t37_new_intake_through_full_chain_changes_reports() {
     let notice = post(&sergei, &format!("{case_path}/dispatches"), "t37-notice", notice_body.clone()).await;
     assert_eq!(notice["status"], "draft");
     assert_eq!(notice["hearing_id"], hearing_id);
-    assert!(notice["body"].as_str().unwrap().contains("14 December 2026 at 10:00"), "notice: {notice}");
+    assert!(notice["body"].as_str().unwrap().contains(&tuvalu_court::time::human_court_local(&format!("{date}T08:00"),false)), "notice: {notice}");
     preview_queue(&sergei, &notice, "t37-notice-queue").await;
     // The harness drops the background receiver: this is the existing worker trigger,
     // not a fixture write. All domain commands and observations use HTTP.
@@ -262,7 +262,7 @@ async fn t37_new_intake_through_full_chain_changes_reports() {
         &format!("/api/hearings/{hearing_id}/adjourn"),
         "t37-adjourn",
         json!({
-            "starts_local":"2026-12-16T10:00", "ends_local":"2026-12-16T11:00", "room_id":room,
+            "starts_local":format!("{date}T10:00"), "ends_local":format!("{date}T11:00"), "room_id":room,
             "reason":"DEMO witness unavailable on the original date", "authorised_by":"Viktor Hale"
         }),
     )
@@ -274,8 +274,8 @@ async fn t37_new_intake_through_full_chain_changes_reports() {
     assert_eq!(moved["old"]["adjourned_to_id"], new_hearing_id);
     assert_eq!(new_hearing["previous_hearing_id"], hearing_id);
     assert_eq!(new_hearing["status"], "scheduled");
-    assert_eq!(new_hearing["starts_local"], "2026-12-16T10:00");
-    assert_eq!(new_hearing["ends_local"], "2026-12-16T11:00");
+    assert_eq!(new_hearing["starts_local"], format!("{date}T10:00"));
+    assert_eq!(new_hearing["ends_local"], format!("{date}T11:00"));
     assert_eq!(new_hearing["room_id"], room);
     assert_eq!(new_hearing["conflict_override"], 0);
     assert_eq!(get(&sergei, &format!("/api/dispatches/{stale_id}")).await["status"], "superseded");
@@ -293,7 +293,7 @@ async fn t37_new_intake_through_full_chain_changes_reports() {
     .await;
     assert_eq!(fresh["status"], "draft");
     assert_eq!(fresh["hearing_id"], new_hearing_id);
-    assert!(fresh["body"].as_str().unwrap().contains("16 December 2026 at 10:00"), "new notice: {fresh}");
+    assert!(fresh["body"].as_str().unwrap().contains(&tuvalu_court::time::human_court_local(&format!("{date}T10:00"),false)), "new notice: {fresh}");
     preview_queue(&sergei, &fresh, "t37-new-notice-queue").await;
     tuvalu_court::outbox::process(&olga.db(&app)).unwrap();
     mailbox_item(&sergei, &fresh, number).await;
@@ -305,6 +305,11 @@ async fn t37_new_intake_through_full_chain_changes_reports() {
         assert_eq!(task["hearing_id"], new_hearing_id);
         assert_eq!(task["assignee_user_id"], sergei_id);
         let id = task["id"].as_i64().unwrap();
+        let current = get(&sergei, &format!("/api/tasks/{id}")).await;
+        if current["status"] == "done" {
+            assert_eq!(current["result"],format!("completed automatically: notice #{} queued for the new hearing",fresh["id"]));
+            continue;
+        }
         let completed = post(
             &sergei,
             &format!("/api/tasks/{id}/complete"),
@@ -336,7 +341,7 @@ async fn t37_new_intake_through_full_chain_changes_reports() {
     assert_eq!(outcome["hearing"]["outcome_summary"], "DEMO parties heard; claim allowed");
     assert_eq!(outcome["hearing"]["outcome_recorded_by_name"], "Viktor Hale");
     assert!(outcome["hearing"]["participants"].as_array().unwrap().iter().all(|p| p["attended"] == 1));
-    if date < "2026-12-16" {
+    if new_hearing["starts_at"].as_str().unwrap() > tuvalu_court::time::now_utc().as_str() {
         assert_eq!(outcome["demo_note"], "Recorded ahead of the hearing time (demo only)");
     }
     let decision_bytes = pdf("DEMO T37 final decision: boat repair claim allowed");
@@ -492,9 +497,9 @@ async fn t37_new_intake_through_full_chain_changes_reports() {
         ("dispatch.prepared", "Sergei Novak"),
         ("dispatch.reviewed", "Sergei Novak"),
         ("dispatch.queued", "Sergei Novak"),
+        ("task.completed", "Sergei Novak"),
         ("dispatch.sent", "Sergei Novak"),
         ("dispatch.confirmed", "Sergei Novak"),
-        ("task.completed", "Sergei Novak"),
         ("task.completed", "Sergei Novak"),
         ("hearing.outcome_recorded", "Viktor Hale"),
         ("document.uploaded", "Viktor Hale"),

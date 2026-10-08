@@ -761,3 +761,180 @@ async fn f11_import_future_closed_date_rejected_at_preview_and_commit() {
         .unwrap();
     assert_eq!(count, 0);
 }
+
+#[tokio::test]
+async fn e2e_d2_closure_evidence_is_linked_versioned_and_redacted_in_each_status_entry() {
+    let app = TestApp::demo();
+    let o = app.persona("olga").await;
+    let (cid,_) = register_case(&o,"DEMO evidence display").await;
+    let e = o.switch("elena").await;
+    let uid = user_id(&o,"Olga").await;
+    let vid = basis(&o,&app,cid,uid);
+    let close = format!("/api/cases/{cid}/close");
+    let (s,b) = o.post(&close,json!({"basis":"settled","basis_document_version_id":vid})).await;
+    ok(s,&b);
+    let (_,detail) = o.get(&format!("/api/cases/{cid}")).await;
+    let evidence = &detail["case"]["closure_evidence"];
+    assert_eq!(evidence["label"],"DEMO settlement · v1");
+    assert_eq!(evidence["link"],format!("/api/document-versions/{vid}/download"));
+    assert_eq!(detail["status_history"].as_array().unwrap().last().unwrap()["closure_evidence"],*evidence);
+    let (s,b) = e.post(&format!("/api/cases/{cid}/reopen"),json!({"reason":"DEMO new material"})).await;
+    ok(s,&b);
+    let db = o.db(&app);
+    let conn = db.open().unwrap();
+    let (_,secret) = insert_document(&db,cid,"SECRET closure title","decision","restricted",uid);
+    conn.execute("INSERT INTO decisions(case_id,title,decision_date,status,document_id,document_version_id,author_user_id,created_at)
+        SELECT ?1,'SECRET decision',?2,'finalised',document_id,id,?3,uploaded_at FROM document_versions WHERE id=?4",
+        params![cid,today(),uid,secret]).unwrap();
+    let did = conn.last_insert_rowid();
+    let (s,b) = o.post(&close,json!({"basis":"decided","basis_decision_id":did})).await;
+    ok(s,&b);
+    let (_,detail) = o.get(&format!("/api/cases/{cid}")).await;
+    assert_eq!(detail["case"]["closure_evidence"]["label"],"SECRET decision — SECRET closure title · v1");
+    assert_eq!(detail["case"]["closure_evidence"]["link"],format!("/cases/{cid}?tab=decisions#decision-{did}"));
+    let (_,hidden) = e.get(&format!("/api/cases/{cid}")).await;
+    assert!(!hidden.to_string().contains("SECRET"));
+    assert_eq!(hidden["case"]["closure_evidence"],json!({"label":"Restricted document","link":null}));
+    assert_eq!(hidden["status_history"].as_array().unwrap().last().unwrap()["closure_evidence"],hidden["case"]["closure_evidence"]);
+    assert_eq!(hidden["status_history"][1]["closure_evidence"],*evidence);
+    let (s,b) = e.post(&format!("/api/cases/{cid}/reopen"),json!({"reason":"DEMO outcome"})).await;
+    ok(s,&b);
+    let start = tuvalu_court::time::local_to_utc(&format!("{}T00:00",today())).unwrap();
+    conn.execute("INSERT INTO hearings(case_id,hearing_type,status,starts_at,ends_at,outcome_summary,created_by,created_at)
+        VALUES(?1,'directions','held',?2,?3,'DEMO settlement recorded',?4,?2)",params![cid,start,tuvalu_court::time::add_minutes(&start,1).unwrap(),uid]).unwrap();
+    let hid = conn.last_insert_rowid();
+    let (s,b) = o.post(&close,json!({"basis":"settled","basis_hearing_id":hid})).await;
+    ok(s,&b);
+    let (_,detail) = e.get(&format!("/api/cases/{cid}")).await;
+    assert_eq!(detail["case"]["closure_evidence"]["link"],format!("/cases/{cid}?tab=hearings&hearing={hid}"));
+    assert!(detail["case"]["closure_evidence"]["label"].as_str().unwrap().contains("DEMO settlement recorded"));
+    assert_eq!(detail["status_history"].as_array().unwrap().iter().filter(|h|!h["closure_evidence"].is_null()).count(),3);
+}
+
+#[tokio::test]
+async fn e2e_d4_grant_candidates_share_endpoint_eligibility_and_exclude_pavel() {
+    let app = TestApp::demo();
+    let o = app.persona("olga").await;
+    let (cid,_) = register_case(&o,"DEMO grant candidates").await;
+    let e = o.switch("elena").await;
+    let uid = user_id(&o,"Olga").await;
+    let (doc,_) = insert_document(&o.db(&app),cid,"DEMO restricted","claim","restricted",uid);
+    let pavel = user_id(&o,"Pavel").await;
+    let sergei = user_id(&o,"Sergei").await;
+    let conn = o.db(&app).open().unwrap();
+    // Even a tech admin with delegated task permission and stale case assignment is ineligible.
+    conn.execute("INSERT INTO user_permissions(user_id,permission,granted_at) VALUES(?1,'task.manage',?2)",params![pavel,tuvalu_court::time::now_utc()]).unwrap();
+    conn.execute("INSERT INTO case_assignments(case_id,user_id,role,reason,assigned_by,start_at) VALUES(?1,?2,'other','DEMO stale admin assignment',?3,?4)",params![cid,pavel,uid,tuvalu_court::time::now_utc()]).unwrap();
+    let path = format!("/api/documents/{doc}/grants");
+    let (s,b) = e.get(&format!("{path}/candidates")).await;
+    ok(s,&b);
+    let items = b["items"].as_array().unwrap();
+    assert!(!items.is_empty());
+    assert!(!items.iter().any(|u|u["id"]==pavel || u["id"]==sergei || u["id"]==user_id_value(&conn,"elena")));
+    for u in items {
+        let (s,b) = e.post(&path,json!({"user_id":u["id"],"reason":"DEMO grant"})).await;
+        ok(s,&b);
+    }
+    let (_,remaining) = e.get(&format!("{path}/candidates")).await;
+    assert!(remaining["items"].as_array().unwrap().is_empty());
+    let (s,b) = e.post(&path,json!({"user_id":pavel,"reason":"DEMO rejected admin grant"})).await;
+    err(s,&b,StatusCode::BAD_REQUEST,"validation");
+    // Fresh endpoint results reflect deactivation and ended assignments.
+    let (s,b) = e.post(&format!("/api/cases/{cid}/assignments"),json!({"user_id":sergei,"role":"service_officer","reason":"DEMO access"})).await;
+    ok(s,&b);
+    let (_,b) = e.get(&format!("{path}/candidates")).await;
+    assert!(b["items"].as_array().unwrap().iter().any(|u|u["id"]==sergei));
+    conn.execute("UPDATE users SET active=0 WHERE id=?1",[sergei]).unwrap();
+    let (_,b) = e.get(&format!("{path}/candidates")).await;
+    assert!(!b["items"].as_array().unwrap().iter().any(|u|u["id"]==sergei));
+    conn.execute("UPDATE users SET active=1 WHERE id=?1",[sergei]).unwrap();
+    conn.execute("UPDATE case_assignments SET end_at=?2 WHERE case_id=?1 AND user_id=?3",params![cid,tuvalu_court::time::now_utc(),sergei]).unwrap();
+    let (_,b) = e.get(&format!("{path}/candidates")).await;
+    assert!(!b["items"].as_array().unwrap().iter().any(|u|u["id"]==sergei));
+}
+
+fn user_id_value(conn: &rusqlite::Connection, username: &str) -> i64 {
+    conn.query_row("SELECT id FROM users WHERE username=?1",[username],|r|r.get(0)).unwrap()
+}
+
+#[tokio::test]
+async fn e2e_d5_replaced_notices_are_history_without_next_steps_or_closing_blockers() {
+    for status in ["adjourned","cancelled"] {
+        let app = TestApp::demo();
+        let o = app.persona("olga").await;
+        let (cid,_) = register_case(&o,"DEMO stale notice").await;
+        let uid = user_id(&o,"Olga").await;
+        let db = o.db(&app);
+        let conn = db.open().unwrap();
+        conn.execute("INSERT INTO hearings(case_id,hearing_type,status,starts_at,ends_at,created_by,created_at)
+            VALUES(?1,'hearing',?2,'2099-01-01T00:00:00Z','2099-01-01T01:00:00Z',?3,?4)",params![cid,status,uid,tuvalu_court::time::now_utc()]).unwrap();
+        let hid = conn.last_insert_rowid();
+        conn.execute("INSERT INTO dispatches(case_id,hearing_id,kind,recipient_name,method,address,subject,body,status,prepared_by,prepared_at,sent_at)
+            VALUES(?1,?2,'notice','DEMO recipient','email','demo@example.invalid','Old invitation','DEMO','sent',?3,?4,?4)",params![cid,hid,uid,tuvalu_court::time::now_utc()]).unwrap();
+        let did = conn.last_insert_rowid();
+        let (_,detail) = o.get(&format!("/api/cases/{cid}")).await;
+        assert!(detail["next_actions"].as_array().unwrap().iter().any(|a|a["code"]=="plan_next_step"));
+        assert!(!detail["next_actions"].as_array().unwrap().iter().any(|a|a["code"]=="confirm_delivery" || a["code"]=="assess_service"));
+        let (_,report) = o.get("/api/reports/without_next_step/items").await;
+        assert!(report["rows"].as_array().unwrap().iter().any(|r|r["id"]==cid));
+        assert!(tuvalu_court::api::cases::open_items(&conn,cid).unwrap().is_empty());
+        let (_,history) = o.get(&format!("/api/cases/{cid}/dispatches")).await;
+        assert!(history["items"].as_array().unwrap().iter().any(|d|d["id"]==did && d["status"]=="sent"));
+        // A cancellation message about the old appointment is still active correspondence.
+        conn.execute("UPDATE dispatches SET notice_purpose='cancellation' WHERE id=?1",[did]).unwrap();
+        let (_,detail) = o.get(&format!("/api/cases/{cid}")).await;
+        assert!(detail["next_actions"].as_array().unwrap().iter().any(|a|a["code"]=="confirm_delivery"));
+        assert_eq!(tuvalu_court::api::cases::open_items(&conn,cid).unwrap().len(),1);
+        conn.execute("UPDATE dispatches SET notice_purpose='invitation' WHERE id=?1",[did]).unwrap();
+        let vid = basis(&o,&app,cid,uid);
+        let (s,b) = o.post(&format!("/api/cases/{cid}/close"),json!({"basis":"settled","basis_document_version_id":vid})).await;
+        ok(s,&b);
+    }
+}
+
+#[tokio::test]
+async fn e2e_d2_existing_closures_and_d5_legacy_renotify_bindings_survive_migration() {
+    let app = TestApp::demo();
+    let o = app.persona("olga").await;
+    let e = o.switch("elena").await;
+    let (cid,_) = register_case(&o,"DEMO migration evidence").await;
+    let uid = user_id(&o,"Olga").await;
+    let db = o.db(&app);
+    let mut versions = Vec::new();
+    for _ in 0..2 {
+        let vid = basis(&o,&app,cid,uid);
+        versions.push(vid);
+        let (s,b) = o.post(&format!("/api/cases/{cid}/close"),json!({"basis":"settled","basis_document_version_id":vid})).await;
+        ok(s,&b);
+        let (s,b) = e.post(&format!("/api/cases/{cid}/reopen"),json!({"reason":"DEMO reopening"})).await;
+        ok(s,&b);
+    }
+    let (_,detail) = o.get(&format!("/api/cases/{cid}")).await;
+    let party = detail["participants"][0]["party_id"].as_i64().unwrap();
+    let (s,h) = o.post(&format!("/api/cases/{cid}/hearings"),json!({"hearing_type":"hearing","confirm":true,
+        "starts_local":"2027-09-01T09:00","ends_local":"2027-09-01T10:00","participants":[{"party_id":party,"role":"claimant"}]})).await;
+    ok(s,&h);
+    let (s,moved) = o.post(&format!("/api/hearings/{}/adjourn",h["id"]),json!({"starts_local":"2027-09-02T09:00","ends_local":"2027-09-02T10:00","reason":"DEMO migration","authorised_by":"Judge DEMO"})).await;
+    ok(s,&moved);
+    let conn = db.open().unwrap();
+    // Model a v12 database with an imported closure preceding its native audit records.
+    conn.execute("INSERT INTO case_status_history(id,case_id,to_status,at,effective_date) VALUES(-1,?1,'closed','2000-01-01T00:00:00Z','2000-01-01')",[cid]).unwrap();
+    conn.execute_batch("ALTER TABLE case_status_history DROP COLUMN basis_document_version_id;
+        ALTER TABLE case_status_history DROP COLUMN basis_decision_id;
+        ALTER TABLE case_status_history DROP COLUMN basis_hearing_id;
+        ALTER TABLE tasks DROP COLUMN renotify_party_id;
+        PRAGMA user_version=12;").unwrap();
+    drop(conn);
+    db.init().unwrap();
+    let (_,detail) = o.get(&format!("/api/cases/{cid}")).await;
+    let closures:Vec<_> = detail["status_history"].as_array().unwrap().iter().filter(|h|h["to_status"]=="closed").collect();
+    assert!(closures[0]["closure_evidence"].is_null());
+    for (h,vid) in closures[1..].iter().zip(versions) {
+        assert_eq!(h["closure_evidence"]["link"],format!("/api/document-versions/{vid}/download"));
+    }
+    assert_eq!(db.open().unwrap().query_row("SELECT renotify_party_id FROM tasks WHERE id=?1",[moved["tasks"][0]["id"].as_i64()],|r|r.get::<_,i64>(0)).unwrap(),party);
+    let conn = db.open().unwrap();
+    let missing_seed_evidence:i64 = conn.query_row("SELECT COUNT(*) FROM case_status_history h JOIN cases c ON c.id=h.case_id
+        WHERE h.to_status='closed' AND c.basis_decision_id IS NOT NULL AND h.basis_decision_id IS NULL",[],|r|r.get(0)).unwrap();
+    assert_eq!(missing_seed_evidence,0);
+}

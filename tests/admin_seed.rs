@@ -881,14 +881,18 @@ async fn demo_seed_dataset_is_complete_and_consistent() {
         .unwrap();
     assert_eq!(copies, 2);
 
-    // Every sent dispatch has a local mailbox copy; nothing leaves the server.
+    // Only e-mail dispatches have mailbox copies; all deliveries stay fictional.
     let mail: i64 = conn
         .query_row("SELECT COUNT(*) FROM mailbox", [], |r| r.get(0))
         .unwrap();
     assert!(
-        mail >= 5,
+        mail == 3,
         "expected notices, an info request and copy packages in the mailbox"
     );
+
+    let invalid_mail: i64 = conn.query_row("SELECT COUNT(*) FROM mailbox m JOIN dispatches d ON d.id=m.dispatch_id
+        WHERE d.method <> 'email' OR m.to_address NOT LIKE '%@example.invalid'", [], |r|r.get(0)).unwrap();
+    assert_eq!(invalid_mail, 0);
 
     // Restricted case: Sergei is initially unassigned; Elena is assigned to manage grants.
     let case6 = by_title("DEMO — Guardianship assessment")["id"]

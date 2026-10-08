@@ -34,6 +34,7 @@ pub fn routes() -> Router<AppState> {
         .route("/documents/{id}", get(detail).patch(update))
         .route("/documents/{id}/versions", post(add_version))
         .route("/documents/{id}/grants", post(grant_add))
+        .route("/documents/{id}/grants/candidates", get(grant_candidates))
         .route("/documents/{id}/grants/{gid}", delete(grant_revoke))
         .route("/document-versions/{id}/download", get(download))
         .route("/cases/{id}/documents", get(list_for_case).post(upload_to_case))
@@ -797,6 +798,46 @@ fn grant_json(conn: &Connection, gid: i64) -> AppResult<Value> {
     query_one_json(conn, &format!("{GRANT_SELECT} WHERE g.id = ?1"), [gid])
 }
 
+fn grant_target(conn: &Connection, actor: &Actor, doc: &Value, user_id: i64) -> AppResult<Actor> {
+    let target = crate::auth::load_actor(conn, user_id, None)?
+        .ok_or_else(|| AppError::validation("Choose an active staff member."))?;
+    if target.has(perm::ADMIN_USERS) || !policy::user_assignable(conn, user_id)? {
+        return Err(AppError::validation("System administrators cannot receive document grants."));
+    }
+    if doc["visibility"] == "restricted" && user_id == actor.user_id {
+        return Err(AppError::forbidden("You cannot grant yourself access to a restricted document."));
+    }
+    let reaches = match doc["case_id"].as_i64() {
+        Some(cid) => policy::can_view_case(conn, &target, cid)?,
+        None => target.has(perm::INTAKE_MANAGE),
+    };
+    if !reaches {
+        return Err(AppError::validation("This person has no access to the case; a grant cannot help.")
+            .with_details(json!({"field":"user_id"})));
+    }
+    Ok(target)
+}
+
+async fn grant_candidates(ctx: Ctx, Path(id): Path<i64>) -> JsonResult {
+    let actor = ctx.actor;
+    let value = ctx.db.read(move |c| {
+        let doc = load_for_grant(c, &actor, id)?;
+        authorize_grant(&actor, &doc)?;
+        let mut items = Vec::new();
+        for user in query_json(c, "SELECT id, display_name, title, is_judge FROM users u WHERE active=1
+            AND NOT EXISTS(SELECT 1 FROM document_grants g WHERE g.document_id=?1 AND g.user_id=u.id AND g.revoked_at IS NULL)
+            ORDER BY display_name", [id])? {
+            match grant_target(c, &actor, &doc, user["id"].as_i64().unwrap_or_default()) {
+                Ok(_) => items.push(user),
+                Err(e) if matches!(e.status.as_u16(), 400 | 403 | 404) => {},
+                Err(e) => return Err(e),
+            }
+        }
+        Ok(json!({"items":items}))
+    }).await?;
+    Ok(Json(value))
+}
+
 #[derive(Deserialize)]
 struct GrantReq {
     user_id: i64,
@@ -811,20 +852,7 @@ async fn grant_add(ctx: Ctx, Path(id): Path<i64>, JsonBody(req): JsonBody<GrantR
             let doc = load_for_grant(tx, &actor, id)?;
             authorize_grant(&actor, &doc)?;
             let why = reason(&req.reason)?;
-            let target = crate::auth::load_actor(tx, req.user_id, None)?
-                .ok_or_else(|| AppError::validation("Unknown user.").with_details(json!({ "field": "user_id" })))?;
-            if doc["visibility"] == "restricted" && target.user_id == actor.user_id {
-                return Err(AppError::forbidden("You cannot grant yourself access to a restricted document."));
-            }
-            // The grant widens the visibility scope only; the person must already reach the container.
-            let reaches_container = match doc["case_id"].as_i64() {
-                Some(cid) => policy::can_view_case(tx, &target, cid)?,
-                None => target.has(perm::INTAKE_MANAGE),
-            };
-            if !reaches_container {
-                return Err(AppError::validation("This person has no access to the case; a grant cannot help.")
-                    .with_details(json!({ "field": "user_id" })));
-            }
+            let target = grant_target(tx, &actor, &doc, req.user_id)?;
             if let Some(existing) = query_json(
                 tx,
                 "SELECT id FROM document_grants WHERE document_id = ?1 AND user_id = ?2 AND revoked_at IS NULL",
