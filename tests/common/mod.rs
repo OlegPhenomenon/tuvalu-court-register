@@ -198,6 +198,31 @@ impl Client {
         (s, v)
     }
 
+    /// Multipart upload with a stable command key, preserving the ordinary upload helper.
+    pub async fn upload_idem(&self, path: &str, key: &str, fields: &[(&str, &str)], filename: &str, bytes: &[u8]) -> (StatusCode, Value) {
+        let boundary = "----tcrtestidem";
+        let mut body = Vec::new();
+        for (k, v) in fields {
+            body.extend_from_slice(format!("--{boundary}\r\nContent-Disposition: form-data; name=\"{k}\"\r\n\r\n{v}\r\n").as_bytes());
+        }
+        body.extend_from_slice(format!("--{boundary}\r\nContent-Disposition: form-data; name=\"file\"; filename=\"{filename}\"\r\nContent-Type: application/octet-stream\r\n\r\n").as_bytes());
+        body.extend_from_slice(bytes);
+        body.extend_from_slice(format!("\r\n--{boundary}--\r\n").as_bytes());
+        let req = self.builder(Method::POST, path)
+            .header(header::CONTENT_TYPE, format!("multipart/form-data; boundary={boundary}"))
+            .header("idempotency-key", key).body(Body::from(body)).unwrap();
+        let (s, v, _, _) = self.clone().send(req).await;
+        (s, v)
+    }
+
+    /// PATCH with an Idempotency-Key, for task reassignment retries.
+    pub async fn patch_idem(&self, path: &str, key: &str, body: Value) -> (StatusCode, Value) {
+        let req = self.builder(Method::PATCH, path).header(header::CONTENT_TYPE, "application/json")
+            .header("idempotency-key", key).body(Body::from(body.to_string())).unwrap();
+        let (s, v, _, _) = self.clone().send(req).await;
+        (s, v)
+    }
+
     /// The sandbox database behind this client (to run the outbox or inspect rows in tests).
     pub fn db(&self, app: &TestApp) -> tuvalu_court::db::Db {
         let mut h = axum::http::HeaderMap::new();
@@ -295,4 +320,13 @@ pub fn insert_document(db: &tuvalu_court::db::Db, case_id: i64, title: &str, doc
     )
     .unwrap();
     (doc, conn.last_insert_rowid())
+}
+
+/// A fictional dated settlement document for closure tests that do not hold a hearing.
+pub async fn settlement_document(c: &Client, app: &TestApp, case_id: i64) -> i64 {
+    let uid = user_id(c, "Olga").await;
+    let db = c.db(app);
+    let (doc, vid) = insert_document(&db, case_id, "DEMO settlement agreement", "correspondence", "party_material", uid);
+    db.open().unwrap().execute("UPDATE documents SET document_date=?2 WHERE id=?1", rusqlite::params![doc, today()]).unwrap();
+    vid
 }

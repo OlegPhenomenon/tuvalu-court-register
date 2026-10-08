@@ -1084,8 +1084,8 @@ pub fn seed_cases(tx: &Transaction, db: &Db) -> AppResult<()> {
     )?;
     tx.execute(
         "UPDATE cases SET closure_basis = 'decided', closure_note = 'Decision made and copies delivered to both parties',
-                closed_date = ?2, closed_at = ?3, closed_by = ?4 WHERE id = ?1",
-        params![case4, ldate(-15), ts(-15), olga],
+                closed_date = ?2, closed_at = ?3, closed_by = ?4, basis_decision_id = ?5 WHERE id = ?1",
+        params![case4, ldate(-15), ts(-15), olga, dec_id],
     )?;
     audit::record(
         tx,
@@ -1154,6 +1154,9 @@ pub fn seed_cases(tx: &Transaction, db: &Db) -> AppResult<()> {
         "Allocated by the registry head",
         58,
     )?;
+    let (_, settlement_basis) = document(tx, db, case5, "DEMO - Settlement agreement", "correspondence",
+        "party", "party_material", None, &a_olga, 30,
+        &["DEMO - FICTIONAL SETTLEMENT", "The fictional parties agreed to settle the refund claim."])?;
     set_status(
         tx,
         &a_olga,
@@ -1166,8 +1169,8 @@ pub fn seed_cases(tx: &Transaction, db: &Db) -> AppResult<()> {
     )?;
     tx.execute(
         "UPDATE cases SET closure_basis = 'settled', closure_note = 'Parties settled',
-                closed_date = ?2, closed_at = ?3, closed_by = ?4 WHERE id = ?1",
-        params![case5, ldate(-30), ts(-30), olga],
+                closed_date = ?2, closed_at = ?3, closed_by = ?4, basis_document_version_id = ?5 WHERE id = ?1",
+        params![case5, ldate(-30), ts(-30), olga, settlement_basis.version_id],
     )?;
     audit::record(
         tx,

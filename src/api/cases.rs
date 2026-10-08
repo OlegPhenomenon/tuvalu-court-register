@@ -21,6 +21,7 @@ pub fn routes() -> Router<AppState> {
         .route("/cases/{id}", get(detail).patch(update))
         .route("/cases/{id}/status", post(change_status))
         .route("/cases/{id}/close", post(close))
+        .route("/cases/{id}/closing-bases", get(closing_bases))
         .route("/cases/{id}/reopen", post(reopen))
         .route("/cases/{id}/relations", post(add_relation))
         .route("/cases/{id}/participants", post(participant_add))
@@ -257,6 +258,7 @@ pub fn case_json(c: &Connection, actor: &Actor, id: i64) -> AppResult<Value> {
         [id],
     )?;
     case["category_label"] = json!(super::common::ref_label(c, "case_category", case["category"].as_str().unwrap_or_default())?);
+    redact_closing_basis(c, actor, &mut case)?;
     let rel_vis_to = policy::case_visible_sql(actor, "r.to_case_id");
     let rel_vis_from = policy::case_visible_sql(actor, "r.from_case_id");
     Ok(json!({
@@ -326,6 +328,21 @@ fn action(code: &str, message: String, link: String) -> Value {
     json!({ "code": code, "message": message, "link": link })
 }
 
+/// Existing planned work, independent of whether a person needs to act immediately.
+pub fn has_next_step(c: &Connection, actor: &Actor, case_id: i64) -> AppResult<bool> {
+    policy::require_case(c, actor, case_id)?;
+    let sql = format!(
+        "SELECT status <> 'closed' AND (
+        EXISTS(SELECT 1 FROM hearings WHERE case_id=?1 AND status='scheduled' AND ends_at > ?2)
+        OR EXISTS(SELECT 1 FROM tasks WHERE case_id=?1 AND status='open')
+        OR EXISTS(SELECT 1 FROM dispatches WHERE case_id=?1 AND status IN ('draft','queued','failed'))
+        OR EXISTS(SELECT 1 FROM decisions dc JOIN documents doc ON doc.id=dc.document_id
+            WHERE dc.case_id=?1 AND dc.status='draft' AND {})) FROM cases WHERE id=?1",
+        policy::document_visible_sql(actor, "doc")
+    );
+    Ok(c.query_row(&sql, params![case_id, crate::time::now_utc()], |r| r.get(0))?)
+}
+
 /// Plain-language next steps for a case, computed from its records (spec §5: explain the next step,
 /// not a status code). Only includes things the actor can see.
 pub fn next_actions(c: &Connection, actor: &Actor, case_id: i64) -> AppResult<Vec<Value>> {
@@ -336,7 +353,11 @@ pub fn next_actions(c: &Connection, actor: &Actor, case_id: i64) -> AppResult<Ve
         return Ok(out);
     }
     if status == "reopened" {
-        out.push(action("decide_after_reopen", "The case was reopened — record the next step (set it active or on hold).".into(), format!("{base}?tab=summary")));
+        out.push(action(
+            "decide_after_reopen",
+            "The case was reopened — record the next step (set it active or on hold).".into(),
+            format!("{base}?tab=summary"),
+        ));
     }
     let has_judge: bool = c.query_row(
         "SELECT EXISTS (SELECT 1 FROM case_assignments WHERE case_id = ?1 AND role = 'judge' AND end_at IS NULL)",
@@ -344,9 +365,32 @@ pub fn next_actions(c: &Connection, actor: &Actor, case_id: i64) -> AppResult<Ve
         |r| r.get(0),
     )?;
     if !has_judge {
-        out.push(action("assign_judge", "Assign a judge to this case.".into(), format!("{base}?tab=summary&action=assign-judge")));
+        out.push(action(
+            "assign_judge",
+            "Assign a judge to this case.".into(),
+            format!("{base}?tab=summary&action=assign-judge"),
+        ));
     }
     let now = crate::time::now_utc();
+    for h in query_json(
+        c,
+        "SELECT id, starts_at FROM hearings WHERE case_id=?1 AND status='scheduled' AND ends_at > ?2 ORDER BY starts_at",
+        params![case_id, now],
+    )? {
+        let when = crate::time::utc_to_local(h["starts_at"].as_str().unwrap_or_default());
+        out.push(action(
+            "scheduled_hearing",
+            format!("Next hearing: {when} (court time)."),
+            format!("{base}?tab=hearings&hearing={}", h["id"]),
+        ));
+    }
+    if !has_next_step(c, actor, case_id)? {
+        out.push(action(
+            "plan_next_step",
+            "No next step is recorded. Schedule a hearing or record the work still needed.".into(),
+            format!("{base}?tab=summary"),
+        ));
+    }
     // Hearings that ended but have no outcome.
     for h in query_json(
         c,
@@ -354,19 +398,30 @@ pub fn next_actions(c: &Connection, actor: &Actor, case_id: i64) -> AppResult<Ve
         params![case_id, now],
     )? {
         let when = crate::time::utc_to_local(h["starts_at"].as_str().unwrap_or_default());
-        out.push(action("record_outcome", format!("Record the outcome of the hearing on {when}."), format!("{base}?tab=hearings&hearing={}", h["id"])));
+        out.push(action(
+            "record_outcome",
+            format!("Record the outcome of the hearing on {when}."),
+            format!("{base}?tab=hearings&hearing={}", h["id"]),
+        ));
     }
     let has_hearing: bool = c.query_row(
         "SELECT EXISTS (SELECT 1 FROM hearings WHERE case_id = ?1 AND status IN ('scheduled','held'))",
         [case_id],
         |r| r.get(0),
     )?;
-    let has_final: bool =
-        c.query_row("SELECT EXISTS (SELECT 1 FROM decisions WHERE case_id = ?1 AND status = 'finalised')", [case_id], |r| r.get(0))?;
+    let has_final: bool = c.query_row(
+        "SELECT EXISTS (SELECT 1 FROM decisions WHERE case_id = ?1 AND status = 'finalised')",
+        [case_id],
+        |r| r.get(0),
+    )?;
     if !has_hearing && !has_final && has_judge && matches!(status.as_str(), "registered" | "active") {
         out.push(action("schedule_hearing", "Schedule the first hearing.".into(), format!("{base}?tab=hearings")));
     }
-    for d in query_json(c, "SELECT d.id, d.kind, d.recipient_name, d.subject, d.status, h.starts_at AS hearing_at FROM dispatches d LEFT JOIN hearings h ON h.id = d.hearing_id WHERE d.case_id = ?1 AND d.status IN ('draft','failed','sent') ORDER BY d.id", [case_id])? {
+    for d in query_json(
+        c,
+        "SELECT d.id, d.kind, d.recipient_name, d.subject, d.status, h.starts_at AS hearing_at FROM dispatches d LEFT JOIN hearings h ON h.id = d.hearing_id WHERE d.case_id = ?1 AND d.status IN ('draft','queued','failed','sent') ORDER BY d.id",
+        [case_id],
+    )? {
         let who = d["recipient_name"].as_str().unwrap_or_default();
         let what = match d["kind"].as_str() {
             Some("notice") => "notice",
@@ -375,8 +430,17 @@ pub fn next_actions(c: &Connection, actor: &Actor, case_id: i64) -> AppResult<Ve
         };
         let link = format!("{base}?tab=dispatch&dispatch={}", d["id"]);
         match d["status"].as_str() {
-            Some("draft") => out.push(action("review_dispatch", format!("Check the recipient and contents of the {what} for {who}, then send it."), link.clone())),
-            Some("failed") => out.push(action("retry_dispatch", format!("Delivery of the {what} to {who} failed — retry or use another method."), link.clone())),
+            Some("queued") => out.push(action("queued_dispatch", format!("The {what} to {who} is queued for sending."), link.clone())),
+            Some("draft") => out.push(action(
+                "review_dispatch",
+                format!("Check the recipient and contents of the {what} for {who}, then send it."),
+                link.clone(),
+            )),
+            Some("failed") => out.push(action(
+                "retry_dispatch",
+                format!("Delivery of the {what} to {who} failed — retry or use another method."),
+                link.clone(),
+            )),
             Some("sent") => {
                 let confirmed: bool = c.query_row(
                     "SELECT EXISTS (SELECT 1 FROM delivery_confirmations WHERE dispatch_id = ?1 AND kind = 'human_handover')",
@@ -396,15 +460,22 @@ pub fn next_actions(c: &Connection, actor: &Actor, case_id: i64) -> AppResult<Ve
             _ => {}
         }
     }
-    for mut d in query_json(c, "SELECT title,document_version_id FROM decisions WHERE case_id = ?1 AND status = 'draft'", [case_id])? {
-        if policy::require_version(c,actor,d["document_version_id"].as_i64().unwrap_or_default()).is_err() { d["title"]=json!("Restricted document"); }
-        out.push(action("finalise_decision", format!("Finalise or withdraw the draft decision “{}”.", d["title"].as_str().unwrap_or_default()), format!("{base}?tab=decisions")));
+    for mut d in query_json(c, "SELECT title, document_version_id FROM decisions WHERE case_id = ?1 AND status = 'draft'", [case_id])? {
+        if policy::require_version(c, actor, d["document_version_id"].as_i64().unwrap_or_default()).is_err() {
+            d["title"] = json!("Restricted document");
+        }
+        out.push(action(
+            "finalise_decision",
+            format!("Finalise or withdraw the draft decision “{}”.", d["title"].as_str().unwrap_or_default()),
+            format!("{base}?tab=decisions"),
+        ));
     }
     if has_final {
         // Each party needs each current finalised decision, with its exact bound version.
         for p in query_json(
             c,
-            &format!("SELECT DISTINCT p.id AS party_id, p.name, dc.id AS decision_id, dc.title
+            &format!(
+                "SELECT DISTINCT p.id AS party_id, p.name, dc.id AS decision_id, dc.title
              FROM decisions dc JOIN case_participations cp ON cp.case_id = dc.case_id
              JOIN parties p ON p.id = cp.party_id
              JOIN document_versions v ON v.id = dc.document_version_id JOIN documents doc ON doc.id = v.document_id
@@ -413,11 +484,20 @@ pub fn next_actions(c: &Connection, actor: &Actor, case_id: i64) -> AppResult<Ve
                AND NOT EXISTS (SELECT 1 FROM dispatches dp JOIN dispatch_items di ON di.dispatch_id = dp.id
                  WHERE dp.case_id = ?1 AND dp.kind = 'copies' AND dp.recipient_party_id = p.id
                    AND dp.status <> 'cancelled' AND di.document_version_id = dc.document_version_id)
-             ORDER BY dc.id, p.id", visible = policy::document_visible_sql(actor, "doc")),
+             ORDER BY dc.id, p.id",
+                visible = policy::document_visible_sql(actor, "doc")
+            ),
             [case_id],
         )? {
-            out.push(action("send_decision", format!("Send a copy of the decision “{}” to {}.", p["title"].as_str().unwrap_or_default(), p["name"].as_str().unwrap_or_default()),
-                format!("{base}?tab=dispatch&action=copies&decision={}&party={}", p["decision_id"], p["party_id"])));
+            out.push(action(
+                "send_decision",
+                format!(
+                    "Send a copy of the decision “{}” to {}.",
+                    p["title"].as_str().unwrap_or_default(),
+                    p["name"].as_str().unwrap_or_default()
+                ),
+                format!("{base}?tab=dispatch&action=copies&decision={}&party={}", p["decision_id"], p["party_id"]),
+            ));
         }
     }
     for t in query_json(
@@ -428,10 +508,18 @@ pub fn next_actions(c: &Connection, actor: &Actor, case_id: i64) -> AppResult<Ve
     )? {
         let who = t["assignee"].as_str().map(|a| format!(" ({a})")).unwrap_or_default();
         let due = t["due_date"].as_str().map(|d| format!(", due {d}")).unwrap_or_default();
-        out.push(action("task", format!("Task: {}{who}{due}.", t["title"].as_str().unwrap_or_default()), format!("{base}?tab=tasks")));
+        out.push(action(
+            "task",
+            format!("Task: {}{who}{due}.", t["title"].as_str().unwrap_or_default()),
+            format!("{base}?tab=tasks"),
+        ));
     }
-    if out.is_empty() && has_final && actor.has(perm::CASE_CLOSE) {
-        out.push(action("ready_to_close", "Nothing is left open. The case can be closed with a basis.".into(), format!("{base}?tab=summary")));
+    if out.iter().all(|a| a["code"] == "plan_next_step") && has_final && actor.has(perm::CASE_CLOSE) {
+        out.push(action(
+            "ready_to_close",
+            "Nothing is left open. The case can be closed with a basis.".into(),
+            format!("{base}?tab=summary"),
+        ));
     }
     Ok(out)
 }
@@ -608,11 +696,140 @@ struct Acknowledgement {
 
 #[derive(Deserialize, Serialize)]
 struct CloseReq {
+    version: Option<i64>,
+    basis_document_version_id: Option<i64>,
+    basis_decision_id: Option<i64>,
+    basis_hearing_id: Option<i64>,
     basis: String,
     note: Option<String>,
     closed_date: Option<String>,
     #[serde(default)]
     acknowledge: Vec<Acknowledgement>,
+}
+
+/// New closure references inherit their evidence's document visibility, including audit details.
+pub(crate) fn redact_closing_basis(c: &Connection, actor: &Actor, value: &mut Value) -> AppResult<()> {
+    for (field, target) in [
+        ("basis_document_version_id", "SELECT document_id FROM document_versions WHERE id=?1"),
+        ("basis_decision_id", "SELECT document_id FROM decisions WHERE id=?1"),
+    ] {
+        if let Some(id) = value[field].as_i64() {
+            let visible: bool = c.query_row(
+                &format!(
+                    "SELECT EXISTS(SELECT 1 FROM documents d WHERE d.id=({target}) AND {})",
+                    policy::document_visible_sql(actor, "d")
+                ),
+                [id],
+                |r| r.get(0),
+            )?;
+            if !visible {
+                value[field] = Value::Null;
+            }
+        }
+    }
+    Ok(())
+}
+
+/// Only evidence that the actor can inspect is offered by the closing dialog.
+async fn closing_bases(ctx: Ctx, Path(id): Path<i64>) -> JsonResult {
+    let actor = ctx.actor;
+    let value = ctx.db.read(move |c| {
+        policy::require_case_perm(c, &actor, id, perm::CASE_CLOSE)?;
+        let mut items = Vec::new();
+        let held: bool = c.query_row("SELECT EXISTS(SELECT 1 FROM hearings WHERE case_id=?1 AND status='held')",[id],|r|r.get(0))?;
+        if !held {
+            for row in query_json(c, &format!("SELECT v.id, v.version_no, d.title,
+                COALESCE(d.document_date, d.received_date, date(d.created_at, '+12 hours')) AS date
+                FROM documents d JOIN document_versions v ON v.document_id=d.id
+                WHERE d.case_id=?1 AND d.visibility <> 'judicial_note' AND v.scan_status='clean' AND {}
+                ORDER BY d.id, v.version_no DESC",policy::document_visible_sql(&actor,"d")),[id])? {
+                items.push(json!({"kind":"document", "id":row["id"], "date":row["date"],
+                    "label":format!("{} — version {}",row["title"].as_str().unwrap_or_default(),row["version_no"])}));
+            }
+        }
+        for row in query_json(c, &format!("SELECT dc.id, dc.title, dc.decision_date AS date
+            FROM decisions dc JOIN document_versions v ON v.id=dc.document_version_id JOIN documents d ON d.id=v.document_id
+            WHERE dc.case_id=?1 AND dc.status='finalised' AND d.case_id=?1 AND dc.decision_date IS NOT NULL
+                AND d.visibility <> 'judicial_note' AND v.scan_status='clean' AND {} ORDER BY dc.id",
+                policy::document_visible_sql(&actor,"d")),[id])? {
+            items.push(json!({"kind":"decision","id":row["id"],"date":row["date"],"label":row["title"]}));
+        }
+        for row in query_json(c,"SELECT id, ends_at, outcome_summary FROM hearings WHERE case_id=?1 AND status='held' AND trim(COALESCE(outcome_summary,'')) <> '' ORDER BY starts_at DESC",[id])? {
+            let date = crate::time::utc_to_local(row["ends_at"].as_str().unwrap_or_default())[..10].to_string();
+            items.push(json!({"kind":"hearing","id":row["id"],"date":date,
+                "label":format!("Hearing on {date} — {}",row["outcome_summary"].as_str().unwrap_or_default())}));
+        }
+        Ok(json!({"items":items}))
+    }).await?;
+    Ok(Json(value))
+}
+
+/// Check exact evidence and chronology without inferring a judicial outcome.
+fn validate_closing_basis(tx: &Connection, actor: &Actor, id: i64, req: &CloseReq, date: &str) -> AppResult<()> {
+    let registered: String = tx.query_row("SELECT registered_date FROM cases WHERE id = ?1", [id], |r| r.get(0))?;
+    if date < registered.as_str() || date > crate::time::today_local().as_str() {
+        return Err(AppError::validation("Closed date must be on or after registration and no later than today.").with_details(json!({"field":"closed_date"})));
+    }
+    let count =
+        usize::from(req.basis_document_version_id.is_some()) + usize::from(req.basis_decision_id.is_some()) + usize::from(req.basis_hearing_id.is_some());
+    if count != 1 {
+        return Err(
+            AppError::validation("Choose one basis document, finalised decision or recorded hearing outcome.")
+                .with_details(json!({"field":"basis_document_version_id"})),
+        );
+    }
+    let evidence_date = if let Some(vid) = req.basis_document_version_id {
+        let (doc, _) = policy::require_version(tx, actor, vid)?;
+        if doc.case_id != Some(id) || doc.visibility == "judicial_note" {
+            return Err(AppError::validation("The basis must be a document of this case and cannot be a judicial note.")
+                .with_details(json!({"field":"basis_document_version_id"})));
+        }
+        let (scan, document_date, received, created): (String, Option<String>, Option<String>, String) = tx.query_row(
+            "SELECT v.scan_status, d.document_date, d.received_date, d.created_at FROM document_versions v JOIN documents d ON d.id=v.document_id WHERE v.id=?1",
+            [vid], |r| Ok((r.get(0)?,r.get(1)?,r.get(2)?,r.get(3)?)))?;
+        if scan != "clean" {
+            return Err(AppError::validation("A quarantined file cannot be the basis for closing.").with_details(json!({"field":"basis_document_version_id"})));
+        }
+        let held: bool = tx.query_row("SELECT EXISTS(SELECT 1 FROM hearings WHERE case_id=?1 AND status='held')", [id], |r| r.get(0))?;
+        if held || req.basis == "decided" {
+            return Err(
+                AppError::validation("Closing after a hearing or decision requires its recorded outcome or finalised decision.")
+                    .with_details(json!({"field":"basis_hearing_id"})),
+            );
+        }
+        document_date
+            .or(received)
+            .unwrap_or_else(|| crate::time::utc_to_local(&created)[..10].to_string())
+    } else if let Some(did) = req.basis_decision_id {
+        let decision = query_one_json(tx, "SELECT * FROM decisions WHERE id=?1 AND case_id=?2", params![did, id])?;
+        let (doc, _) = policy::require_version(tx, actor, decision["document_version_id"].as_i64().unwrap_or_default())?;
+        let scan: String = tx.query_row(
+            "SELECT scan_status FROM document_versions WHERE id=?1",
+            [decision["document_version_id"].as_i64()],
+            |r| r.get(0),
+        )?;
+        if decision["status"] != "finalised" || doc.case_id != Some(id) || doc.visibility == "judicial_note" || scan != "clean" {
+            return Err(
+                AppError::validation("Choose a finalised decision with a safe document of this case.").with_details(json!({"field":"basis_decision_id"}))
+            );
+        }
+        decision["decision_date"]
+            .as_str()
+            .ok_or_else(|| AppError::validation("The basis decision needs a decision date."))?
+            .to_string()
+    } else {
+        let hearing = query_one_json(tx, "SELECT * FROM hearings WHERE id=?1 AND case_id=?2", params![req.basis_hearing_id, id])?;
+        if hearing["status"] != "held" || hearing["outcome_summary"].as_str().unwrap_or_default().trim().is_empty() {
+            return Err(AppError::validation("Choose a held hearing with a recorded outcome.").with_details(json!({"field":"basis_hearing_id"})));
+        }
+        crate::time::utc_to_local(hearing["ends_at"].as_str().unwrap_or_default())[..10].to_string()
+    };
+    if date < evidence_date.as_str() {
+        return Err(
+            AppError::validation("Closed date cannot precede the basis document, decision or hearing outcome.").with_details(json!({"field":"closed_date"})),
+        );
+    }
+    Ok(())
 }
 
 async fn close(ctx: Ctx, Path(id): Path<i64>, IdemKey(key): IdemKey, JsonBody(req): JsonBody<CloseReq>) -> JsonResult {
@@ -624,6 +841,9 @@ async fn close(ctx: Ctx, Path(id): Path<i64>, IdemKey(key): IdemKey, JsonBody(re
             idempotent(tx, &actor, &key, "case.close", &(id, &req), || {
                 if !matches!(case.status.as_str(), "registered" | "active" | "on_hold" | "reopened") {
                     return Err(AppError::invalid_transition("This case is already closed."));
+                }
+                if let Some(version) = req.version && version != case.version {
+                    return Err(AppError::version_conflict(case_json(tx, &actor, id)?));
                 }
                 require_ref(tx, "closure_basis", &req.basis)?;
                 let mut note = optional(&req.note);
@@ -662,17 +882,19 @@ async fn close(ctx: Ctx, Path(id): Path<i64>, IdemKey(key): IdemKey, JsonBody(re
                     Some(d) if !d.trim().is_empty() => crate::time::parse_date(d)?,
                     _ => crate::time::today_local(),
                 };
+                validate_closing_basis(tx, &actor, id, &req, &date)?;
                 record_status(tx, &actor, id, &case.status, "closed", note.as_deref(), Some(&req.basis), &date)?;
                 tx.execute(
-                    "UPDATE cases SET closure_basis = ?2, closure_note = ?3, closed_date = ?4, closed_at = ?5, closed_by = ?6 WHERE id = ?1",
-                    params![id, req.basis, note, date, crate::time::now_utc(), actor.user_id],
+                    "UPDATE cases SET closure_basis = ?2, closure_note = ?3, closed_date = ?4, closed_at = ?5, closed_by = ?6,
+                            basis_document_version_id = ?7, basis_decision_id = ?8, basis_hearing_id = ?9 WHERE id = ?1",
+                    params![id, req.basis, note, date, crate::time::now_utc(), actor.user_id, req.basis_document_version_id, req.basis_decision_id, req.basis_hearing_id],
                 )?;
                 audit::record(
                     tx,
                     Some(&actor),
                     Event::new("case.closed", "case", id, format!("Case {} closed ({})", case.number, req.basis))
                         .case(Some(id))
-                        .details(json!({ "basis": req.basis, "note": note, "closed_date": date, "acknowledge": acknowledged })),
+                        .details(json!({ "basis": req.basis, "note": note, "closed_date": date, "acknowledge": acknowledged, "basis_document_version_id": req.basis_document_version_id, "basis_decision_id": req.basis_decision_id, "basis_hearing_id": req.basis_hearing_id })),
                 )?;
                 Ok(json!({ "ok": true, "closed_date": date }))
             })
@@ -683,58 +905,75 @@ async fn close(ctx: Ctx, Path(id): Path<i64>, IdemKey(key): IdemKey, JsonBody(re
 
 #[derive(Deserialize, Serialize)]
 struct ReasonReq {
+    version: Option<i64>,
     reason: Option<String>,
 }
 
-async fn reopen(ctx: Ctx, Path(id): Path<i64>, JsonBody(req): JsonBody<ReasonReq>) -> JsonResult {
+async fn reopen(ctx: Ctx, Path(id): Path<i64>, IdemKey(key): IdemKey, JsonBody(req): JsonBody<ReasonReq>) -> JsonResult {
     let actor = ctx.actor;
     let v = ctx
         .db
         .write(move |tx| {
             let case = policy::require_case_perm(tx, &actor, id, perm::CASE_REOPEN)?;
-            if case.status != "closed" {
-                return Err(AppError::invalid_transition("Only a closed case can be reopened."));
-            }
-            let why = reason(&req.reason)?;
-            record_status(tx, &actor, id, "closed", "reopened", Some(&why), None, &crate::time::today_local())?;
-            audit::record(
-                tx,
-                Some(&actor),
-                Event::new("case.reopened", "case", id, format!("Case {} reopened", case.number))
-                    .case(Some(id))
-                    .details(json!({ "reason": why })),
-            )?;
-            case_json(tx, &actor, id)
+            idempotent(tx, &actor, &key, "case.reopen", &(id, &req), || {
+                if let Some(version) = req.version
+                    && version != case.version
+                {
+                    return Err(AppError::version_conflict(case_json(tx, &actor, id)?));
+                }
+                if case.status != "closed" {
+                    return Err(AppError::invalid_transition("Only a closed case can be reopened."));
+                }
+                let why = reason(&req.reason)?;
+                record_status(tx, &actor, id, "closed", "reopened", Some(&why), None, &crate::time::today_local())?;
+                audit::record(
+                    tx,
+                    Some(&actor),
+                    Event::new("case.reopened", "case", id, format!("Case {} reopened", case.number))
+                        .case(Some(id))
+                        .details(json!({ "reason": why })),
+                )?;
+                case_json(tx, &actor, id)
+            })
         })
         .await?;
     Ok(Json(v))
 }
 
-#[derive(Deserialize)]
+#[derive(Deserialize, Serialize)]
 struct RelationReq {
     to_case_id: i64,
     kind: String,
     note: Option<String>,
 }
 
-async fn add_relation(ctx: Ctx, Path(id): Path<i64>, JsonBody(req): JsonBody<RelationReq>) -> JsonResult {
+async fn add_relation(ctx: Ctx, Path(id): Path<i64>, IdemKey(key): IdemKey, JsonBody(req): JsonBody<RelationReq>) -> JsonResult {
     let actor = ctx.actor;
     let v = ctx
         .db
         .write(move |tx| {
             let case = policy::require_case_perm(tx, &actor, id, perm::CASE_EDIT)?;
             let other = policy::require_case(tx, &actor, req.to_case_id)?;
-            require_ref(tx, "relation_kind", &req.kind)?;
-            tx.execute(
-                "INSERT INTO case_relations (from_case_id, to_case_id, kind, note, created_by, created_at) VALUES (?1, ?2, ?3, ?4, ?5, ?6)",
-                params![id, other.id, req.kind, optional(&req.note), actor.user_id, crate::time::now_utc()],
-            )?;
-            audit::record(
-                tx,
-                Some(&actor),
-                Event::new("case.related", "case", id, format!("Case {} linked to {} ({})", case.number, other.number, req.kind)).case(Some(id)).details(json!({"related_case_id": other.id})),
-            )?;
-            case_json(tx, &actor, id)
+            idempotent(tx, &actor, &key, "case.relation", &(id, &req), || {
+                require_ref(tx, "relation_kind", &req.kind)?;
+                tx.execute(
+                    "INSERT INTO case_relations (from_case_id, to_case_id, kind, note, created_by, created_at) VALUES (?1, ?2, ?3, ?4, ?5, ?6)",
+                    params![id, other.id, req.kind, optional(&req.note), actor.user_id, crate::time::now_utc()],
+                )?;
+                audit::record(
+                    tx,
+                    Some(&actor),
+                    Event::new(
+                        "case.related",
+                        "case",
+                        id,
+                        format!("Case {} linked to {} ({})", case.number, other.number, req.kind),
+                    )
+                    .case(Some(id))
+                    .details(json!({"related_case_id": other.id})),
+                )?;
+                case_json(tx, &actor, id)
+            })
         })
         .await?;
     Ok(Json(v))

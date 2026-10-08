@@ -183,3 +183,12 @@ for the repository (Security tab → Advisories → "Report a vulnerability").
 Include steps to reproduce and the affected version/commit. If the repository
 is not on GitHub, contact the maintainer directly through the channel the
 software was delivered by.
+
+## Workflow retries and closure evidence
+
+Command keys belong to the authenticated user and bind the operation, target and request hash.
+The action, audit event and stored response commit atomically. A replay rechecks current object
+visibility and permissions; state changes such as closing or registering cannot duplicate a committed upload.
+Multipart requests bind metadata and file SHA-256. Closing evidence must be visible, belong to the
+case and use a clean version; judicial notes are excluded. The evidence picker uses the same policy.
+Case cards and closure audit details redact evidence IDs when the viewer cannot see their document.

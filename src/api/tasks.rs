@@ -5,7 +5,7 @@
 
 use super::common::{JsonBody, JsonResult, optional, query_json, query_one_json, reason, required};
 use crate::audit::{self, Event};
-use crate::auth::{Actor, Ctx};
+use crate::auth::{Actor, Ctx, IdemKey, idempotent};
 use crate::error::{AppError, AppResult};
 use crate::policy::{self, perm};
 use crate::state::AppState;
@@ -13,7 +13,7 @@ use axum::extract::{Path, Query};
 use axum::routing::{get, post};
 use axum::{Json, Router};
 use rusqlite::{Connection, params};
-use serde::Deserialize;
+use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
 
 pub fn routes() -> Router<AppState> {
@@ -171,7 +171,7 @@ async fn detail(ctx: Ctx, Path(id): Path<i64>) -> JsonResult {
 
 // ------------------------------------------------------------------ create & edit
 
-#[derive(Deserialize)]
+#[derive(Deserialize, Serialize)]
 struct CreateReq {
     title: String,
     description: Option<String>,
@@ -180,21 +180,19 @@ struct CreateReq {
     hearing_id: Option<i64>,
 }
 
-async fn create(ctx: Ctx, Path(id): Path<i64>, JsonBody(req): JsonBody<CreateReq>) -> JsonResult {
+async fn create(ctx: Ctx, Path(id): Path<i64>, IdemKey(key): IdemKey, JsonBody(req): JsonBody<CreateReq>) -> JsonResult {
     let actor = ctx.actor;
-    let v =
-        ctx.db
-            .write(move |tx| {
-                policy::require_case_perm(tx, &actor, id, perm::TASK_MANAGE)?;
+    let v = ctx
+        .db
+        .write(move |tx| {
+            policy::require_case_perm(tx, &actor, id, perm::TASK_MANAGE)?;
+            idempotent(tx, &actor, &key, "task.create", &(id, &req), || {
                 if let Some(hid) = req.hearing_id {
-                    let belongs: bool = tx.query_row(
-                        "SELECT EXISTS(SELECT 1 FROM hearings WHERE id = ?1 AND case_id = ?2)",
-                        params![hid, id],
-                        |r| r.get(0),
-                    )?;
+                    let belongs: bool = tx.query_row("SELECT EXISTS(SELECT 1 FROM hearings WHERE id = ?1 AND case_id = ?2)", params![hid, id], |r| {
+                        r.get(0)
+                    })?;
                     if !belongs {
-                        return Err(AppError::validation("That hearing does not belong to this case.")
-                            .with_details(json!({ "field": "hearing_id" })));
+                        return Err(AppError::validation("That hearing does not belong to this case.").with_details(json!({ "field": "hearing_id" })));
                     }
                 }
                 let tid = insert_task(
@@ -213,66 +211,69 @@ async fn create(ctx: Ctx, Path(id): Path<i64>, JsonBody(req): JsonBody<CreateReq
                 )?;
                 task_json(tx, tid)
             })
-            .await?;
+        })
+        .await?;
     Ok(Json(v))
 }
 
-#[derive(Deserialize)]
+#[derive(Deserialize, Serialize)]
 struct UpdateReq {
     version: i64,
     title: Option<String>,
     description: Option<String>,
-    #[serde(default, deserialize_with = "super::common::nullable")]
+    #[serde(default, deserialize_with = "super::common::nullable", skip_serializing_if = "Option::is_none")]
     assignee_user_id: Option<Option<i64>>,
     due_date: Option<String>,
 }
 
-async fn update(ctx: Ctx, Path(id): Path<i64>, JsonBody(req): JsonBody<UpdateReq>) -> JsonResult {
+async fn update(ctx: Ctx, Path(id): Path<i64>, IdemKey(key): IdemKey, JsonBody(req): JsonBody<UpdateReq>) -> JsonResult {
     let actor = ctx.actor;
     let v = ctx
         .db
         .write(move |tx| {
             let current = require_task(tx, &actor, id)?;
             actor.require(perm::TASK_MANAGE)?;
-            if current["status"].as_str() != Some("open") {
-                return Err(AppError::invalid_transition("Only an open task can be edited."));
-            }
-            if current["version"].as_i64() != Some(req.version) {
-                return Err(AppError::version_conflict(current));
-            }
-            let title = req.title.as_deref().map(|t| required(t, "Title")).transpose()?;
-            if let Some(Some(uid)) = req.assignee_user_id {
-                check_assignee(tx, uid, current["case_id"].as_i64())?;
-            }
-            tx.execute(
-                "UPDATE tasks SET title = COALESCE(?2, title),
+            idempotent(tx, &actor, &key, "task.update", &(id, &req), || {
+                if current["status"].as_str() != Some("open") {
+                    return Err(AppError::invalid_transition("Only an open task can be edited."));
+                }
+                if current["version"].as_i64() != Some(req.version) {
+                    return Err(AppError::version_conflict(current));
+                }
+                let title = req.title.as_deref().map(|t| required(t, "Title")).transpose()?;
+                if let Some(Some(uid)) = req.assignee_user_id {
+                    check_assignee(tx, uid, current["case_id"].as_i64())?;
+                }
+                tx.execute(
+                    "UPDATE tasks SET title = COALESCE(?2, title),
                         description = CASE WHEN ?3 IS NULL THEN description ELSE NULLIF(?3, '') END,
                         assignee_user_id = CASE WHEN ?7 THEN ?4 ELSE assignee_user_id END,
                         due_date = CASE WHEN ?6 THEN ?5 ELSE due_date END, version = version + 1
                  WHERE id = ?1",
-                params![
-                    id,
-                    title,
-                    req.description.as_deref().map(str::trim),
-                    req.assignee_user_id.flatten(),
-                    crate::time::parse_opt_date(req.due_date.as_deref())?,
-                    req.due_date.is_some(),
-                    req.assignee_user_id.is_some()
-                ],
-            )?;
-            audit::record(
-                tx,
-                Some(&actor),
-                Event::new(
-                    "task.updated",
-                    "task",
-                    id,
-                    format!("Task updated: {}", current["title"].as_str().unwrap_or_default()),
-                )
-                .case(current["case_id"].as_i64())
-                .details(json!({ "before": current })),
-            )?;
-            task_json(tx, id)
+                    params![
+                        id,
+                        title,
+                        req.description.as_deref().map(str::trim),
+                        req.assignee_user_id.flatten(),
+                        crate::time::parse_opt_date(req.due_date.as_deref())?,
+                        req.due_date.is_some(),
+                        req.assignee_user_id.is_some()
+                    ],
+                )?;
+                audit::record(
+                    tx,
+                    Some(&actor),
+                    Event::new(
+                        "task.updated",
+                        "task",
+                        id,
+                        format!("Task updated: {}", current["title"].as_str().unwrap_or_default()),
+                    )
+                    .case(current["case_id"].as_i64())
+                    .details(json!({ "before": current })),
+                )?;
+                task_json(tx, id)
+            })
         })
         .await?;
     Ok(Json(v))
@@ -301,90 +302,103 @@ fn close_task(tx: &Connection, actor: &Actor, id: i64, status: &str, result: Opt
     Ok(())
 }
 
-#[derive(Deserialize)]
+#[derive(Deserialize, Serialize)]
 struct ResultReq {
+    version: Option<i64>,
     result: Option<String>,
 }
 
-async fn complete(ctx: Ctx, Path(id): Path<i64>, JsonBody(req): JsonBody<ResultReq>) -> JsonResult {
+async fn complete(ctx: Ctx, Path(id): Path<i64>, IdemKey(key): IdemKey, JsonBody(req): JsonBody<ResultReq>) -> JsonResult {
     let actor = ctx.actor;
     let v = ctx
         .db
         .write(move |tx| {
-            let t = load_open(tx, &actor, id)?;
-            let result = required(req.result.as_deref().unwrap_or(""), "Result")?;
-            close_task(tx, &actor, id, "done", Some(&result), None)?;
-            audit::record(
-                tx,
-                Some(&actor),
-                Event::new(
-                    "task.completed",
-                    "task",
-                    id,
-                    format!("Task done: {}", t["title"].as_str().unwrap_or_default()),
-                )
-                .case(t["case_id"].as_i64())
-                .details(json!({ "result": result })),
-            )?;
-            task_json(tx, id)
+            let t = require_task(tx, &actor, id)?;
+            require_touch(&actor, &t)?;
+            idempotent(tx, &actor, &key, "task.complete", &(id, &req), || {
+                let t = load_open(tx, &actor, id)?;
+                if let Some(version) = req.version
+                    && t["version"].as_i64() != Some(version)
+                {
+                    return Err(AppError::version_conflict(t));
+                }
+                let result = required(req.result.as_deref().unwrap_or(""), "Result")?;
+                close_task(tx, &actor, id, "done", Some(&result), None)?;
+                audit::record(
+                    tx,
+                    Some(&actor),
+                    Event::new("task.completed", "task", id, format!("Task done: {}", t["title"].as_str().unwrap_or_default()))
+                        .case(t["case_id"].as_i64())
+                        .details(json!({ "result": result })),
+                )?;
+                task_json(tx, id)
+            })
         })
         .await?;
     Ok(Json(v))
 }
 
-#[derive(Deserialize)]
+#[derive(Deserialize, Serialize)]
 struct ReasonReq {
     reason: Option<String>,
 }
 
-async fn cancel(ctx: Ctx, Path(id): Path<i64>, JsonBody(req): JsonBody<ReasonReq>) -> JsonResult {
+async fn cancel(ctx: Ctx, Path(id): Path<i64>, IdemKey(key): IdemKey, JsonBody(req): JsonBody<ReasonReq>) -> JsonResult {
     let actor = ctx.actor;
     let v = ctx
         .db
         .write(move |tx| {
-            let t = load_open(tx, &actor, id)?;
-            let why = reason(&req.reason)?;
-            close_task(tx, &actor, id, "cancelled", None, Some(&why))?;
-            audit::record(
-                tx,
-                Some(&actor),
-                Event::new(
-                    "task.cancelled",
-                    "task",
-                    id,
-                    format!("Task cancelled: {}", t["title"].as_str().unwrap_or_default()),
-                )
-                .case(t["case_id"].as_i64())
-                .details(json!({ "reason": why })),
-            )?;
-            task_json(tx, id)
+            let t = require_task(tx, &actor, id)?;
+            require_touch(&actor, &t)?;
+            idempotent(tx, &actor, &key, "task.cancel", &(id, &req), || {
+                let t = load_open(tx, &actor, id)?;
+                let why = reason(&req.reason)?;
+                close_task(tx, &actor, id, "cancelled", None, Some(&why))?;
+                audit::record(
+                    tx,
+                    Some(&actor),
+                    Event::new(
+                        "task.cancelled",
+                        "task",
+                        id,
+                        format!("Task cancelled: {}", t["title"].as_str().unwrap_or_default()),
+                    )
+                    .case(t["case_id"].as_i64())
+                    .details(json!({ "reason": why })),
+                )?;
+                task_json(tx, id)
+            })
         })
         .await?;
     Ok(Json(v))
 }
 
 /// Carried forward: the task stays on record as deliberately left for later work (reason required).
-async fn carry_forward(ctx: Ctx, Path(id): Path<i64>, JsonBody(req): JsonBody<ReasonReq>) -> JsonResult {
+async fn carry_forward(ctx: Ctx, Path(id): Path<i64>, IdemKey(key): IdemKey, JsonBody(req): JsonBody<ReasonReq>) -> JsonResult {
     let actor = ctx.actor;
     let v = ctx
         .db
         .write(move |tx| {
-            let t = load_open(tx, &actor, id)?;
-            let why = reason(&req.reason)?;
-            close_task(tx, &actor, id, "carried_forward", None, Some(&why))?;
-            audit::record(
-                tx,
-                Some(&actor),
-                Event::new(
-                    "task.carried_forward",
-                    "task",
-                    id,
-                    format!("Task carried forward: {}", t["title"].as_str().unwrap_or_default()),
-                )
-                .case(t["case_id"].as_i64())
-                .details(json!({ "reason": why })),
-            )?;
-            task_json(tx, id)
+            let t = require_task(tx, &actor, id)?;
+            require_touch(&actor, &t)?;
+            idempotent(tx, &actor, &key, "task.carry_forward", &(id, &req), || {
+                let t = load_open(tx, &actor, id)?;
+                let why = reason(&req.reason)?;
+                close_task(tx, &actor, id, "carried_forward", None, Some(&why))?;
+                audit::record(
+                    tx,
+                    Some(&actor),
+                    Event::new(
+                        "task.carried_forward",
+                        "task",
+                        id,
+                        format!("Task carried forward: {}", t["title"].as_str().unwrap_or_default()),
+                    )
+                    .case(t["case_id"].as_i64())
+                    .details(json!({ "reason": why })),
+                )?;
+                task_json(tx, id)
+            })
         })
         .await?;
     Ok(Json(v))

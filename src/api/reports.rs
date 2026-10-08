@@ -246,7 +246,7 @@ fn raw_items(
             );
             let mut rows = Vec::new();
             for row in query_json(c, &sql, [])? {
-                if super::cases::next_actions(c, actor, row["id"].as_i64().unwrap_or_default())?.is_empty() {
+                if !super::cases::has_next_step(c, actor, row["id"].as_i64().unwrap_or_default())? {
                     rows.push(row);
                 }
             }

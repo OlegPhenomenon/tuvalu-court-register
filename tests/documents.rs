@@ -921,7 +921,7 @@ async fn oversized_and_closed_case_uploads_are_rejected() {
         .query_row("SELECT id FROM intakes WHERE case_id = ?1", [case_id], |r| r.get(0))
         .unwrap();
     let (s, b) = olga
-        .post(&format!("/api/cases/{case_id}/close"), json!({ "basis": "settled" }))
+        .post(&format!("/api/cases/{case_id}/close"), json!({ "basis": "settled", "basis_document_version_id": d["versions"][0]["id"] }))
         .await;
     ok(s, &b);
     let baseline = stored_blobs(&db);

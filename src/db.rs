@@ -13,6 +13,7 @@ const MIGRATIONS: &[&str] = &[
     include_str!("migrations/0006_admin.sql"),
     include_str!("migrations/0007_access.sql"),
     include_str!("migrations/0008_audit_judicial.sql"),
+    include_str!("migrations/0009_audit_workflow.sql"),
 ];
 
 /// Handle to one court database (production DB or one demo sandbox) and its private file store.

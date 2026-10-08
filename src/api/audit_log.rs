@@ -84,7 +84,10 @@ fn event_json(
     let entity_type = ev["entity_type"].as_str().unwrap_or_default();
     let entity_id = ev["entity_id"].as_i64();
     let action = ev["action"].as_str().unwrap_or_default();
-    let details: Value = serde_json::from_str(ev["details"].as_str().unwrap_or("{}"))?;
+    let mut details: Value = serde_json::from_str(ev["details"].as_str().unwrap_or("{}"))?;
+    if action == "case.closed" {
+        super::cases::redact_closing_basis(c, actor, &mut details)?;
+    }
     let hidden_relation = if action == "case.related" {
         if let Some(other) = details["related_case_id"].as_i64() {
             policy::require_case(c, actor, other).is_err()

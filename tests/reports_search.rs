@@ -64,10 +64,11 @@ async fn reports_dates_visibility_drilldown_and_csv() {
         .get("/api/reports/summary?from=1900-01-01&to=1900-01-01&as_of=1900-01-01")
         .await;
     assert_eq!(metric(&prior, "open_as_of"), 0);
+    let vid = settlement_document(&olga, &app, visible).await;
     let (s, b) = olga
         .post(
             &format!("/api/cases/{visible}/close"),
-            json!({"basis":"settled","note":"Settlement"}),
+            json!({"basis":"settled","note":"Settlement","basis_document_version_id":vid}),
         )
         .await;
     ok(s, &b);
