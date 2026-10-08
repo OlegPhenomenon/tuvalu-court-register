@@ -1,0 +1,41 @@
+# /etc/systemd/system/tuvalu-court.service
+# Binary: /opt/tuvalu-court/tuvalu-court   Data: /var/lib/tuvalu-court   Config: /etc/tuvalu-court.env
+[Unit]
+Description=Tuvalu Court Register (demo prototype)
+After=network.target
+
+[Service]
+Type=simple
+User=tuvalu-court
+Group=tuvalu-court
+EnvironmentFile=/etc/tuvalu-court.env
+Environment=TCR_DATA_DIR=/var/lib/tuvalu-court
+ExecStart=/opt/tuvalu-court/tuvalu-court serve
+Restart=on-failure
+RestartSec=3
+StateDirectory=tuvalu-court
+StateDirectoryMode=0700
+
+# Resource limits: the service is designed to stay well under these.
+MemoryMax=200M
+CPUQuota=50%
+TasksMax=64
+
+# Hardening
+NoNewPrivileges=true
+ProtectSystem=strict
+ProtectHome=true
+PrivateTmp=true
+PrivateDevices=true
+ProtectKernelTunables=true
+ProtectKernelModules=true
+ProtectControlGroups=true
+RestrictAddressFamilies=AF_INET AF_INET6 AF_UNIX
+RestrictNamespaces=true
+LockPersonality=true
+MemoryDenyWriteExecute=true
+SystemCallArchitectures=native
+ReadWritePaths=/var/lib/tuvalu-court
+
+[Install]
+WantedBy=multi-user.target
