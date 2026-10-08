@@ -59,7 +59,10 @@ open; each must be confirmed with the Office of the Judiciary before real use
     nothing about appeals being exhausted or the judgment being final.
 11. **Demo-only early outcomes.** Production refuses to record a hearing
     outcome before its start time; demo mode allows it so visitors can finish
-    the walkthrough on fictional dates (`src/api/hearings.rs`).
+    the walkthrough on fictional dates (`src/api/hearings.rs`). For the same
+    reason a demo case whose closing evidence (outcome or decision) is dated
+    after today closes on exactly that evidence date; production never accepts
+    a closing date after today (`src/api/cases.rs`, `validate_closing_basis`).
 12. **Dispatch transport depends on mode.** Demo always uses the local mailbox.
     Production sends via configured TLS SMTP and keeps a local sent log; missing
     configuration leaves email queued. Transport failures retry with backoff;

@@ -236,7 +236,7 @@ Judicial review commands bind to the exact record shown to the reviewer:
   The UI reloads the draft, identifies the file/revision and requires a fresh review before retrying.
 - `POST /hearings/:id/confirm` requires `{version, override_reason?}`. A changed draft slot returns
   409 `version_conflict` with `{current}` before booking. The UI reloads time/room/judge for review.
-- Hearing outcome's early-recording exception applies only to DEMO. Production refuses future hearings.
+- Hearing outcome's early-recording exception applies only to DEMO. Production refuses future hearings. In DEMO only, a case whose closing evidence is dated after today closes on exactly that evidence date.
 
 Dispatch material and currency:
 - Create accepts `kind: notice|copies|decision_copy|working_document`; the last three are stored as a copy package.

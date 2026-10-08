@@ -25,6 +25,7 @@ import type { CaseHit } from '../intake/pickers';
 import type { Assignment, CaseData, CaseTabProps, ClosureEvidence, OpenItem } from './types';
 import ExportDialog from './ExportDialog';
 import { useApi } from '../../components/useApi';
+import { useSession } from '../../session';
 
 function EvidenceLink({ evidence }: { evidence: ClosureEvidence }) {
   return evidence.link ? (evidence.link.startsWith('/api/')
@@ -237,6 +238,12 @@ function CloseCaseModal({ caseId, caseVersion, registeredDate, latestStatusDate,
   const selected = evidence.data?.items.find((i) => `${i.kind}:${i.id}` === evidenceId);
   const [note, setNote] = useState('');
   const [closedDate, setClosedDate] = useState(courtToday());
+  const { session } = useSession();
+  // Demo only: outcomes may be recorded ahead of the hearing, so evidence can be dated after today.
+  const demoAhead = session?.mode === 'demo' && !!selected && selected.date > courtToday();
+  useEffect(() => {
+    if (demoAhead && selected) setClosedDate(selected.date);
+  }, [demoAhead, selected?.date]); // eslint-disable-line react-hooks/exhaustive-deps
   // One key per opened form — a network retry replays, never double-closes.
   const [idemKey] = useState(() => newKey());
   const [busy, setBusy] = useState(false);
@@ -357,7 +364,9 @@ function CloseCaseModal({ caseId, caseVersion, registeredDate, latestStatusDate,
           }))} placeholder="Choose evidence for closing" required
           help="Without a hearing, choose a document of this case or a finalised decision. After a hearing, choose its recorded outcome or decision." />
         <DateField label="Closed date" value={closedDate} onChange={setClosedDate} required
-          min={[registeredDate, latestStatusDate, selected?.date ?? ''].sort().at(-1)} max={courtToday()} />
+          min={[registeredDate, latestStatusDate, selected?.date ?? ''].sort().at(-1)}
+          max={demoAhead ? selected?.date : courtToday()}
+          help={demoAhead ? 'Demo only: this evidence was recorded ahead of its date, so the case closes on that date.' : undefined} />
         <p className="muted">
           Closed in the register means the registry stage is complete. It is not proof that the
           decision was enforced or that appeal rights have expired.

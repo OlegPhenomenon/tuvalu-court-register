@@ -8,7 +8,7 @@ use crate::auth::{Actor, Ctx, IdemKey, idempotent};
 use crate::error::{AppError, AppResult};
 use crate::policy::{self, perm};
 use crate::state::AppState;
-use axum::extract::{Path, Query};
+use axum::extract::{Path, Query, State};
 use axum::routing::{get, post};
 use axum::{Json, Router};
 use rusqlite::{Connection, OptionalExtension, Transaction, params};
@@ -893,9 +893,11 @@ async fn closing_bases(ctx: Ctx, Path(id): Path<i64>) -> JsonResult {
 }
 
 /// Check exact evidence and chronology without inferring a judicial outcome.
-fn validate_closing_basis(tx: &Connection, actor: &Actor, id: i64, req: &CloseReq, date: &str) -> AppResult<()> {
+/// `demo`: a demo installation records hearing outcomes (and so decisions) ahead of the hearing time;
+/// there, and only there, the closing date may follow such evidence into the future (spec §12 walkthrough).
+fn validate_closing_basis(tx: &Connection, actor: &Actor, id: i64, req: &CloseReq, date: &str, demo: bool) -> AppResult<()> {
     let registered: String = tx.query_row("SELECT registered_date FROM cases WHERE id = ?1", [id], |r| r.get(0))?;
-    if date < registered.as_str() || date > crate::time::today_local().as_str() {
+    if date < registered.as_str() {
         return Err(AppError::validation("Closed date must be on or after registration and no later than today.").with_details(json!({"field":"closed_date"})));
     }
     let count =
@@ -957,10 +959,27 @@ fn validate_closing_basis(tx: &Connection, actor: &Actor, id: i64, req: &CloseRe
             AppError::validation("Closed date cannot precede the basis document, decision or hearing outcome.").with_details(json!({"field":"closed_date"})),
         );
     }
+    let today = crate::time::today_local();
+    if demo && evidence_date > today {
+        // Demo only: the evidence was recorded ahead of its date; close on exactly that date, never later.
+        if date != evidence_date.as_str() {
+            return Err(AppError::validation("In the demo, a case closed on evidence recorded ahead of time is closed on the evidence date.")
+                .with_details(json!({"field":"closed_date","demo_only":true})));
+        }
+    } else if date > today.as_str() {
+        return Err(AppError::validation("Closed date must be on or after registration and no later than today.").with_details(json!({"field":"closed_date"})));
+    }
     Ok(())
 }
 
-async fn close(ctx: Ctx, Path(id): Path<i64>, IdemKey(key): IdemKey, JsonBody(req): JsonBody<CloseReq>) -> JsonResult {
+async fn close(
+    ctx: Ctx,
+    State(state): State<AppState>,
+    Path(id): Path<i64>,
+    IdemKey(key): IdemKey,
+    JsonBody(req): JsonBody<CloseReq>,
+) -> JsonResult {
+    let demo = state.is_demo();
     let actor = ctx.actor;
     let v = ctx
         .db
@@ -1019,7 +1038,7 @@ async fn close(ctx: Ctx, Path(id): Path<i64>, IdemKey(key): IdemKey, JsonBody(re
                     return Err(AppError::validation("Closed date cannot precede the latest case status change.")
                         .with_details(json!({"field":"closed_date"})));
                 }
-                validate_closing_basis(tx, &actor, id, &req, &date)?;
+                validate_closing_basis(tx, &actor, id, &req, &date, demo)?;
                 record_status(tx, &actor, id, &case.status, "closed", note.as_deref(), Some(&req.basis), &date)?;
                 tx.execute("UPDATE case_status_history SET basis_document_version_id=?2, basis_decision_id=?3, basis_hearing_id=?4
                     WHERE id=(SELECT MAX(id) FROM case_status_history WHERE case_id=?1)",

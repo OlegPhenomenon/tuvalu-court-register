@@ -1490,3 +1490,49 @@ async fn continuation_requires_scheduler_confirmation_and_scheduled_outcome_chec
     assert!(b["next_hearing_note"].is_null());
     assert_eq!(blocked["status"], "scheduled");
 }
+
+/// A finalised decision dated after today on `cid`, as recorded ahead of time in the demo walkthrough.
+fn future_decision(app_db: &tuvalu_court::db::Db, cid: i64, uid: i64, date: &str) -> i64 {
+    let (_, vid) = insert_document(app_db, cid, "DEMO order recorded ahead", "decision", "party_material", uid);
+    let conn = app_db.open().unwrap();
+    conn.execute(
+        "INSERT INTO decisions(case_id,title,decision_date,status,document_id,document_version_id,author_user_id,finalised_by,finalised_at,created_at)
+         SELECT ?1,'DEMO order recorded ahead',?2,'finalised',document_id,id,?3,?3,uploaded_at,uploaded_at FROM document_versions WHERE id=?4",
+        rusqlite::params![cid, date, uid, vid],
+    )
+    .unwrap();
+    conn.last_insert_rowid()
+}
+
+#[tokio::test]
+async fn demo_closes_on_evidence_recorded_ahead_but_production_never_closes_in_the_future() {
+    let evidence_date = "2099-11-19";
+    // Demo: the walkthrough records the 19 Nov outcome and decision ahead of time, so the case
+    // closes on exactly that date; any other future date or today is refused.
+    let app = TestApp::demo();
+    let olga = app.persona("olga").await;
+    let (cid, _) = register_case(&olga, "DEMO closing on early evidence").await;
+    let uid = user_id(&olga, "Olga").await;
+    let did = future_decision(&olga.db(&app), cid, uid, evidence_date);
+    let path = format!("/api/cases/{cid}/close");
+    for date in [today(), "2099-11-20".to_string()] {
+        let (s, b) = olga.post(&path, json!({"basis":"decided","basis_decision_id":did,"closed_date":date})).await;
+        err(s, &b, StatusCode::BAD_REQUEST, "validation");
+    }
+    let (s, b) = olga.post(&path, json!({"basis":"decided","basis_decision_id":did,"closed_date":evidence_date})).await;
+    ok(s, &b);
+    assert_eq!(b["closed_date"], evidence_date);
+
+    // Production: no early evidence exception — a future closing date is always refused.
+    let app = TestApp::production();
+    tuvalu_court::seed::seed_demo(app.state.main_db.as_ref().unwrap()).unwrap();
+    let olga = production_client(&app, "olga");
+    let (cid, _) = register_case(&olga, "Production closing date").await;
+    let uid = user_id(&olga, "Olga").await;
+    let did = future_decision(app.state.main_db.as_ref().unwrap(), cid, uid, evidence_date);
+    let (s, b) = olga
+        .post(&format!("/api/cases/{cid}/close"), json!({"basis":"decided","basis_decision_id":did,"closed_date":evidence_date}))
+        .await;
+    err(s, &b, StatusCode::BAD_REQUEST, "validation");
+    assert_eq!(b["error"]["message"], "Closed date must be on or after registration and no later than today.");
+}
