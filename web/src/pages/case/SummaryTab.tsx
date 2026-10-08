@@ -616,11 +616,13 @@ export default function SummaryTab({ caseId, caseData, reload }: CaseTabProps) {
       { key: 'display_name', header: 'Person', render: (a) => `${a.display_name}${a.title ? ` — ${a.title}` : ''}` },
       { key: 'role', header: 'Role', render: (a) => ASSIGN_ROLE_LABELS[a.role] ?? a.role },
       { key: 'reason', header: 'Reason' },
-      { key: 'start_at', header: 'From', render: (a) => fmtLocal(a.start_at) },
+      { key: 'start_at', header: 'From', render: (a) => <span className="assignment-date">{fmtLocal(a.start_at)}</span> },
       {
         key: 'end_at',
         header: 'To',
-        render: (a) => (a.end_at ? `${fmtLocal(a.end_at)}${a.end_reason ? ` — ${a.end_reason}` : ''}` : 'active'),
+        render: (a) => a.end_at ? (
+          <><span className="assignment-date">{fmtLocal(a.end_at)}</span>{a.end_reason ? ` — ${a.end_reason}` : ''}</>
+        ) : <span className="assignment-date">active</span>,
       },
       { key: 'assigned_by_name', header: 'By', render: (a) => a.assigned_by_name ?? '—' },
     ];

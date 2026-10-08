@@ -1,32 +1,44 @@
-import { useEffect, useId, useRef } from 'react';
+import { useEffect, useId, useLayoutEffect, useRef, useState } from 'react';
 import type { ReactNode } from 'react';
 
 const FOCUSABLE = 'button, [href], input, select, textarea, [tabindex]:not([tabindex="-1"])';
+
+type ModalContentProps = {
+  title: string;
+  onClose: () => void;
+  children: ReactNode;
+};
 
 /**
  * Dialog: `<Modal title="…" open={open} onClose={close}>content</Modal>`.
  * Focus trap + Esc to close + focus restore + backdrop click closes.
  */
-export function Modal({ title, open, onClose, children }: {
-  title: string;
-  open: boolean;
-  onClose: () => void;
-  children: ReactNode;
-}) {
+export function Modal({ open, ...props }: ModalContentProps & { open: boolean }) {
+  return open ? <ModalDialog {...props} /> : null;
+}
+
+function ModalDialog({ title, onClose, children }: ModalContentProps) {
   const ref = useRef<HTMLDivElement>(null);
   const titleId = useId();
+  const closeRef = useRef(onClose);
+  // Each opening mounts a fresh dialog. Capture before children's autoFocus runs.
+  const [previousFocus] = useState(() =>
+    document.activeElement instanceof HTMLElement ? document.activeElement : null,
+  );
+
+  useLayoutEffect(() => {
+    closeRef.current = onClose;
+  }, [onClose]);
 
   useEffect(() => {
-    if (!open) return;
     const node = ref.current;
     if (!node) return;
-    const previous = document.activeElement as HTMLElement | null;
     (node.querySelector<HTMLElement>(FOCUSABLE) ?? node).focus();
 
     const onKey = (e: KeyboardEvent) => {
       if (e.key === 'Escape') {
         e.stopPropagation();
-        onClose();
+        closeRef.current();
         return;
       }
       if (e.key !== 'Tab') return;
@@ -52,11 +64,10 @@ export function Modal({ title, open, onClose, children }: {
     return () => {
       document.removeEventListener('keydown', onKey, true);
       document.body.style.overflow = prevOverflow;
-      previous?.focus?.();
+      previousFocus?.focus();
     };
-  }, [open, onClose]);
+  }, [previousFocus]);
 
-  if (!open) return null;
   return (
     <div
       className="modal-backdrop"

@@ -207,6 +207,7 @@ th, td {
 }
 th { font-size: 0.85rem; color: var(--muted); font-weight: 600; white-space: nowrap; }
 .table-empty { text-align: center; color: var(--muted); padding: 1.5rem 0.5rem; }
+.assignment-date { white-space: nowrap; }
 .conflict-table td:first-child { font-weight: 600; }
 
 /* ---------- Badge ---------- */

@@ -92,6 +92,7 @@ export default function CaseWorkspace() {
       </Card>
 
       <Tabs
+        idPrefix={`case-${caseId}`}
         tabs={TABS.map(({ key, label }) => ({ key, label }))}
         active={active}
         onChange={(key) =>
@@ -102,9 +103,18 @@ export default function CaseWorkspace() {
           })
         }
       />
-      <div role="tabpanel" aria-label={tab.label}>
-        <Component key={caseId} caseId={caseId} caseData={data} reload={reload} />
-      </div>
+      {TABS.map((t) => (
+        <div
+          key={t.key}
+          role="tabpanel"
+          id={`case-${caseId}-panel-${t.key}`}
+          aria-labelledby={`case-${caseId}-tab-${t.key}`}
+          hidden={t.key !== active}
+          tabIndex={0}
+        >
+          {t.key === active && <Component key={caseId} caseId={caseId} caseData={data} reload={reload} />}
+        </div>
+      ))}
     </RegistryPage>
   );
 }

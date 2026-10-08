@@ -805,7 +805,7 @@ export default function HearingsTab({ caseId, caseData, reload }: CaseTabProps) 
                   ) : (
                     'a new hearing'
                   )}
-                  {h.status_reason ? ` — ${h.status_reason}` : ''}
+                  {h.status_reason ? ` — ${h.status_authorised_by ? h.status_reason.replace(/[\s.,;:!?…]+$/u, '') : h.status_reason}` : ''}
                   {h.status_authorised_by ? `, authorised by ${h.status_authorised_by}` : ''}
                 </p>
               )}
