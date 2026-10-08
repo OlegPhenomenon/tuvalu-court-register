@@ -794,7 +794,7 @@ async fn demo_seed_dataset_is_complete_and_consistent() {
     let tavita = find(
         intakes["items"].as_array().unwrap(),
         "sender_name",
-        "Tavita Lomasi (DEMO)",
+        "Jonah Whitlock (DEMO)",
     );
     assert_eq!(tavita["channel"], "post");
     assert_eq!(tavita["origin_island"], "nukufetau");

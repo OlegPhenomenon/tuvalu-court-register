@@ -331,7 +331,7 @@ CREATE TABLE hearings (
   previous_hearing_id    INTEGER REFERENCES hearings(id),  -- set on the new hearing created by adjournment
   adjourned_to_id        INTEGER REFERENCES hearings(id),  -- set on the old hearing
   status_reason          TEXT,                   -- adjournment / cancellation / not-held reason
-  status_authorised_by   TEXT,                   -- who authorised the adjournment (free text, e.g. "Judge Viktor Lauti")
+  status_authorised_by   TEXT,                   -- who authorised the adjournment (free text, e.g. "Judge Viktor Hale")
   conflict_override      INTEGER NOT NULL DEFAULT 0,
   override_reason        TEXT,
   override_by            INTEGER REFERENCES users(id),

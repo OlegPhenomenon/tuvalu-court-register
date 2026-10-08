@@ -568,15 +568,15 @@ pub fn seed_cases(tx: &Transaction, db: &Db) -> AppResult<()> {
         tx,
         &a_olga,
         "person",
-        "Tavita Lomasi (DEMO)",
-        Some("tavita.lomasi@example.invalid"),
+        "Jonah Whitlock (DEMO)",
+        Some("jonah.whitlock@example.invalid"),
         Some("nukufetau"),
     )?;
     let (in1, in1_ref) = intake(
         tx,
         &a_olga,
         Some(tavita),
-        "Tavita Lomasi (DEMO)",
+        "Jonah Whitlock (DEMO)",
         "post",
         "nukufetau",
         "Statement about damage to a family water tank (fictional DEMO filing)",
@@ -587,7 +587,7 @@ pub fn seed_cases(tx: &Transaction, db: &Db) -> AppResult<()> {
         tx,
         "information_request",
         &[
-            ("recipient", "Tavita Lomasi (DEMO)".to_string()),
+            ("recipient", "Jonah Whitlock (DEMO)".to_string()),
             ("intake_reference", in1_ref.clone()),
             ("received_date", ldate(-3)),
             ("missing_items", missing.clone()),
@@ -603,7 +603,7 @@ pub fn seed_cases(tx: &Transaction, db: &Db) -> AppResult<()> {
             kind: "information_request",
             template: Some("information_request"),
             party: Some(tavita),
-            recipient: "Tavita Lomasi (DEMO)",
+            recipient: "Jonah Whitlock (DEMO)",
             method: "post",
             address: Some("Nukufetau, Tuvalu (DEMO)"),
             subject: &subject,
@@ -638,16 +638,16 @@ pub fn seed_cases(tx: &Transaction, db: &Db) -> AppResult<()> {
         tx,
         &a_olga,
         "person",
-        "Tomasi Puapua (DEMO)",
-        Some("tomasi.puapua@example.invalid"),
+        "Edwin Marlowe (DEMO)",
+        Some("edwin.marlowe@example.invalid"),
         Some("funafuti"),
     )?;
     let selima = party(
         tx,
         &a_olga,
         "person",
-        "Selima Fale (DEMO)",
-        Some("selima.fale@example.invalid"),
+        "Clara Bennett (DEMO)",
+        Some("clara.bennett@example.invalid"),
         Some("funafuti"),
     )?;
     let (case2, num2) = new_case(
@@ -668,7 +668,7 @@ pub fn seed_cases(tx: &Transaction, db: &Db) -> AppResult<()> {
         case2,
         tomasi,
         "claimant",
-        Some("tomasi.puapua@example.invalid"),
+        Some("edwin.marlowe@example.invalid"),
     )?;
     participate(
         tx,
@@ -676,7 +676,7 @@ pub fn seed_cases(tx: &Transaction, db: &Db) -> AppResult<()> {
         case2,
         selima,
         "respondent",
-        Some("selima.fale@example.invalid"),
+        Some("clara.bennett@example.invalid"),
     )?;
     assign(tx, &a_olga, case2, olga, "clerk", "Registered the case", 30)?;
     assign(
@@ -724,8 +724,8 @@ pub fn seed_cases(tx: &Transaction, db: &Db) -> AppResult<()> {
         .case(Some(case2)),
     )?;
     for (party_id, name, method, confirmed) in [
-        (tomasi, "Tomasi Puapua (DEMO)", "hand", true),
-        (selima, "Selima Fale (DEMO)", "post", false),
+        (tomasi, "Edwin Marlowe (DEMO)", "hand", true),
+        (selima, "Clara Bennett (DEMO)", "post", false),
     ] {
         let (subject, body) = crate::api::common::render_template(
             tx,
@@ -768,7 +768,7 @@ pub fn seed_cases(tx: &Transaction, db: &Db) -> AppResult<()> {
         &a_olga,
         case2,
         "general",
-        "Confirm the hearing notice reached Selima Fale (DEMO) and record it",
+        "Confirm the hearing notice reached Clara Bennett (DEMO) and record it",
         sergei,
         Some(&ldate(9)),
     )?;
@@ -778,16 +778,16 @@ pub fn seed_cases(tx: &Transaction, db: &Db) -> AppResult<()> {
         tx,
         &a_olga,
         "person",
-        "Paleki Lino (DEMO)",
-        Some("paleki.lino@example.invalid"),
+        "Felix Rowan (DEMO)",
+        Some("felix.rowan@example.invalid"),
         Some("funafuti"),
     )?;
     let moea = party(
         tx,
         &a_olga,
         "person",
-        "Moea Tui (DEMO)",
-        Some("moea.tui@example.invalid"),
+        "Ada Pemberton (DEMO)",
+        Some("ada.pemberton@example.invalid"),
         Some("vaitupu"),
     )?;
     let (case3, _num3) = new_case(
@@ -808,7 +808,7 @@ pub fn seed_cases(tx: &Transaction, db: &Db) -> AppResult<()> {
         case3,
         paleki,
         "claimant",
-        Some("paleki.lino@example.invalid"),
+        Some("felix.rowan@example.invalid"),
     )?;
     participate(
         tx,
@@ -816,7 +816,7 @@ pub fn seed_cases(tx: &Transaction, db: &Db) -> AppResult<()> {
         case3,
         moea,
         "respondent",
-        Some("moea.tui@example.invalid"),
+        Some("ada.pemberton@example.invalid"),
     )?;
     assign(tx, &a_olga, case3, olga, "clerk", "Registered the case", 45)?;
     assign(
@@ -894,7 +894,7 @@ pub fn seed_cases(tx: &Transaction, db: &Db) -> AppResult<()> {
             "new_hearing_id": new_h,
         })),
     )?;
-    for name in ["Paleki Lino (DEMO)", "Moea Tui (DEMO)"] {
+    for name in ["Felix Rowan (DEMO)", "Ada Pemberton (DEMO)"] {
         task(
             tx,
             &a_olga,
@@ -910,16 +910,16 @@ pub fn seed_cases(tx: &Transaction, db: &Db) -> AppResult<()> {
         tx,
         &a_olga,
         "person",
-        "Ana Lauti (DEMO)",
-        Some("ana.lauti@example.invalid"),
+        "Nina Hartley (DEMO)",
+        Some("nina.hartley@example.invalid"),
         Some("funafuti"),
     )?;
     let keli = party(
         tx,
         &a_olga,
         "person",
-        "Keli Lauti (DEMO)",
-        Some("keli.lauti@example.invalid"),
+        "Owen Hartley (DEMO)",
+        Some("owen.hartley@example.invalid"),
         Some("funafuti"),
     )?;
     let (case4, num4) = new_case(
@@ -940,7 +940,7 @@ pub fn seed_cases(tx: &Transaction, db: &Db) -> AppResult<()> {
         case4,
         ana,
         "applicant",
-        Some("ana.lauti@example.invalid"),
+        Some("nina.hartley@example.invalid"),
     )?;
     participate(
         tx,
@@ -948,7 +948,7 @@ pub fn seed_cases(tx: &Transaction, db: &Db) -> AppResult<()> {
         case4,
         keli,
         "respondent",
-        Some("keli.lauti@example.invalid"),
+        Some("owen.hartley@example.invalid"),
     )?;
     assign(tx, &a_olga, case4, olga, "clerk", "Registered the case", 90)?;
     assign(
@@ -1036,8 +1036,8 @@ pub fn seed_cases(tx: &Transaction, db: &Db) -> AppResult<()> {
         .case(Some(case4)),
     )?;
     for (party_id, name, method) in [
-        (ana, "Ana Lauti (DEMO)", "collection"),
-        (keli, "Keli Lauti (DEMO)", "post"),
+        (ana, "Nina Hartley (DEMO)", "collection"),
+        (keli, "Owen Hartley (DEMO)", "post"),
     ] {
         let (subject, body) = crate::api::common::render_template(
             tx,
@@ -1104,8 +1104,8 @@ pub fn seed_cases(tx: &Transaction, db: &Db) -> AppResult<()> {
         tx,
         &a_olga,
         "person",
-        "Malia Kofe (DEMO)",
-        Some("malia.kofe@example.invalid"),
+        "Iris Calloway (DEMO)",
+        Some("iris.calloway@example.invalid"),
         Some("funafuti"),
     )?;
     let traders = party(
@@ -1134,7 +1134,7 @@ pub fn seed_cases(tx: &Transaction, db: &Db) -> AppResult<()> {
         case5,
         malia,
         "claimant",
-        Some("malia.kofe@example.invalid"),
+        Some("iris.calloway@example.invalid"),
     )?;
     participate(
         tx,
@@ -1184,7 +1184,7 @@ pub fn seed_cases(tx: &Transaction, db: &Db) -> AppResult<()> {
         tx,
         &a_olga,
         Some(malia),
-        "Malia Kofe (DEMO)",
+        "Iris Calloway (DEMO)",
         "counter",
         "funafuti",
         "Follow-up application: the settlement was not honoured (fictional DEMO filing)",
@@ -1228,16 +1228,16 @@ pub fn seed_cases(tx: &Transaction, db: &Db) -> AppResult<()> {
         tx,
         &a_olga,
         "person",
-        "Sina Pule (DEMO)",
-        Some("sina.pule@example.invalid"),
+        "Rosa Ingram (DEMO)",
+        Some("rosa.ingram@example.invalid"),
         Some("funafuti"),
     )?;
     let teo = party(
         tx,
         &a_olga,
         "person",
-        "Teo Pule (DEMO)",
-        Some("teo.pule@example.invalid"),
+        "Leo Ingram (DEMO)",
+        Some("leo.ingram@example.invalid"),
         Some("funafuti"),
     )?;
     let (case6, _num6) = new_case(
@@ -1258,7 +1258,7 @@ pub fn seed_cases(tx: &Transaction, db: &Db) -> AppResult<()> {
         case6,
         sina,
         "applicant",
-        Some("sina.pule@example.invalid"),
+        Some("rosa.ingram@example.invalid"),
     )?;
     participate(
         tx,
@@ -1266,7 +1266,7 @@ pub fn seed_cases(tx: &Transaction, db: &Db) -> AppResult<()> {
         case6,
         teo,
         "respondent",
-        Some("teo.pule@example.invalid"),
+        Some("leo.ingram@example.invalid"),
     )?;
     assign(tx, &a_olga, case6, olga, "clerk", "Registered the case", 25)?;
     assign(
@@ -1357,15 +1357,15 @@ pub fn seed_cases(tx: &Transaction, db: &Db) -> AppResult<()> {
         tx,
         &a_olga,
         "person",
-        "Junior Ioane (DEMO)",
-        Some("junior.ioane@example.invalid"),
+        "Sam Ashdown (DEMO)",
+        Some("sam.ashdown@example.invalid"),
         Some("funafuti"),
     )?;
     let police = party(
         tx,
         &a_olga,
         "organisation",
-        "Tuvalu Police Service (DEMO)",
+        "DEMO Police Prosecutions (fictional)",
         None,
         Some("funafuti"),
     )?;
