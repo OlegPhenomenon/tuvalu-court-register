@@ -1548,3 +1548,41 @@ async fn restricted_dispatch_and_mailbox_inventory_is_redacted_and_patch_keeps_c
     assert!(body.contains("Public evidence (version 1, Public_evidence.pdf)"));
     assert!(!body.contains("Confidential medical file"));
 }
+
+#[tokio::test]
+async fn finalised_decision_lists_its_issued_copies() {
+    let app = TestApp::demo();
+    let olga = app.persona("olga").await;
+    let (cid, _) = register_case(&olga, "Issued copies DEMO").await;
+    let viktor = assigned(&olga, cid).await;
+    let db = olga.db(&app);
+    let uid = user_id(&olga, "Viktor").await;
+    let (_, vid) = insert_document(&db, cid, "Issued ruling", "decision", "administrative", uid);
+    let d = draft(&viktor, cid, vid).await;
+    let id = d["id"].as_i64().unwrap();
+    assert_eq!(d["issued"], json!([]));
+    let finalised = posted(
+        &viktor,
+        &format!("/api/decisions/{id}/finalise"),
+        json!({"decision_date":today(),"version":d["version"],"document_version_id":d["document_version_id"]}),
+    )
+    .await;
+    assert_eq!(finalised["issued"], json!([]), "finalised but not issued yet");
+    // A working-material send of the same file is not an issued decision copy.
+    posted(&olga, &format!("/api/cases/{cid}/dispatches"), json!({"kind":"working_document","recipient_name":"DEMO Working","method":"email","address":"working@example.invalid","version_ids":[vid]})).await;
+    let copy = posted(&olga, &format!("/api/cases/{cid}/dispatches"), json!({"kind":"decision_copy","recipient_name":"DEMO Recipient","method":"email","address":"copy@example.invalid","version_ids":[vid]})).await;
+    let did = copy["id"].as_i64().unwrap();
+    assert_eq!(fetched(&olga, &format!("/api/decisions/{id}")).await["issued"], json!([]), "a draft dispatch is not issued");
+    preview_queue(&olga, did, "issued-copy-queue").await;
+    assert_eq!(tuvalu_court::outbox::process(&db).unwrap(), 1);
+    let detail = fetched(&viktor, &format!("/api/decisions/{id}")).await;
+    let issued = detail["issued"].as_array().unwrap();
+    assert_eq!(issued.len(), 1);
+    assert_eq!(issued[0]["dispatch_id"], did);
+    assert_eq!(issued[0]["recipient_name"], "DEMO Recipient");
+    assert_eq!(issued[0]["status"], "sent");
+    assert!(issued[0]["sent_at"].is_string());
+    assert_eq!(issued[0]["handed_over"], false);
+    let list = fetched(&olga, &format!("/api/cases/{cid}/decisions")).await;
+    assert_eq!(list["items"][0]["issued"], detail["issued"], "the Decisions tab list shows the same copies");
+}

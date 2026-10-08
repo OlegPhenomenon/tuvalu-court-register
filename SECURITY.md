@@ -74,6 +74,10 @@ Changing responsibility through case PATCH and importing a named responsible use
 assignment permission and an active user with case-work permissions. Imports cannot grant technical
 administrators case access. Replacing the responsible officer atomically ends the previous clerk assignment,
 records the reason and `case.unassigned`, and returns remaining roles; other visibility bases remain valid.
+Ending an assignment (or the PATCH replacement) also returns `residual`: the access policy re-evaluated as the
+former assignee (`can_view_case`, `via` = `case.view_all`/`case.view_restricted`/`assignment:<role>`, active
+`document_grants`, authored restricted documents). Ending the responsible clerk's assignment, or deactivating the
+user, sets `cases.responsible_user_id` to NULL (version bumped, `responsible_cleared` in the audit details).
 Registration names another responsible officer only with `case.assign_staff` and a non-empty reason; missing
 permission/reason returns 403 without creation. Judicial officers are assigned through the judge route only.
 Case PATCH retries and registration retries recheck current permissions before replay.

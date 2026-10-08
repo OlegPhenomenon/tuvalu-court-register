@@ -18,6 +18,7 @@ const MIGRATIONS: &[&str] = &[
     include_str!("migrations/0011_party_link_indexes.sql"),
     include_str!("migrations/0012_outbox_claim.sql"),
     include_str!("migrations/0013_e2e_workflow.sql"),
+    include_str!("migrations/0014_hearing_record.sql"),
 ];
 
 /// Handle to one court database (production DB or one demo sandbox) and its private file store.

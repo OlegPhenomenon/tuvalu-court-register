@@ -42,6 +42,7 @@ SELECT d.id, d.case_id, c.number AS case_number, d.title, d.decision_date, d.sta
 
 /// Display shaping shared by detail and list responses.
 fn decorate(conn: &Connection, actor: &Actor, mut d: Value) -> AppResult<Value> {
+    d["issued"] = json!(issued_copies(conn, actor, &d)?);
     if policy::require_version(conn,actor,d["document_version_id"].as_i64().unwrap_or_default()).is_err() {
         let object=d.as_object_mut().ok_or_else(||AppError::internal("Invalid decision record."))?;
         for key in ["filename","sha256","version_no","document_id","status_reason","amendment_basis"] { object.remove(key); }
@@ -58,6 +59,31 @@ fn decorate(conn: &Connection, actor: &Actor, mut d: Value) -> AppResult<Value> 
         d["note"] = json!(FINALISED_NOTE);
     }
     Ok(d)
+}
+
+/// Issued copies (spec §5): dispatches whose items carry this decision as a `decision_copy`
+/// (its exact finalised version), limited to dispatches the actor may see. Drafts and withdrawn
+/// decisions are never issued.
+fn issued_copies(conn: &Connection, actor: &Actor, d: &Value) -> AppResult<Vec<Value>> {
+    if !matches!(d["status"].as_str(), Some("finalised") | Some("superseded")) {
+        return Ok(Vec::new());
+    }
+    let sql = format!(
+        "SELECT d.id AS dispatch_id, d.recipient_name, d.method, d.status, d.sent_at,
+                EXISTS(SELECT 1 FROM delivery_confirmations dc WHERE dc.dispatch_id = d.id AND dc.kind = 'human_handover') AS handed_over
+           FROM dispatches d LEFT JOIN intakes i ON i.id = d.intake_id
+          WHERE d.status IN ('queued','sent','failed')
+            AND EXISTS(SELECT 1 FROM dispatch_items di WHERE di.dispatch_id = d.id
+                         AND di.material_kind = 'decision_copy' AND di.decision_id = ?1)
+            AND {}
+          ORDER BY d.id",
+        super::dispatch::dispatch_visible_sql(actor)
+    );
+    let mut rows = query_json(conn, &sql, [d["id"].as_i64()])?;
+    for row in &mut rows {
+        row["handed_over"] = json!(row["handed_over"].as_i64() == Some(1));
+    }
+    Ok(rows)
 }
 
 /// Full decision JSON, or 404 when the actor may not see the case.

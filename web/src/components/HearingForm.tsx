@@ -65,7 +65,24 @@ export interface Hearing {
   created_at: string;
   version: number;
   participants: HearingParticipant[];
+  /** Re-notification tasks linked to this hearing (adjourned-to or cancelled): who must be told. */
+  notify_tasks?: HearingNotifyTask[];
+  /** Minutes / record bound to the outcome; redacted when the viewer cannot see the document. */
+  record?: HearingRecord | null;
 }
+
+export interface HearingNotifyTask {
+  id: number;
+  title: string;
+  status: string;
+  result: string | null;
+  party_id: number | null;
+  assignee_name: string | null;
+}
+
+export type HearingRecord =
+  | { restricted: true; title: string }
+  | { restricted: false; version_id: number; document_id: number; title: string; doc_type: string; version_no: number; filename: string };
 
 /** One visible clash inside a 409 `hearing_conflict` details payload. */
 export interface HearingConflict {

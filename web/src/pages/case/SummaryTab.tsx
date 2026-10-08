@@ -164,6 +164,34 @@ function EditCaseModal({ caseData, onClose, onSaved }: {
   );
 }
 
+/** Server-evaluated residual access of a former assignee (policy run as that user). */
+type ResidualAccess = {
+  roles: { role: string }[];
+  can_view_case: boolean;
+  via: string[];
+  document_grants: number;
+  authored_restricted_documents: number;
+};
+
+function residualMessage(name: string, r: ResidualAccess | undefined): string {
+  if (!r) return '';
+  if (!r.can_view_case) return `${name} no longer has access to this case.`;
+  const reasons = r.via.map((v) => {
+    if (v === 'case.view_all') return 'they may view all non-restricted cases (case.view_all)';
+    if (v === 'case.view_restricted') return 'they may view every case, including restricted ones (case.view_restricted)';
+    if (v.startsWith('assignment:')) {
+      const role = v.slice('assignment:'.length);
+      return `they are still assigned as ${ASSIGN_ROLE_LABELS[role] ?? role}`;
+    }
+    return v;
+  });
+  const extra = [
+    r.document_grants > 0 ? `${r.document_grants} active grant(s) on restricted documents` : '',
+    r.authored_restricted_documents > 0 ? `authorship of ${r.authored_restricted_documents} restricted document(s)` : '',
+  ].filter(Boolean);
+  return `${name} can still open this case because: ${reasons.join('; ')}.${extra.length ? ` They also keep ${extra.join(' and ')}.` : ''}`;
+}
+
 function ChangeResponsibleModal({ caseData, onClose, onSaved }: {
   caseData: CaseData;
   onClose: () => void;
@@ -178,14 +206,14 @@ function ChangeResponsibleModal({ caseData, onClose, onSaved }: {
   const [reason, setReason] = useState('');
   const [busy, setBusy] = useState(false);
   const [error, setError] = useState<unknown>(null);
-  const [residual, setResidual] = useState<string[] | null>(null);
+  const [residual, setResidual] = useState<string | null>(null);
   const conflict = error instanceof ApiError && error.code === 'version_conflict';
   const submit = async (e: FormEvent) => {
     e.preventDefault();
     if (!responsible || !reason.trim()) return;
     setBusy(true); setError(null);
     try {
-      const result = await api<{ case: CaseData['case'] | null; residual_access?: { role: string }[] }>('PATCH', `/cases/${c.id}`, {
+      const result = await api<{ case: CaseData['case'] | null; residual?: ResidualAccess }>('PATCH', `/cases/${c.id}`, {
         version: c.version,
         responsible_user_id: Number(responsible),
         assignment_reason: reason.trim(),
@@ -194,14 +222,14 @@ function ChangeResponsibleModal({ caseData, onClose, onSaved }: {
         navigate('/cases', { state: { assignmentEnded: { name: 'You', roles: [] } } });
         return;
       }
-      setResidual((result.residual_access ?? []).map(r => r.role));
+      setResidual(result.residual ? residualMessage('The previous officer', result.residual) : '');
       onSaved();
     } catch (e) { setError(e); } finally { setBusy(false); }
   };
   return <Modal title="Change responsible officer" open onClose={busy ? () => {} : onClose}>
     <ErrorBanner error={refError} onRetry={reloadRef} />
     {residual !== null ? <>
-      <p>Responsible officer changed. {residual.length ? `The previous officer keeps these assignments: ${residual.map(r => ASSIGN_ROLE_LABELS[r] ?? r).join(', ')}.` : 'The previous officer has no remaining assignments. Access may remain through general case-view permissions.'}</p>
+      <p>Responsible officer changed. {residual}</p>
       <Button type="button" onClick={onClose}>Done</Button>
     </> : <>
       {conflict ? <p role="alert">Changed by someone else, reload before assigning. <Button type="button" variant="secondary" onClick={() => { onSaved(); onClose(); }}>Reload</Button></p> : <FormErrors error={error} form={form} />}
@@ -547,7 +575,7 @@ export default function SummaryTab({ caseId, caseData, reload }: CaseTabProps) {
   const [endAssignment, setEndAssignment] = useState<Assignment | null>(null);
   const [busy, setBusy] = useState(false);
   const [actionError, setActionError] = useState<unknown>(null);
-  const [residual, setResidual] = useState<{ name: string; roles: string[] } | null>(null);
+  const [residual, setResidual] = useState<{ name: string; roles: string[]; message: string; responsibleCleared: boolean } | null>(null);
 
   const openModal = (m: NonNullable<typeof modal>) => {
     setModalTick((t) => t + 1);
@@ -597,11 +625,12 @@ export default function SummaryTab({ caseId, caseData, reload }: CaseTabProps) {
 
   const endAssign = (reason: string) =>
     run(async () => {
-      const res = await api<Partial<CaseData> & { residual_access: { role: string }[] }>('POST', `/cases/${caseId}/assignments/${endAssignment?.id}/end`, {
+      const res = await api<Partial<CaseData> & { residual_access: { role: string }[]; residual?: ResidualAccess; responsible_cleared?: boolean }>('POST', `/cases/${caseId}/assignments/${endAssignment?.id}/end`, {
         reason,
       });
       const roles = (res?.residual_access ?? []).map((r) => r.role);
-      const result = { name: endAssignment?.display_name ?? 'The person', roles };
+      const name = endAssignment?.display_name ?? 'The person';
+      const result = { name, roles, message: residualMessage(name, res?.residual), responsibleCleared: Boolean(res?.responsible_cleared) };
       setResidual(result);
       setEndAssignment(null);
       if (!res.case) navigate('/cases', { state: { assignmentEnded: result } });
@@ -667,7 +696,7 @@ export default function SummaryTab({ caseId, caseData, reload }: CaseTabProps) {
                 {fmtDate(c.registered_date)}
                 {c.registered_by_name ? ` by ${c.registered_by_name}` : ''}
               </Detail>
-              <Detail term="Responsible">{c.responsible_name ?? '—'}</Detail>
+              <Detail term="Responsible">{c.responsible_name ?? 'No responsible officer'}</Detail>
               {c.summary && <Detail term="Summary">{c.summary}</Detail>}
               {Boolean(c.historical_incomplete) && (
                 <Detail term="History">Imported with missing values — incomplete history.</Detail>
@@ -720,10 +749,8 @@ export default function SummaryTab({ caseId, caseData, reload }: CaseTabProps) {
           {residual && (
             <div className="banner" role="status" style={{ background: '#eef4fd', border: '1px solid #c8d9f3' }}>
               <p>
-                <strong>{residual.name}</strong> is no longer assigned in that role.
-                {residual.roles.length > 0
-                  ? ` They still have access as: ${residual.roles.map((r) => ASSIGN_ROLE_LABELS[r] ?? r).join(', ')}.`
-                  : ' No access to this case remains through assignments.'}
+                <strong>{residual.name}</strong> is no longer assigned in that role. {residual.message}
+                {residual.responsibleCleared && ' The case now has no responsible officer.'}
               </p>
             </div>
           )}

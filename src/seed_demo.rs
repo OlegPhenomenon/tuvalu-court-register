@@ -1074,6 +1074,12 @@ pub fn seed_cases(tx: &Transaction, db: &Db) -> AppResult<()> {
             },
         )?;
     }
+    // The order went out as the decision's copy, exactly as the dispatch workflow records it.
+    tx.execute(
+        "UPDATE dispatch_items SET material_kind = 'decision_copy', decision_id = ?1
+         WHERE document_version_id = ?2 AND dispatch_id IN (SELECT id FROM dispatches WHERE case_id = ?3 AND kind = 'copies')",
+        params![dec_id, dec_v.version_id, case4],
+    )?;
     set_status(
         tx,
         &a_olga,

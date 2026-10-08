@@ -1536,3 +1536,142 @@ async fn demo_closes_on_evidence_recorded_ahead_but_production_never_closes_in_t
     err(s, &b, StatusCode::BAD_REQUEST, "validation");
     assert_eq!(b["error"]["message"], "Closed date must be on or after registration and no later than today.");
 }
+
+#[tokio::test]
+async fn cancelling_scheduled_hearing_creates_notify_tasks_completed_by_cancellation_notice() {
+    let app = TestApp::demo();
+    let olga = app.persona("olga").await;
+    let (case_id, _n, _v, room) = seeded_case(&olga, "Cancellation follow-up").await;
+    let pids = party_ids(&olga, case_id).await;
+    let mut body = hearing_body("2026-12-03T09:00", "2026-12-03T10:00", room, true);
+    body["participants"] = json!([
+        { "party_id": pids[0], "role": "claimant" },
+        { "party_id": pids[1], "role": "respondent" },
+    ]);
+    let (s, h) = olga.post(&format!("/api/cases/{case_id}/hearings"), body).await;
+    ok(s, &h);
+    let hid = h["id"].as_i64().unwrap();
+
+    let path = format!("/api/hearings/{hid}/cancel");
+    let req = json!({"reason": "Judge recused; the case will be re-listed"});
+    let (s, b) = olga.post_idem(&path, "cancel-1", req.clone()).await;
+    ok(s, &b);
+    assert_eq!(b["status"], "cancelled");
+    let tasks = b["tasks"].as_array().unwrap();
+    assert_eq!(tasks.len(), 2);
+    assert!(tasks.iter().all(|t| t["kind"] == "renotify" && t["hearing_id"] == hid && t["status"] == "open"));
+    assert!(tasks[0]["title"].as_str().unwrap().contains("that the hearing on 03 Dec 2026 09:00 is cancelled"));
+    assert_eq!(b["notify_tasks"].as_array().unwrap().len(), 2);
+
+    // Replay: same tasks, nothing new.
+    let (s, again) = olga.post_idem(&path, "cancel-1", req).await;
+    ok(s, &again);
+    assert_eq!(again["tasks"], b["tasks"]);
+    let (_, list) = olga.get(&format!("/api/cases/{case_id}/tasks")).await;
+    let renotify: Vec<&Value> = list["items"].as_array().unwrap().iter().filter(|t| t["kind"] == "renotify").collect();
+    assert_eq!(renotify.len(), 2);
+    assert_eq!(audit_count_for_case(&olga, &app, "hearing.cancelled", case_id), 1);
+
+    // A cancellation notice to the first party completes that party's task only.
+    let (s, d) = olga
+        .post(
+            &format!("/api/cases/{case_id}/dispatches"),
+            json!({"kind": "notice", "hearing_id": hid, "template_code": "hearing_cancellation", "recipient_party_id": pids[0],
+                   "method": "email", "address": "party@example.invalid"}),
+        )
+        .await;
+    ok(s, &d);
+    let (s, b2) = olga.post(&format!("/api/dispatches/{}/preview", d["id"]), json!({})).await;
+    ok(s, &b2);
+    let (s, b2) = olga.post(&format!("/api/dispatches/{}/queue", d["id"]), json!({})).await;
+    ok(s, &b2);
+    let (_, after) = olga.get(&format!("/api/hearings/{hid}")).await;
+    let statuses: Vec<&str> = after["notify_tasks"].as_array().unwrap().iter().map(|t| t["status"].as_str().unwrap()).collect();
+    assert_eq!(statuses, ["done", "open"]);
+}
+
+#[tokio::test]
+async fn outcome_record_must_be_visible_same_case_version_and_is_redacted_for_others() {
+    let app = TestApp::demo();
+    let olga = app.persona("olga").await;
+    let (cid, _, viktor_id, room) = seeded_case(&olga, "Outcome record").await;
+    let (other, _, _, _) = seeded_case(&olga, "Another case").await;
+    let olga_id = user_id(&olga, "Olga").await;
+    let viktor = olga.switch("viktor").await;
+    let db = olga.db(&app);
+    let h = scheduled(&olga, cid, "2026-12-04T09:00", "2026-12-04T10:00", room).await;
+    let hid = h["id"].as_i64().unwrap();
+    let (_, foreign) = insert_document(&db, other, "DEMO minutes of another case", "hearing_record", "administrative", olga_id);
+    let (_, note) = insert_document(&db, cid, "DEMO judge note", "judicial_note", "judicial_note", viktor_id);
+    let (_, hidden) = insert_document(&db, cid, "DEMO sealed minutes", "hearing_record", "restricted", olga_id);
+    let (_, secret) = insert_document(&db, cid, "DEMO restricted minutes", "hearing_record", "restricted", viktor_id);
+    let body = |vid: i64| json!({"held": true, "outcome_summary": "Heard both parties", "record_version_id": vid});
+    let path = format!("/api/hearings/{hid}/outcome");
+
+    for (vid, status, code) in [
+        (foreign, StatusCode::BAD_REQUEST, "validation"),
+        (note, StatusCode::BAD_REQUEST, "validation"),
+        (hidden, StatusCode::NOT_FOUND, "not_found"),
+    ] {
+        let (s, b) = viktor.post(&path, body(vid)).await;
+        err(s, &b, status, code);
+        let (_, fresh) = olga.get(&format!("/api/hearings/{hid}")).await;
+        assert_eq!(fresh["status"], "scheduled");
+        assert!(fresh["record"].is_null());
+    }
+
+    let (s, b) = viktor.post_idem(&path, "outcome-record", body(secret)).await;
+    ok(s, &b);
+    assert_eq!(b["hearing"]["status"], "held");
+    assert_eq!(b["hearing"]["record"]["version_id"], secret);
+    assert_eq!(b["hearing"]["record"]["restricted"], false);
+    assert_eq!(b["hearing"]["record"]["title"], "DEMO restricted minutes");
+    let stored: Option<i64> = db
+        .open()
+        .unwrap()
+        .query_row("SELECT record_version_id FROM hearings WHERE id = ?1", [hid], |r| r.get(0))
+        .unwrap();
+    assert_eq!(stored, Some(secret));
+
+    // Olga sees the case and the hearing but not the restricted document: redacted.
+    let (_, seen) = olga.get(&format!("/api/hearings/{hid}")).await;
+    assert_eq!(seen["record"], json!({"restricted": true, "title": "Restricted document"}));
+}
+
+#[tokio::test]
+async fn cancelling_an_adjourned_to_hearing_retires_its_open_new_date_tasks() {
+    let app = TestApp::demo();
+    let olga = app.persona("olga").await;
+    let (case_id, _n, _v, room) = seeded_case(&olga, "Cancel after adjournment").await;
+    let pids = party_ids(&olga, case_id).await;
+    let mut body = hearing_body("2026-12-07T09:00", "2026-12-07T10:00", room, true);
+    body["participants"] = json!([
+        { "party_id": pids[0], "role": "claimant" },
+        { "party_id": pids[1], "role": "respondent" },
+    ]);
+    let (s, h) = olga.post(&format!("/api/cases/{case_id}/hearings"), body).await;
+    ok(s, &h);
+    let (s, moved) = olga
+        .post(
+            &format!("/api/hearings/{}/adjourn", h["id"]),
+            json!({"starts_local": "2026-12-09T09:00", "ends_local": "2026-12-09T10:00", "reason": "DEMO witness unavailable", "authorised_by": "Judge DEMO"}),
+        )
+        .await;
+    ok(s, &moved);
+    let new_date: Vec<i64> = moved["tasks"].as_array().unwrap().iter().map(|t| t["id"].as_i64().unwrap()).collect();
+    assert_eq!(new_date.len(), 2);
+    // One party was already told the new date; the other was not.
+    let (s, done) = olga.post_idem(&format!("/api/tasks/{}/complete", new_date[0]), "told-1", json!({"result": "Phoned"})).await;
+    ok(s, &done);
+
+    let (s, b) = olga
+        .post_idem(&format!("/api/hearings/{}/cancel", moved["new"]["id"]), "cancel-adj", json!({"reason": "DEMO settled"}))
+        .await;
+    ok(s, &b);
+    assert_eq!(b["tasks"].as_array().unwrap().len(), 2, "everyone required is told of the cancellation: {b}");
+    let (_, told) = olga.get(&format!("/api/tasks/{}", new_date[0])).await;
+    assert_eq!(told["status"], "done", "completed work stays on record");
+    let (_, moot) = olga.get(&format!("/api/tasks/{}", new_date[1])).await;
+    assert_eq!(moot["status"], "cancelled", "{moot}");
+    assert!(moot["status_reason"].as_str().unwrap().contains("cancelled"), "{moot}");
+}

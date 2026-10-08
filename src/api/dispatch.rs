@@ -763,15 +763,23 @@ async fn preview(ctx: Ctx, Path(id): Path<i64>) -> JsonResult {
     Ok(Json(v))
 }
 
-/// Completing re-notification means preparing delivery, not proving legal service.
+/// Completing re-notification means preparing delivery, not proving legal service: an invitation
+/// for a current (scheduled/held) hearing, or a cancellation notice for a cancelled hearing,
+/// completes that party's open re-notification task linked to the same hearing.
 fn complete_renotify(conn: &Connection, actor: &Actor, dispatch_id: i64) -> AppResult<()> {
-    let tasks = query_json(conn, "SELECT t.id FROM tasks t JOIN dispatches d
+    let tasks = query_json(conn, "SELECT t.id, d.notice_purpose FROM tasks t JOIN dispatches d
         ON d.hearing_id=t.hearing_id AND d.recipient_party_id=t.renotify_party_id AND d.case_id=t.case_id
         JOIN hearings h ON h.id=d.hearing_id
-        WHERE d.id=?1 AND d.kind='notice' AND d.notice_purpose='invitation' AND d.status IN ('queued','sent')
-        AND h.status IN ('scheduled','held') AND t.kind='renotify' AND t.status='open'",[dispatch_id])?;
-    let result = format!("completed automatically: notice #{dispatch_id} queued for the new hearing");
+        WHERE d.id=?1 AND d.kind='notice' AND d.status IN ('queued','sent')
+        AND ((d.notice_purpose='invitation' AND h.status IN ('scheduled','held'))
+          OR (d.notice_purpose='cancellation' AND h.status='cancelled'))
+        AND t.kind='renotify' AND t.status='open'",[dispatch_id])?;
     for task in tasks {
+        let result = if task["notice_purpose"] == "cancellation" {
+            format!("completed automatically: cancellation notice #{dispatch_id} prepared for delivery")
+        } else {
+            format!("completed automatically: notice #{dispatch_id} queued for the new hearing")
+        };
         let id = task["id"].as_i64().unwrap_or_default();
         conn.execute("UPDATE tasks SET status='done',result=?2,closed_by=?3,closed_at=?4,version=version+1 WHERE id=?1",
             params![id,result,actor.user_id,crate::time::now_utc()])?;

@@ -9,7 +9,7 @@
 import { useEffect, useRef, useState } from 'react';
 import type { FormEvent, ReactNode } from 'react';
 import { useSearchParams } from 'react-router-dom';
-import { api, ApiError, newKey } from '../../api';
+import { api, ApiError, downloadUrl, newKey } from '../../api';
 import { useSession } from '../../session';
 import { fmtCourtLocal, fmtLocal } from '../../time';
 import { Button } from '../../components/Button';
@@ -20,6 +20,7 @@ import { Modal } from '../../components/Modal';
 import { StatusBadge } from '../../components/StatusBadge';
 import { label, options, refList, useRef as useRefData } from '../../components/refdata';
 import { useApi } from '../../components/useApi';
+import { useDocumentDetails } from '../../components/DocumentUpload';
 import {
   caseStaffOptions,
   ConflictDetails,
@@ -40,19 +41,21 @@ function Detail({ term, children }: { term: string; children: ReactNode }) {
 }
 
 /** Reason-requiring dialog with an inline error slot (keeps the typed reason on failure). */
-function ReasonModal({ title, label: fieldLabel, confirmLabel = 'Confirm', danger, busy, error, onConfirm, onClose }: {
+function ReasonModal({ title, label: fieldLabel, confirmLabel = 'Confirm', danger, busy, error, intro, onConfirm, onClose }: {
   title: string;
   label: string;
   confirmLabel?: string;
   danger?: boolean;
   busy?: boolean;
   error?: unknown;
+  intro?: ReactNode;
   onConfirm: (reason: string) => void;
   onClose: () => void;
 }) {
   const [reason, setReason] = useState('');
   return (
     <Modal title={title} open onClose={busy ? () => {} : onClose}>
+      {intro}
       <ErrorBanner error={error} onRetry={reason.trim() ? () => onConfirm(reason.trim()) : undefined} />
       <TextArea disabled={busy} label={fieldLabel} value={reason} onChange={setReason} required rows={3} autoFocus />
       <div className="actions">
@@ -334,6 +337,20 @@ function OutcomeModal({ hearing, caseData, onClose, onSaved, onDemoNote }: {
   const [conflicts, setConflicts] = useState<{ visible: HearingConflict[]; hidden: number } | null>(null);
   const [localError, setLocalError] = useState('');
   const [nhOverride, setNhOverride] = useState('');
+  const docs = useDocumentDetails(`/cases/${hearing.case_id}/documents`);
+  const [recordId, setRecordId] = useState('');
+  // Minutes / record: clean versions of visible case documents, hearing records first.
+  const recordOptions = [...(docs.data ?? [])]
+    .filter((d) => d.visibility !== 'judicial_note')
+    .sort((a, b) => Number(b.doc_type === 'hearing_record') - Number(a.doc_type === 'hearing_record'))
+    .flatMap((d) =>
+      d.versions
+        .filter((v) => v.scan_status === 'clean')
+        .map((v) => ({
+          value: String(v.id),
+          label: `${d.title} — ${v.filename} · v${v.version_no}${d.doc_type === 'hearing_record' ? '' : ' (not a hearing record)'}`,
+        })),
+    );
 
   const submit = async (e: FormEvent) => {
     e.preventDefault();
@@ -385,6 +402,7 @@ function OutcomeModal({ hearing, caseData, onClose, onSaved, onDemoNote }: {
                 override_reason: nhOverride.trim() || null,
               }
             : null,
+        record_version_id: recordId ? Number(recordId) : null,
       }, { idempotencyKey: commandKey });
       if (res.demo_note) onDemoNote(res.demo_note);
       onSaved();
@@ -403,6 +421,7 @@ function OutcomeModal({ hearing, caseData, onClose, onSaved, onDemoNote }: {
   return (
     <Modal title={`Record the outcome — ${hearing.hearing_type_label} ${hearingTimeRange(hearing)}`} open onClose={busy ? () => {} : onClose}>
       <ErrorBanner error={refError} onRetry={reloadRef} />
+      <ErrorBanner error={docs.error} onRetry={docs.reload} />
       <ErrorBanner error={error && !conflicts ? error : null} onRetry={() => form.current?.requestSubmit()} />
       {conflicts && (
         <>
@@ -545,6 +564,15 @@ function OutcomeModal({ hearing, caseData, onClose, onSaved, onDemoNote }: {
             </>
           )}
 
+          <SelectField
+            label="Minutes / record (optional)"
+            value={recordId}
+            onChange={setRecordId}
+            options={recordOptions}
+            placeholder={docs.loading ? 'Loading documents…' : 'No record attached'}
+            help="The minutes or other confirmation of this hearing — an exact, safety-checked version of a document of this case. Upload it in the Documents tab first."
+          />
+
           <div className="actions">
             <Button type="submit" busy={busy}>Record the outcome</Button>
             <Button type="button" variant="secondary" onClick={onClose}>Cancel</Button>
@@ -623,7 +651,7 @@ type ModalState =
   | { kind: 'edit'; hearing: Hearing }
   | { kind: 'confirm'; hearing: Hearing }
   | { kind: 'adjourn'; hearing: Hearing }
-  | { kind: 'cancel'; hearing: Hearing }
+  | { kind: 'cancel'; hearing: Hearing; key: string }
   | { kind: 'outcome'; hearing: Hearing }
   | { kind: 'correct'; hearing: Hearing }
   | null;
@@ -668,7 +696,7 @@ export default function HearingsTab({ caseId, caseData, reload }: CaseTabProps) 
     setBusy(true);
     setActionError(null);
     try {
-      await api('POST', `/hearings/${modal.hearing.id}/cancel`, { reason });
+      await api('POST', `/hearings/${modal.hearing.id}/cancel`, { reason }, { idempotencyKey: modal.key });
       finish();
     } catch (e) {
       setActionError(e);
@@ -683,7 +711,7 @@ export default function HearingsTab({ caseId, caseData, reload }: CaseTabProps) 
       buttons.push(
         <Button key="edit" variant="secondary" onClick={() => openModal({ kind: 'edit', hearing: h })}>Edit</Button>,
         <Button key="confirm" onClick={() => openModal({ kind: 'confirm', hearing: h })}>Confirm</Button>,
-        <Button key="cancel" variant="secondary" onClick={() => openModal({ kind: 'cancel', hearing: h })}>Cancel</Button>,
+        <Button key="cancel" variant="secondary" onClick={() => openModal({ kind: 'cancel', hearing: h, key: newKey() })}>Cancel</Button>,
       );
     }
     if (h.status === 'scheduled') {
@@ -695,7 +723,7 @@ export default function HearingsTab({ caseId, caseData, reload }: CaseTabProps) 
       if (allowed.schedule_hearing) {
         buttons.push(
           <Button key="adjourn" variant="secondary" onClick={() => openModal({ kind: 'adjourn', hearing: h })}>Adjourn</Button>,
-          <Button key="cancel" variant="secondary" onClick={() => openModal({ kind: 'cancel', hearing: h })}>Cancel</Button>,
+          <Button key="cancel" variant="secondary" onClick={() => openModal({ kind: 'cancel', hearing: h, key: newKey() })}>Cancel</Button>,
         );
       }
     }
@@ -837,6 +865,46 @@ export default function HearingsTab({ caseId, caseData, reload }: CaseTabProps) 
                   {h.outcome_recorded_at ? `, ${fmtLocal(h.outcome_recorded_at)}` : ''}
                 </p>
               )}
+              {h.record && (
+                <p>
+                  <strong>Minutes / record:</strong>{' '}
+                  {h.record.restricted ? (
+                    <span className="muted">Restricted document</span>
+                  ) : (
+                    <a
+                      href={downloadUrl(`/document-versions/${h.record.version_id}/download`)}
+                      target="_blank"
+                      rel="noopener noreferrer"
+                      title="Download (new tab)"
+                    >
+                      {h.record.title} — {h.record.filename} · v{h.record.version_no}
+                    </a>
+                  )}
+                </p>
+              )}
+              {h.notify_tasks && h.notify_tasks.length > 0 && (
+                <div>
+                  <p>
+                    <strong>
+                      {h.status === 'cancelled' ? 'Who must be told of the cancellation' : 'Who must be told of this date'}
+                    </strong>
+                  </p>
+                  <ul>
+                    {h.notify_tasks.map((t) => (
+                      <li key={t.id}>
+                        {t.title} <StatusBadge status={t.status} />
+                        {t.assignee_name && <span className="muted"> — {t.assignee_name}</span>}
+                        {t.result && <span className="muted"> ({t.result})</span>}
+                      </li>
+                    ))}
+                  </ul>
+                  <p className="muted">
+                    {h.status === 'cancelled'
+                      ? 'Queuing a "Hearing cancellation" notice to a party in the Dispatch tab (or recording it as sent) completes that party’s task; otherwise complete it in the Tasks tab with a note of how they were told.'
+                      : 'Queuing an invitation for this hearing to a party in the Dispatch tab completes that party’s task; otherwise complete it in the Tasks tab.'}
+                  </p>
+                </div>
+              )}
             </div>
           </Card>
         );
@@ -880,6 +948,15 @@ export default function HearingsTab({ caseId, caseData, reload }: CaseTabProps) 
           danger
           busy={busy}
           error={actionError}
+          intro={
+            modal.hearing.status === 'scheduled' && modal.hearing.participants.some((p) => p.required) ? (
+              <p>
+                The hearing stays on record as <strong>Cancelled</strong>. A notification task is added for each
+                required participant:{' '}
+                {modal.hearing.participants.filter((p) => p.required).map(participantName).join(', ')}.
+              </p>
+            ) : undefined
+          }
           onConfirm={(r) => void cancel(r)}
           onClose={() => setModal(null)}
         />

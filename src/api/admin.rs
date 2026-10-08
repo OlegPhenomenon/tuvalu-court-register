@@ -470,20 +470,32 @@ async fn user_deactivate(
                 "UPDATE case_assignments SET end_at = ?2, ended_by = ?3, end_reason = ?4 WHERE user_id = ?1 AND end_at IS NULL",
                 params![id, now, actor.user_id, format!("Account deactivated: {why}")],
             )?;
-            for assignment in assignments {
+            // The responsible officer follows the active clerk assignment (C05): clear it.
+            let responsible_cases: Vec<i64> = tx
+                .prepare("SELECT id FROM cases WHERE responsible_user_id = ?1")?
+                .query_map([id], |r| r.get(0))?
+                .collect::<Result<_, _>>()?;
+            tx.execute(
+                "UPDATE cases SET responsible_user_id = NULL, version = version + 1, updated_at = ?2 WHERE responsible_user_id = ?1",
+                params![id, now],
+            )?;
+            for assignment in &assignments {
                 let case_id = assignment["case_id"].as_i64().unwrap_or_default();
+                let cleared = assignment["role"] == "clerk" && responsible_cases.contains(&case_id);
                 audit::record(tx, Some(&actor), Event::new("case.unassigned", "case", case_id,
                     "Assignment ended after account deactivation")
                     .case(Some(case_id))
                     .details(json!({ "assignment_id": assignment["id"], "user_id": id,
-                        "role": assignment["role"], "reason": format!("Account deactivated: {why}") })))?;
+                        "role": assignment["role"], "reason": format!("Account deactivated: {why}"),
+                        "responsible_cleared": cleared })))?;
             }
             let after = user_json(tx, id)?;
             audit::record(
                 tx,
                 Some(&actor),
                 Event::new("user.deactivated", "user", id, "User account deactivated").details(
-                    json!({ "reason": why, "sessions_revoked": revoked, "assignments_ended": ended, "before": before }),
+                    json!({ "reason": why, "sessions_revoked": revoked, "assignments_ended": ended,
+                        "responsible_cleared_cases": responsible_cases, "before": before }),
                 ),
             )?;
             Ok(after)

@@ -33,8 +33,10 @@ pub fn routes() -> Router<AppState> {
 
 // ------------------------------------------------------------------ representation
 
-/// Full hearing JSON, including `starts_local`/`ends_local` and the participant list.
-fn hearing_json(conn: &Connection, id: i64) -> AppResult<Value> {
+/// Full hearing JSON, including `starts_local`/`ends_local`, the participant list, the
+/// re-notification tasks linked to this hearing (`notify_tasks`: who must be told) and the outcome
+/// record (`record`, redacted to "Restricted document" when the viewer cannot see that document).
+fn hearing_json(conn: &Connection, actor: &Actor, id: i64) -> AppResult<Value> {
     let mut h = query_one_json(
         conn,
         "SELECT h.id, h.case_id, cs.number AS case_number, h.hearing_type, h.status, h.starts_at, h.ends_at,
@@ -42,7 +44,7 @@ fn hearing_json(conn: &Connection, id: i64) -> AppResult<Value> {
                 h.previous_hearing_id, h.adjourned_to_id, h.status_reason, h.status_authorised_by,
                 h.conflict_override, h.override_reason, ou.display_name AS override_by_name,
                 h.outcome_summary, h.next_step, oc.display_name AS outcome_recorded_by_name, h.outcome_recorded_at,
-                h.created_at, h.version
+                h.record_version_id, h.created_at, h.version
          FROM hearings h
          JOIN cases cs ON cs.id = h.case_id
          LEFT JOIN rooms r ON r.id = h.room_id
@@ -69,14 +71,60 @@ fn hearing_json(conn: &Connection, id: i64) -> AppResult<Value> {
          WHERE hp.hearing_id = ?1 ORDER BY hp.id",
         [id],
     )?);
+    h["notify_tasks"] = json!(query_json(
+        conn,
+        "SELECT t.id, t.title, t.status, t.result, t.renotify_party_id AS party_id, au.display_name AS assignee_name
+         FROM tasks t LEFT JOIN users au ON au.id = t.assignee_user_id
+         WHERE t.hearing_id = ?1 AND t.kind = 'renotify' ORDER BY t.id",
+        [id],
+    )?);
+    let record = match h["record_version_id"].as_i64() {
+        Some(vid) => record_json(conn, actor, vid)?,
+        None => Value::Null,
+    };
+    if let Some(o) = h.as_object_mut() {
+        o.remove("record_version_id");
+    }
+    h["record"] = record;
     Ok(h)
+}
+
+/// The minutes / record bound to an outcome; ids and file details only for viewers of the document.
+fn record_json(conn: &Connection, actor: &Actor, version_id: i64) -> AppResult<Value> {
+    if policy::require_version(conn, actor, version_id).is_err() {
+        return Ok(json!({ "restricted": true, "title": "Restricted document" }));
+    }
+    let mut r = query_one_json(
+        conn,
+        "SELECT v.id AS version_id, v.document_id, d.title, d.doc_type, v.version_no, v.filename
+         FROM document_versions v JOIN documents d ON d.id = v.document_id WHERE v.id = ?1",
+        [version_id],
+    )?;
+    r["restricted"] = json!(false);
+    Ok(r)
+}
+
+/// An outcome record must be a clean version of a document of the same case that the actor may
+/// see (else 404); judicial notes never serve as the hearing record.
+fn check_record(tx: &Connection, actor: &Actor, case_id: i64, version_id: i64) -> AppResult<()> {
+    let (doc, _) = policy::require_version(tx, actor, version_id)?;
+    if doc.case_id != Some(case_id) || doc.visibility == "judicial_note" {
+        return Err(AppError::validation("The hearing record must be a document of this case and cannot be a judicial note.")
+            .with_details(json!({ "field": "record_version_id" })));
+    }
+    let scan: String = tx.query_row("SELECT scan_status FROM document_versions WHERE id = ?1", [version_id], |r| r.get(0))?;
+    if scan != "clean" {
+        return Err(AppError::validation("A file that has not passed the safety check cannot be the hearing record.")
+            .with_details(json!({ "field": "record_version_id" })));
+    }
+    Ok(())
 }
 
 /// Load a hearing whose case the actor may see, else 404 (never leak existence).
 fn require_hearing(conn: &Connection, actor: &Actor, id: i64) -> AppResult<Value> {
     let row = query_one_json(conn, "SELECT h.id, h.case_id FROM hearings h WHERE h.id = ?1", [id])?;
     policy::require_case(conn, actor, row["case_id"].as_i64().unwrap_or_default())?;
-    hearing_json(conn, id)
+    hearing_json(conn, actor, id)
 }
 
 /// '2026-11-16T21:00:00Z' → '17 Nov 2026 09:00' in court time (audit summaries, task titles).
@@ -144,7 +192,7 @@ async fn calendar(ctx: Ctx, Query(q): Query<CalendarQuery>) -> JsonResult {
             );
             let mut items = Vec::new();
             for row in query_json(c, &sql, params![from_utc, to_utc, q.judge, q.room, q.case_id])? {
-                items.push(hearing_json(c, row["id"].as_i64().unwrap_or_default())?);
+                items.push(hearing_json(c, &actor, row["id"].as_i64().unwrap_or_default())?);
             }
             Ok(json!({ "items": items }))
         })
@@ -165,7 +213,7 @@ async fn list_for_case(ctx: Ctx, Path(id): Path<i64>) -> JsonResult {
                 "SELECT id FROM hearings WHERE case_id = ?1 ORDER BY starts_at DESC, id DESC",
                 [id],
             )? {
-                items.push(hearing_json(c, row["id"].as_i64().unwrap_or_default())?);
+                items.push(hearing_json(c, &actor, row["id"].as_i64().unwrap_or_default())?);
             }
             Ok(json!({ "items": items }))
         })
@@ -533,7 +581,7 @@ async fn create(ctx: Ctx, Path(case_id): Path<i64>, IdemKey(key): IdemKey, JsonB
                         .details(json!({ "reason": r })),
                     )?;
                 }
-                hearing_json(tx, id)
+                hearing_json(tx, &actor, id)
             }, |stored| require_hearing(tx, &actor, replay_id(&stored, "/id")?))
         })
         .await?;
@@ -622,7 +670,7 @@ async fn update(ctx: Ctx, Path(id): Path<i64>, JsonBody(req): JsonBody<UpdateReq
                 .details(json!({ "before": h })),
             )?;
             super::dispatch::supersede_hearing_notices(tx, &actor, id)?;
-            hearing_json(tx, id)
+            hearing_json(tx, &actor, id)
         })
         .await?;
     Ok(Json(v))
@@ -691,7 +739,7 @@ async fn confirm(ctx: Ctx, Path(id): Path<i64>, JsonBody(req): JsonBody<ConfirmR
                 Event::new("hearing.confirmed", "hearing", id, format!("Hearing on {when} confirmed")).case(h["case_id"].as_i64()),
             )?;
             super::dispatch::supersede_hearing_notices(tx, &actor, id)?;
-            hearing_json(tx, id)
+            hearing_json(tx, &actor, id)
         })
         .await?;
     Ok(Json(v))
@@ -787,56 +835,112 @@ async fn adjourn(ctx: Ctx, Path(id): Path<i64>, IdemKey(key): IdemKey, JsonBody(
                         .details(json!({ "reason": why, "authorised_by": authorised, "new_hearing_id": new_id, "tasks": made.iter().map(|t| t["id"].clone()).collect::<Vec<_>>() })),
                 )?;
                 super::dispatch::supersede_hearing_notices(tx, &actor, id)?;
-                Ok(json!({ "old": hearing_json(tx, id)?, "new": hearing_json(tx, new_id)?, "tasks": made }))
+                Ok(json!({ "old": hearing_json(tx, &actor, id)?, "new": hearing_json(tx, &actor, new_id)?, "tasks": made }))
             }, |stored| {
                 let tasks = stored["tasks"].as_array().map(Vec::as_slice).unwrap_or_default().iter()
                     .map(|t| tasks::task_json(tx, replay_id(t, "/id")?))
                     .collect::<AppResult<Vec<_>>>()?;
-                Ok(json!({ "old": hearing_json(tx, id)?, "new": require_hearing(tx, &actor, replay_id(&stored, "/new/id")?)?, "tasks": tasks }))
+                Ok(json!({ "old": hearing_json(tx, &actor, id)?, "new": require_hearing(tx, &actor, replay_id(&stored, "/new/id")?)?, "tasks": tasks }))
             })
         })
         .await?;
     Ok(Json(v))
 }
 
-#[derive(Deserialize)]
+#[derive(Deserialize, Serialize)]
 struct ReasonReq {
     reason: Option<String>,
 }
 
 /// Cancel a draft or scheduled hearing; the date, participants and notices stay on record.
-async fn cancel(ctx: Ctx, Path(id): Path<i64>, JsonBody(req): JsonBody<ReasonReq>) -> JsonResult {
+/// Cancelling a scheduled (announced) hearing creates one re-notification task per required
+/// participant — who must be told — linked to the cancelled hearing and returned as `tasks`.
+/// A party's task completes automatically when a `hearing_cancellation` notice to that party is
+/// queued or handed over; otherwise it is completed by hand with a result note.
+async fn cancel(ctx: Ctx, Path(id): Path<i64>, IdemKey(key): IdemKey, JsonBody(req): JsonBody<ReasonReq>) -> JsonResult {
     let actor = ctx.actor;
     let v = ctx
         .db
         .write(move |tx| {
             let h = require_hearing(tx, &actor, id)?;
             actor.require(perm::HEARING_SCHEDULE)?;
-            if !matches!(h["status"].as_str(), Some("draft") | Some("scheduled")) {
-                return Err(AppError::invalid_transition(format!(
-                    "This hearing is '{}', so it cannot be cancelled.",
-                    h["status"].as_str().unwrap_or_default()
-                )));
-            }
-            let why = reason(&req.reason)?;
-            tx.execute(
-                "UPDATE hearings SET status = 'cancelled', status_reason = ?2, version = version + 1 WHERE id = ?1",
-                params![id, why],
-            )?;
-            audit::record(
-                tx,
-                Some(&actor),
-                Event::new(
-                    "hearing.cancelled",
-                    "hearing",
-                    id,
-                    format!("Hearing on {} cancelled", human_local(h["starts_at"].as_str().unwrap_or_default())),
-                )
-                .case(h["case_id"].as_i64())
-                .details(json!({ "reason": why })),
-            )?;
-            super::dispatch::supersede_hearing_notices(tx, &actor, id)?;
-            hearing_json(tx, id)
+            idempotent(tx, &actor, &key, "hearing.cancel", &(id, &req), || {
+                if !matches!(h["status"].as_str(), Some("draft") | Some("scheduled")) {
+                    return Err(AppError::invalid_transition(format!(
+                        "This hearing is '{}', so it cannot be cancelled.",
+                        h["status"].as_str().unwrap_or_default()
+                    )));
+                }
+                let why = reason(&req.reason)?;
+                let case_id = h["case_id"].as_i64().unwrap_or_default();
+                let when = human_local(h["starts_at"].as_str().unwrap_or_default());
+                tx.execute(
+                    "UPDATE hearings SET status = 'cancelled', status_reason = ?2, version = version + 1 WHERE id = ?1",
+                    params![id, why],
+                )?;
+                // Open "send the new date" tasks from an earlier adjournment are moot: the
+                // cancellation tasks below replace them, so nobody is sent a date that no longer holds.
+                let superseded = "Superseded: the hearing was cancelled; send the cancellation notice instead.";
+                let moot: Vec<(i64, String)> = tx
+                    .prepare("SELECT id, title FROM tasks WHERE hearing_id = ?1 AND kind = 'renotify' AND status = 'open'")?
+                    .query_map([id], |r| Ok((r.get(0)?, r.get(1)?)))?
+                    .collect::<Result<_, _>>()?;
+                for (tid, title) in &moot {
+                    tx.execute(
+                        "UPDATE tasks SET status = 'cancelled', status_reason = ?2, closed_by = ?3, closed_at = ?4, version = version + 1 WHERE id = ?1",
+                        params![tid, superseded, actor.user_id, crate::time::now_utc()],
+                    )?;
+                    audit::record(
+                        tx,
+                        Some(&actor),
+                        Event::new("task.cancelled", "task", *tid, format!("Task cancelled: {title}"))
+                            .case(Some(case_id))
+                            .details(json!({ "reason": superseded })),
+                    )?;
+                }
+                // A draft was never announced; a confirmed hearing must be called off with everyone required.
+                let mut made = Vec::new();
+                if h["status"].as_str() == Some("scheduled") {
+                    let assignee = service_officer(tx, case_id)?.unwrap_or(actor.user_id);
+                    for participant in required_participants(tx, id)? {
+                        let name = participant["name"].as_str().unwrap_or_default();
+                        let tid = tasks::insert_task(
+                            tx,
+                            &actor,
+                            &NewTask {
+                                case_id: Some(case_id),
+                                intake_id: None,
+                                hearing_id: Some(id),
+                                kind: "renotify".into(),
+                                title: format!("Notify {name} that the hearing on {when} is cancelled"),
+                                description: None,
+                                assignee_user_id: Some(assignee),
+                                due_date: None,
+                            },
+                        )?;
+                        tx.execute("UPDATE tasks SET renotify_party_id = ?2 WHERE id = ?1", params![tid, participant["party_id"].as_i64()])?;
+                        made.push(tasks::task_json(tx, tid)?);
+                    }
+                }
+                audit::record(
+                    tx,
+                    Some(&actor),
+                    Event::new("hearing.cancelled", "hearing", id, format!("Hearing on {when} cancelled"))
+                        .case(Some(case_id))
+                        .details(json!({ "reason": why, "tasks": made.iter().map(|t| t["id"].clone()).collect::<Vec<_>>() })),
+                )?;
+                super::dispatch::supersede_hearing_notices(tx, &actor, id)?;
+                let mut out = hearing_json(tx, &actor, id)?;
+                out["tasks"] = json!(made);
+                Ok(out)
+            }, |stored| {
+                let tasks = stored["tasks"].as_array().map(Vec::as_slice).unwrap_or_default().iter()
+                    .map(|t| tasks::task_json(tx, replay_id(t, "/id")?))
+                    .collect::<AppResult<Vec<_>>>()?;
+                let mut out = hearing_json(tx, &actor, id)?;
+                out["tasks"] = json!(tasks);
+                Ok(out)
+            })
         })
         .await?;
     Ok(Json(v))
@@ -876,6 +980,8 @@ struct OutcomeReq {
     next_step: Option<String>,
     next_task: Option<NextTaskIn>,
     next_hearing: Option<NextHearingIn>,
+    /// Minutes / record: an exact clean version of a document of this case (C10 step 8).
+    record_version_id: Option<i64>,
 }
 
 /// Record the outcome: held (summary, attendance, next step) or not held (mandatory reason, kept
@@ -908,6 +1014,9 @@ async fn outcome(
                 }
                 let case_id = h["case_id"].as_i64().unwrap_or_default();
                 let when = human_local(h["starts_at"].as_str().unwrap_or_default());
+                if let Some(vid) = req.record_version_id {
+                    check_record(tx, &actor, case_id, vid)?;
+                }
                 if req.held {
                     let summary = required(req.outcome_summary.as_deref().unwrap_or(""), "Outcome summary")?;
                     tx.execute(
@@ -932,6 +1041,7 @@ async fn outcome(
                         ],
                     )?;
                 }
+                tx.execute("UPDATE hearings SET record_version_id = ?2 WHERE id = ?1", params![id, req.record_version_id])?;
                 for a in &req.attendance {
                     let n = tx.execute(
                         "UPDATE hearing_participants SET attended = ?3 WHERE id = ?1 AND hearing_id = ?2",
@@ -985,7 +1095,7 @@ async fn outcome(
                             .case(Some(case_id)).details(json!({"reason": r})))?;
                     }
                     copy_participants(tx, id, nid)?;
-                    next_v = hearing_json(tx, nid)?;
+                    next_v = hearing_json(tx, &actor, nid)?;
                 }
                 audit::record(
                     tx,
@@ -1002,11 +1112,11 @@ async fn outcome(
                     )
                     .case(Some(case_id))
                     .details(
-                        json!({ "held": req.held, "reason": optional(&req.reason), "task_id": task_v["id"], "next_hearing_id": next_v["id"] }),
+                        json!({ "held": req.held, "reason": optional(&req.reason), "task_id": task_v["id"], "next_hearing_id": next_v["id"], "record_version_id": req.record_version_id }),
                     ),
                 )?;
                 super::dispatch::supersede_hearing_notices(tx, &actor, id)?;
-                let mut out = json!({ "hearing": hearing_json(tx, id)?, "task": task_v, "next_hearing": next_v });
+                let mut out = json!({ "hearing": hearing_json(tx, &actor, id)?, "task": task_v, "next_hearing": next_v });
                 if out["next_hearing"]["status"] == "draft" {
                     out["next_hearing_note"] = json!("Next hearing saved as a draft for a scheduler to confirm.");
                 }
@@ -1017,7 +1127,7 @@ async fn outcome(
             }, |stored| {
                 let task = match stored["task"]["id"].as_i64() { Some(tid) => tasks::task_json(tx, tid)?, None => Value::Null };
                 let next = match stored["next_hearing"]["id"].as_i64() { Some(nid) => require_hearing(tx, &actor, nid)?, None => Value::Null };
-                let mut out = json!({ "hearing": hearing_json(tx, id)?, "task": task, "next_hearing": next });
+                let mut out = json!({ "hearing": hearing_json(tx, &actor, id)?, "task": task, "next_hearing": next });
                 if out["next_hearing"]["status"] == "draft" {
                     out["next_hearing_note"] = json!("Next hearing saved as a draft for a scheduler to confirm.");
                 }
@@ -1087,7 +1197,7 @@ async fn correct(ctx: Ctx, Path(id): Path<i64>, JsonBody(req): JsonBody<CorrectR
                 .details(json!({ "before": h, "reason": why })),
             )?;
             super::dispatch::supersede_hearing_notices(tx, &actor, id)?;
-            hearing_json(tx, id)
+            hearing_json(tx, &actor, id)
         })
         .await?;
     Ok(Json(v))

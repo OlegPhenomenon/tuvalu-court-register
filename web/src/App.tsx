@@ -1,6 +1,6 @@
 /**
  * Application shell: top bar, demo banner, permission-filtered left navigation
- * and all routes. Pages live in src/pages/ — other agents fill in the stubs.
+ * and all routes. Pages live in src/pages/.
  */
 
 import { useRef, useState } from 'react';

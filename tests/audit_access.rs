@@ -1189,3 +1189,57 @@ async fn f05_r2_self_replacement_commits_even_when_actor_loses_access() {
         StatusCode::OK
     );
 }
+
+#[tokio::test]
+async fn c05_ending_responsible_clerk_clears_responsibility_and_reports_no_access() {
+    let app = TestApp::demo();
+    let c = app.persona("olga").await;
+    let (cid, _) = register_case(&c, "DEMO end responsible clerk").await;
+    let olga = user_id(&c, "Olga").await;
+    let elena = c.switch("elena").await;
+    let path = format!("/api/cases/{cid}");
+    let (_, card) = elena.get(&path).await;
+    assert_eq!(card["case"]["responsible_user_id"], olga);
+    let version = card["case"]["version"].as_i64().unwrap();
+    let aid = card["assignments"].as_array().unwrap().iter()
+        .find(|a| a["user_id"] == olga && a["role"] == "clerk" && a["end_at"].is_null()).unwrap()["id"].as_i64().unwrap();
+    let (s, b) = elena.post(&format!("{path}/assignments/{aid}/end"), json!({"reason":"DEMO clerk rotated"})).await;
+    ok(s, &b);
+    assert!(b["case"]["responsible_user_id"].is_null());
+    assert!(b["case"]["responsible_name"].is_null());
+    assert_eq!(b["case"]["version"].as_i64().unwrap(), version + 1);
+    assert_eq!(b["responsible_cleared"], true);
+    assert_eq!(b["residual_access"], json!([]));
+    assert_eq!(b["residual"]["can_view_case"], false);
+    assert_eq!(b["residual"]["via"], json!([]));
+    assert_eq!(c.get(&path).await.0, StatusCode::NOT_FOUND);
+}
+
+#[tokio::test]
+async fn c05_residual_access_reports_case_view_all_and_deactivation_clears_responsible() {
+    let app = TestApp::demo();
+    let c = app.persona("olga").await;
+    let (cid, _) = register_case(&c, "DEMO residual view all").await;
+    let elena = c.switch("elena").await;
+    let elena_id = user_id(&c, "Elena").await;
+    let path = format!("/api/cases/{cid}");
+    let (s, b) = elena.post(&format!("{path}/assignments"), json!({"user_id":elena_id,"role":"other","reason":"DEMO oversight"})).await;
+    ok(s, &b);
+    let aid = b["assignments"].as_array().unwrap().iter()
+        .find(|a| a["user_id"] == elena_id && a["end_at"].is_null()).unwrap()["id"].as_i64().unwrap();
+    let (s, b) = elena.post(&format!("{path}/assignments/{aid}/end"), json!({"reason":"DEMO oversight done"})).await;
+    ok(s, &b);
+    assert_eq!(b["residual"]["can_view_case"], true);
+    assert_eq!(b["residual"]["via"], json!(["case.view_all"]));
+    assert_eq!(b["responsible_cleared"], false);
+
+    let olga = user_id(&c, "Olga").await;
+    let pavel = c.switch("pavel").await;
+    let (s, b) = pavel.post(&format!("/api/admin/users/{olga}/deactivate"), json!({"reason":"DEMO left the registry"})).await;
+    ok(s, &b);
+    let (_, card) = elena.get(&path).await;
+    assert!(card["case"]["responsible_user_id"].is_null());
+    let conn = c.db(&app).open().unwrap();
+    let left: i64 = conn.query_row("SELECT COUNT(*) FROM cases WHERE responsible_user_id = ?1", params![olga], |r| r.get(0)).unwrap();
+    assert_eq!(left, 0);
+}

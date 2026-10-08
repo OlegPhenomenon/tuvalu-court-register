@@ -38,13 +38,20 @@ const LABELS: &[(&str, &str)] = &[
     ("undelivered_notices", "Dispatches not yet delivered"),
 ];
 
+/// Per-person workload drill-downs (`?user=<id>`); not period metrics, so not in the summary list.
+const WORKLOAD_LABELS: &[(&str, &str)] = &[
+    ("workload_cases", "Open cases assigned"),
+    ("workload_tasks", "Open tasks assigned"),
+];
+
 fn known(key: &str) -> bool {
-    LABELS.iter().any(|(k, _)| *k == key)
+    LABELS.iter().chain(WORKLOAD_LABELS).any(|(k, _)| *k == key)
 }
 
 fn label(key: &str) -> &'static str {
     LABELS
         .iter()
+        .chain(WORKLOAD_LABELS)
         .find(|(k, _)| *k == key)
         .map(|(_, l)| *l)
         .unwrap_or("Report")
@@ -55,6 +62,8 @@ struct PeriodQuery {
     from: Option<String>,
     to: Option<String>,
     as_of: Option<String>,
+    /// Staff member for the workload drill-downs.
+    user: Option<i64>,
 }
 
 struct Period {
@@ -64,6 +73,7 @@ struct Period {
     /// `as_of` 00:00 court-local and 14 days later, as UTC bounds for hearing instants.
     hearings_from: String,
     hearings_to: String,
+    user: Option<i64>,
 }
 
 fn period(q: &PeriodQuery) -> AppResult<Period> {
@@ -96,6 +106,7 @@ fn period(q: &PeriodQuery) -> AppResult<Period> {
         as_of,
         hearings_from,
         hearings_to: end,
+        user: q.user,
     })
 }
 
@@ -298,9 +309,10 @@ fn raw_items(
                  WHERE (d.status IN ('draft','queued','failed')
                         OR (d.status = 'sent' AND NOT EXISTS (SELECT 1 FROM delivery_confirmations dc
                               WHERE dc.dispatch_id = d.id AND dc.kind = 'human_handover')))
-                   AND d.case_id IS NOT NULL AND {}
+                   AND d.case_id IS NOT NULL AND {current} AND {vis}
                  ORDER BY d.id",
-                vis()
+                current = super::cases::CURRENT_DISPATCH,
+                vis = vis()
             );
             let rows = query_json(c, &sql, [])?;
             let cols = vec![
@@ -335,26 +347,72 @@ fn raw_items(
                 .collect();
             Ok((cols, out))
         }
+        "workload_cases" => {
+            let user = workload_user(p)?;
+            let sql = format!(
+                "SELECT c.id, c.number, c.title, c.category, c.status, c.registered_date,
+                        group_concat(DISTINCT replace(a.role, '_', ' ')) AS roles
+                 FROM case_assignments a JOIN cases c ON c.id = a.case_id
+                 WHERE a.user_id = ?1 AND a.end_at IS NULL AND c.status <> 'closed' AND {}
+                 GROUP BY c.id ORDER BY c.number",
+                vis()
+            );
+            Ok(case_rows(
+                &query_json(c, &sql, [user])?,
+                &[("roles", "Assigned as")],
+            ))
+        }
+        "workload_tasks" => {
+            let user = workload_user(p)?;
+            let sql = format!(
+                "SELECT c.id, c.number, c.title, c.category, c.status, c.registered_date,
+                        t.title AS task_title, t.due_date
+                 FROM tasks t JOIN cases c ON c.id = t.case_id
+                 WHERE t.assignee_user_id = ?1 AND t.status = 'open' AND {}
+                 ORDER BY t.due_date IS NULL, t.due_date, t.id",
+                vis()
+            );
+            let (cols, mut rows) = case_rows(
+                &query_json(c, &sql, [user])?,
+                &[("task_title", "Task"), ("due_date", "Due (entered)")],
+            );
+            for row in &mut rows {
+                row["link"] = json!(format!("/cases/{}?tab=tasks", row["id"].as_i64().unwrap_or_default()));
+            }
+            Ok((cols, rows))
+        }
         _ => Err(AppError::not_found()),
     }
 }
 
-/// Per-person open workload, counted only over cases the actor can see.
+fn workload_user(p: &Period) -> AppResult<i64> {
+    p.user
+        .ok_or_else(|| AppError::validation("Choose the staff member whose workload to open."))
+}
+
+/// Per-person open workload, counted only over cases the actor can see. Each count opens the
+/// matching `workload_cases` / `workload_tasks` drill-down (same filters, so count = rows).
 fn workload(c: &Connection, actor: &Actor) -> AppResult<Vec<Value>> {
     let case_vis = policy::case_visible_sql(actor, "c2.id");
     let task_vis = policy::case_visible_sql(actor, "t.case_id");
-    query_json(
+    let mut rows = query_json(
         c,
         &format!(
             "SELECT u.id AS user_id, u.display_name,
                     (SELECT COUNT(DISTINCT a.case_id) FROM case_assignments a JOIN cases c2 ON c2.id = a.case_id
                       WHERE a.user_id = u.id AND a.end_at IS NULL AND c2.status <> 'closed' AND {case_vis}) AS open_cases,
-                    (SELECT COUNT(*) FROM tasks t WHERE t.assignee_user_id = u.id AND t.status = 'open'
-                      AND t.case_id IS NOT NULL AND {task_vis}) AS open_tasks
+                    (SELECT COUNT(*) FROM tasks t JOIN cases c2 ON c2.id = t.case_id
+                      WHERE t.assignee_user_id = u.id AND t.status = 'open' AND {task_vis}) AS open_tasks
              FROM users u WHERE u.active = 1 ORDER BY u.display_name"
         ),
         [],
-    )
+    )?;
+    for row in &mut rows {
+        let user = row["user_id"].as_i64().unwrap_or_default();
+        row["cases_drilldown"] = json!(format!("/api/reports/workload_cases/items?user={user}"));
+        row["tasks_drilldown"] = json!(format!("/api/reports/workload_tasks/items?user={user}"));
+    }
+    Ok(rows)
 }
 
 async fn summary(ctx: Ctx, Query(q): Query<PeriodQuery>) -> JsonResult {
@@ -466,7 +524,11 @@ async fn csv_download(
         .read(move |c| {
             let p = period(&q)?;
             let (columns, rows) = fetch_items(c, &actor, &key, &p)?;
-            csv_response(&key, &p.as_of, &columns, &rows)
+            let name = match p.user {
+                Some(user) if key.starts_with("workload_") => format!("{key}-user{user}"),
+                _ => key.clone(),
+            };
+            csv_response(&name, &p.as_of, &columns, &rows)
         })
         .await?;
     Ok(res)

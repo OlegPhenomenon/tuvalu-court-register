@@ -7,7 +7,7 @@ import { PageHeader } from '../components/PageHeader';
 import { StatusBadge } from '../components/StatusBadge';
 import { SelectField } from '../components/fields';
 import { useApi } from '../components/useApi';
-import { DecisionChain, DecisionFile, finalisedNote } from './case/DecisionsTab';
+import { DecisionChain, DecisionFile, IssuedCopies, finalisedNote } from './case/DecisionsTab';
 import type { Decision } from './case/DecisionsTab';
 import { fmtDate, fmtLocal } from '../time';
 import { useSession } from '../session';
@@ -37,6 +37,7 @@ function DecisionsList() {
         { key: 'document_version_id', header: 'Bound version', render: (d) => <DecisionFile decision={d} /> },
         { key: 'author_name', header: 'Author' },
         { key: 'finalised_at', header: 'Finalised', render: (d) => d.finalised_at ? <>{d.finalised_by_name}<div>{fmtLocal(d.finalised_at)}</div></> : '—' },
+        { key: 'issued', header: 'Issued copies', render: (d) => ['finalised', 'superseded'].includes(d.status) ? <IssuedCopies decision={d} /> : '—' },
       ]} />}
       <p className="muted">Up to 500 results. Open a case to draft, finalise or amend a decision.</p>
     </Card>

@@ -26,6 +26,18 @@ export interface Decision {
   hearing_id: number | null; author_name: string | null; finalised_by_name: string | null;
   finalised_at: string | null; amends_decision_id: number | null; amendment_basis: string | null;
   superseded_by_id: number | null; signed_file_uploaded: boolean; created_at: string; version: number; note?: string;
+  issued?: IssuedCopy[];
+}
+export interface IssuedCopy { dispatch_id: number; recipient_name: string; method: string; status: string; sent_at: string | null; handed_over: boolean }
+/** Copies of a finalised decision that went out through Dispatch (spec §5 "issued versions"). */
+export function IssuedCopies({ decision: d }: { decision: Decision }) {
+  if (!['finalised', 'superseded'].includes(d.status)) return null;
+  const issued = d.issued ?? [];
+  if (issued.length === 0) return <span className="muted">Not issued yet</span>;
+  return <ul>{issued.map((i) => <li key={i.dispatch_id}>
+    <Link to={`/cases/${d.case_id}?tab=dispatch&dispatch=${i.dispatch_id}`}>{i.recipient_name}</Link>{' '}
+    ({i.status === 'sent' ? (i.handed_over ? 'sent, handover confirmed' : 'sent') : i.status}{i.sent_at ? `, ${fmtLocal(i.sent_at)}` : ''})
+  </li>)}</ul>;
 }
 export function DecisionFile({ decision: d }: { decision: Decision }) {
   if (d.restricted) return <span>Restricted document</span>;
@@ -203,7 +215,7 @@ function DecisionsTabContent(props: CaseTabProps) {
       </dl>
       <DecisionChain decision={d} decisions={items} />
       {d.status_reason && <p>Withdrawal reason: {d.status_reason}</p>}
-      {['finalised', 'superseded'].includes(d.status) && <><p>Signed scan: {d.signed_file_uploaded ? 'Uploaded' : 'Not recorded'}</p><p className="muted">{finalisedNote}</p></>}
+      {['finalised', 'superseded'].includes(d.status) && <><p>Signed scan: {d.signed_file_uploaded ? 'Uploaded' : 'Not recorded'}</p><div><strong>Issued copies:</strong> <IssuedCopies decision={d} /></div><p className="muted">{finalisedNote}</p></>}
     </Card></div>)}
     {form?.mode === 'finalise' && form.decision ? <FinaliseForm decision={form.decision} onSaved={changed} onClose={closeForm} /> : form && form.mode !== 'finalise' && <DecisionForm {...props} mode={form.mode} decision={form.decision} onSaved={changed} onClose={closeForm} />}
     {withdraw && <DocumentReasonDialog open title={`Withdraw draft ${withdraw.title}`} label="Withdrawal reason" confirmLabel="Withdraw draft" danger busy={busy} error={error} onConfirm={(r) => void withdrawDraft(r)} onClose={() => { if (!busy) setWithdraw(null); }} />}

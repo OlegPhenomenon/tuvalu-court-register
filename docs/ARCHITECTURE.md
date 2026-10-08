@@ -77,7 +77,7 @@ JSON `{"error":{"code":"snake_case","message":"Human readable","details":{}}}`.
 - Idempotency: `Idempotency-Key` header (client UUID), stored in `operation_keys` in the same transaction as the action.
   Supported on: intake create/request-info/mark-ready/supplement/return/mark-duplicate/link/register; case close/reopen/relation;
   task create/update/complete/cancel/carry-forward; document upload/new-version; party creation, participant addition/ending and
-  representation edits; hearing schedule and outcome; decision create/amend/withdraw/finalise; dispatch create/queue/record-sent/confirm/assess.
+  representation edits; hearing schedule, adjourn, cancel and outcome; decision create/amend/withdraw/finalise; dispatch create/queue/record-sent/confirm/assess.
   Keys bind the actor, operation, target and request hash (multipart: metadata, sanitized filename and file SHA-256). Same key + same
   request never runs the action again (never a second case number / decision / attempt); a changed request returns 409
   `idempotency_mismatch`. Replays recheck current visibility and permissions first, then rebuild the response from the current
@@ -174,6 +174,10 @@ return 403 when the actor cannot open that version (finalising an amendment also
 supersedes). A generic `decision.draft`/`decision.finalise` permission never manages hidden material, so a hidden
 draft cannot be declassified by swapping its attachment. The Decisions tab hides those actions on restricted cards
 and explains why; the server check is authoritative.
+Decision list/detail responses include `issued: [{dispatch_id, recipient_name, method, status, sent_at, handed_over}]`:
+queued/sent/failed dispatches whose items carry the decision as a `decision_copy`, filtered by dispatch visibility
+(empty for drafts and withdrawn decisions; working-material sends of the same file are not issued copies). The Decisions
+tab and Decisions screen show "Issued copies" with links to the dispatch, or "Not issued yet".
 Case history includes received/completed/supplemented/registered events and information-request events from linked
 intakes and their supplements, with original timestamps/authors and no duplicate event ids. Document redaction also
 applies to those earlier events. Global audit details undergo recursive document redaction for references in any
@@ -185,7 +189,10 @@ Case PATCH changing `responsible_user_id` requires `case.assign_staff`, a non-em
 same active/eligible-user checks as manual staff assignment. Replacing responsibility ends the previous officer's
 active clerk assignment in the same transaction with `end_reason`, `ended_by` and a `case.unassigned` event;
 other active roles and general view permissions remain valid. The response includes `residual_access` (remaining
-roles), and `case:null` if the assigning actor lost case access. Optional `Idempotency-Key` on case PATCH binds
+roles), `residual` (policy re-run as the former assignee: `can_view_case`, `via`, `document_grants`,
+`authored_restricted_documents`; also returned by `POST /cases/{id}/assignments/{aid}/end` and recomputed on replay),
+and `case:null` if the assigning actor lost case access. Responsibility follows the active clerk assignment: ending
+it or deactivating the user clears `responsible_user_id` (summary shows "No responsible officer"). Optional `Idempotency-Key` on case PATCH binds
 the complete request and rechecks visibility/permissions before replay. Other case fields still require `case.edit`.
 A separate "Change responsible officer" dialog is available with `allowed.assign_staff`; Edit contains no responsible
 field. Judicial officers can only receive judge assignments, never staff responsibility.
@@ -203,8 +210,13 @@ user; invalid rows are reported individually and skipped. Eligibility changes af
 - Case: `registered → active → on_hold ↔ active`; `registered|active|on_hold → closed` (basis + responsible + no unexplained open items);
   `closed → reopened` (reason) → `active|on_hold|closed`. Never back to draft, never deleted.
 - Hearing: `draft → scheduled → held|adjourned|cancelled`; `draft → cancelled`. Adjourn creates a **new linked hearing** (old stays `adjourned`
-  with reason + authoriser; new gets `previous_hearing_id`), frees the slot, generates "notify again" tasks per participant. `held` cannot be adjourned;
+  with reason + authoriser; new gets `previous_hearing_id`), frees the slot, generates "notify again" tasks per participant. Cancelling a
+  `scheduled` hearing creates one `renotify` task per required participant linked to the cancelled hearing (response `tasks`, replay-safe).
+  Hearing JSON lists linked `renotify` tasks as `notify_tasks` (who must be told). `held` cannot be adjourned;
   correction via `hearing.admin_correct` with reason. Held never closes the case.
+- Hearing outcome accepts optional `record_version_id` (minutes / record): visible to the actor (else 404), same case, clean, not a
+  judicial note (else 400). Hearing JSON exposes `record: {version_id, document_id, title, doc_type, version_no, filename, restricted:false}`
+  or, when the viewer cannot see the document, `{restricted:true, title:"Restricted document"}`.
 - Decision: `draft → finalised → superseded` (by a finalised amendment, linked); `draft → withdrawn` (reason). Finalised file can never be replaced in place.
 - Dispatch (notice or copy package): `draft → queued → sent|failed|superseded`;
   `draft|failed → superseded` when bound material becomes obsolete; superseded is terminal and requires a fresh dispatch; `failed → queued` (retry = new attempt row). Technical delivery receipt,
@@ -260,9 +272,10 @@ Dispatch material and currency:
 - Hearing invitations store `hearing_id`, `hearing_version`, `hearing_starts_at` at preparation and verify them
   when previewing, then bind the review to those current values. Hearing edits, confirmation, adjournment,
   cancellation, outcomes and corrections atomically supersede unsent invitations, with an audit event.
-  Sent notices remain unchanged. Adjournment creates tasks; no replacement notice is automatically queued.
+  Sent notices remain unchanged. Adjournment and cancellation create tasks; no replacement notice is automatically queued.
 - The `hearing_cancellation` template derives `notice_purpose: cancellation`; other hearing notices derive
-  `invitation`. Cancellation notices and document copies are independent of hearing cancellation.
+  `invitation`. Cancellation notices and document copies are independent of hearing cancellation. Queuing or
+  recording as sent a cancellation notice for a cancelled hearing completes that party's open `renotify` task for it.
 - Queue uses a JSON command body (normally `{}`) in its idempotency fingerprint. Queue/manual handover/retry
   validate currency; the worker checks again within the delivery transaction and marks stale invitations or
   decision copies `superseded` before any delivery attempt/mailbox entry. The UI displays
@@ -314,7 +327,8 @@ GET  /document-versions/:id/download   PATCH /documents/:id (visibility, version
 GET/POST /cases/:id/decisions   POST /decisions/:id/{finalise,amend}
 GET/POST /cases/:id/dispatches  GET /dispatches?status=   POST /dispatches/:id/{preview,queue,confirm,assess,cancel}
 GET  /mailbox                          demo local e-mail viewer / production SMTP sent log
-GET  /reports/summary?from=&to=   GET /reports/:kind/cases (drill-down)   GET /reports/:kind.csv
+GET  /reports/summary?from=&to=&as_of=   GET /reports/:kind/items (drill-down)   GET /reports/:kind/csv
+     (workload drill-downs: kind workload_cases|workload_tasks with ?user=<id>; summary workload rows carry cases_drilldown/tasks_drilldown)
 GET  /search?q=                        cases + document titles, only accessible
 POST /import/cases/preview (multipart CSV)   POST /import/files/preview (ZIP)   POST /import/:batch/commit   GET /import   GET /import/:batch
   (batch detail and commit replays redact another uploader's restricted/judicial-note rows unless the created document is
@@ -430,5 +444,5 @@ audit event and response. The UI retains one key per opened assessment form thro
 - Modal widths respect the viewport, form controls shrink, and the dialog header stays visible during internal scrolling. At widths ≤640px the compact application header scrolls with the page.
 - Closure evidence is stored per status-history entry, resolved with current document permissions, and returned as a label/link in the case summary and status history. Decision evidence names its bound document version; hidden evidence is labelled “Restricted document”. Migration 0013 recovers previous closure references from audit records.
 - `GET /documents/{id}/grants/candidates` shares the grant endpoint's eligibility checks and excludes existing grants, inactive staff, and technical administrators.
-- Adjournment tasks store the new hearing and recipient party IDs. Queueing an invitation or recording its manual delivery completes the matching task with an audited notice reference. A shared dispatch predicate excludes invitations to adjourned/cancelled hearings from next steps, the no-next-step report, and closing blockers; dispatch history is retained.
+- Adjournment tasks store the new hearing and recipient party IDs. Queueing an invitation or recording its manual delivery completes the matching task with an audited notice reference. A shared dispatch predicate excludes invitations to adjourned/cancelled hearings from next steps, the no-next-step report, the undelivered-dispatch report (summary, drill-down, CSV), and closing blockers; dispatch history is retained.
 - Decision writes validate dates against the linked hearing's court-local date. The API returns that date to support the form's default and minimum. Demo mailbox copies are seeded only for e-mail delivery, with fictional `@example.invalid` recipients; manual deliveries use manual receipts.

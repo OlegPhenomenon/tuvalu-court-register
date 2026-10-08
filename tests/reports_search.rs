@@ -368,3 +368,78 @@ async fn hidden_counterpart_case_is_omitted_from_history_and_audit() {
     let (_, b) = elena.get(&format!("/api/cases/{visible}/history")).await;
     assert!(!b.to_string().contains(&number));
 }
+#[tokio::test]
+async fn undelivered_report_skips_invitations_for_adjourned_hearings() {
+    let app = TestApp::demo();
+    let olga = app.persona("olga").await;
+    let (cid, _) = register_case(&olga, "Adjourned invitation case").await;
+    let uid = user_id(&olga, "Olga").await;
+    let db = olga.db(&app);
+    let c = db.open().unwrap();
+    let start = tuvalu_court::time::local_to_utc(&format!("{}T11:00", today())).unwrap();
+    let end = tuvalu_court::time::add_minutes(&start, 30).unwrap();
+    let now = tuvalu_court::time::now_utc();
+    c.execute("INSERT INTO hearings(case_id,hearing_type,status,starts_at,ends_at,created_at) VALUES(?1,'mention','scheduled',?2,?3,?4)", params![cid, start, end, now]).unwrap();
+    let hid = c.last_insert_rowid();
+    c.execute("INSERT INTO dispatches(case_id,hearing_id,kind,notice_purpose,recipient_name,method,subject,body,purpose,status,prepared_by,prepared_at,sent_at) VALUES(?1,?2,'notice','invitation','DEMO Recipient','email','DEMO adjourned invitation','Body','Notice','sent',?3,?4,?4)", params![cid, hid, uid, now]).unwrap();
+    let did = c.last_insert_rowid();
+    let elena = olga.switch("elena").await;
+    let listed = |items: &Value| items["rows"].as_array().unwrap().iter().any(|r| r["id"] == did);
+    let in_next_steps = |case: &Value| case["next_actions"].as_array().unwrap().iter()
+        .any(|a| a["link"].as_str().unwrap_or_default().ends_with(&format!("dispatch={did}")));
+    let (_, before) = elena.get("/api/reports/summary").await;
+    let (_, items) = elena.get("/api/reports/undelivered_notices/items").await;
+    assert!(listed(&items));
+    let (_, case) = elena.get(&format!("/api/cases/{cid}")).await;
+    assert!(in_next_steps(&case));
+
+    c.execute("UPDATE hearings SET status='adjourned' WHERE id=?1", [hid]).unwrap();
+    let (_, after) = elena.get("/api/reports/summary").await;
+    assert_eq!(metric(&after, "undelivered_notices"), metric(&before, "undelivered_notices") - 1);
+    let (_, items) = elena.get("/api/reports/undelivered_notices/items").await;
+    assert!(!listed(&items));
+    assert_eq!(items["rows"].as_array().unwrap().len() as i64, metric(&after, "undelivered_notices"));
+    let (_, case) = elena.get(&format!("/api/cases/{cid}")).await;
+    assert!(!in_next_steps(&case), "case next steps and the report agree");
+    let (s, _, bytes) = elena.get_bytes("/api/reports/undelivered_notices/csv").await;
+    assert_eq!(s, StatusCode::OK);
+    assert!(!String::from_utf8(bytes).unwrap().contains("DEMO adjourned invitation"));
+}
+#[tokio::test]
+async fn workload_counts_open_their_accessible_cases_and_csv() {
+    let app = TestApp::demo();
+    let olga = app.persona("olga").await;
+    let (visible, _) = register_case(&olga, "DEMO workload visible").await;
+    let (hidden, _) = register_case(&olga, "DEMO workload hidden").await;
+    let uid = user_id(&olga, "Olga").await;
+    let db = olga.db(&app);
+    let c = db.open().unwrap();
+    let now = tuvalu_court::time::now_utc();
+    c.execute("UPDATE cases SET restricted=1 WHERE id=?1", [hidden]).unwrap();
+    for case in [visible, hidden] {
+        c.execute("INSERT OR IGNORE INTO case_assignments(case_id,user_id,role,reason,start_at) VALUES(?1,?2,'clerk','DEMO workload',?3)", params![case, uid, now]).unwrap();
+        c.execute("INSERT INTO tasks(case_id,title,assignee_user_id,status,created_at) VALUES(?1,'DEMO workload task',?2,'open',?3)", params![case, uid, now]).unwrap();
+    }
+    let elena = olga.switch("elena").await;
+    let (s, summary) = elena.get("/api/reports/summary").await;
+    ok(s, &summary);
+    let row = summary["workload"].as_array().unwrap().iter().find(|r| r["user_id"] == uid).unwrap().clone();
+    for (count, link) in [("open_cases", "cases_drilldown"), ("open_tasks", "tasks_drilldown")] {
+        let (s, items) = elena.get(row[link].as_str().unwrap()).await;
+        ok(s, &items);
+        let rows = items["rows"].as_array().unwrap();
+        assert_eq!(rows.len() as i64, row[count].as_i64().unwrap(), "{count} matches its drill-down");
+        assert!(rows.iter().any(|r| r["title"] == "DEMO workload visible"));
+        assert!(rows.iter().all(|r| r["title"] != "DEMO workload hidden"));
+        assert!(rows.iter().all(|r| r["link"].as_str().unwrap().starts_with("/cases/")));
+    }
+    let (s, h, bytes) = elena.get_bytes(&format!("/api/reports/workload_tasks/csv?user={uid}")).await;
+    assert_eq!(s, StatusCode::OK);
+    assert!(h["content-disposition"].to_str().unwrap().contains(&format!("workload_tasks-user{uid}")));
+    let csv = String::from_utf8(bytes).unwrap();
+    assert!(csv.contains("DEMO workload visible") && csv.contains("DEMO workload task"));
+    assert!(!csv.contains("DEMO workload hidden"));
+    assert_eq!(elena.get("/api/reports/workload_cases/items").await.0, StatusCode::BAD_REQUEST);
+    let sergei = olga.switch("sergei").await;
+    assert_eq!(sergei.get(&format!("/api/reports/workload_cases/items?user={uid}")).await.0, StatusCode::FORBIDDEN);
+}

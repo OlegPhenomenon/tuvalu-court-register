@@ -394,7 +394,7 @@ fn action(code: &str, message: String, link: String) -> Value {
 }
 
 /// Invitations for replaced/cancelled hearings remain history, not pending work.
-const CURRENT_DISPATCH: &str = "NOT (d.kind='notice' AND d.notice_purpose='invitation' AND EXISTS(
+pub(crate) const CURRENT_DISPATCH: &str = "NOT (d.kind='notice' AND d.notice_purpose='invitation' AND EXISTS(
     SELECT 1 FROM hearings old WHERE old.id=d.hearing_id AND old.status IN ('adjourned','cancelled')))";
 
 /// Recorded planned or pending work, independent of urgency and document visibility.
@@ -686,7 +686,7 @@ async fn update(
                             audit::record(tx, Some(&actor), Event::new("case.unassigned", "case", id, "Previous responsible officer assignment ended")
                                 .case(Some(id)).details(json!({"user_id":previous,"role":"clerk","reason":why,"remaining_roles":roles})))?;
                         }
-                        remaining = Some(roles);
+                        remaining = Some((previous, roles));
                     }
                     insert_assignment(tx, &actor, id, uid, "clerk", &why)?;
                     audit::record(tx,Some(&actor),Event::new("case.assigned","case",id,"Responsible officer assigned").case(Some(id)).details(json!({"user_id":uid,"role":"clerk","reason":why})))?;
@@ -704,14 +704,18 @@ async fn update(
                 [], |r| r.get(0),
             )?;
             let mut out = if remaining.is_some() && !visible { json!({"case":null}) } else { case_json(tx, &actor, id)? };
-            if let Some(roles) = remaining {
+            if let Some((previous, roles)) = remaining {
                 out["residual_access"] = json!(roles);
+                out["residual"] = residual_access(tx, &actor, id, previous)?;
             }
             Ok(out)
             }, |stored| {
                 let mut out = if stored["case"].is_null() { json!({"case":null}) } else { case_json(tx, &actor, id)? };
                 if let Some(roles) = stored.get("residual_access") {
                     out["residual_access"] = roles.clone();
+                }
+                if let Some(previous) = stored["residual"]["user_id"].as_i64() {
+                    out["residual"] = residual_access(tx, &actor, id, previous)?;
                 }
                 Ok(out)
             })
@@ -1264,23 +1268,90 @@ async fn assignment_end(ctx: Ctx, Path((id, aid)): Path<(i64, i64)>, JsonBody(re
                 "UPDATE case_assignments SET end_at = ?2, ended_by = ?3, end_reason = ?4 WHERE id = ?1",
                 params![aid, crate::time::now_utc(), actor.user_id, why],
             )?;
+            // The responsible officer follows the active clerk assignment (C05).
+            let responsible_cleared = role == "clerk"
+                && tx.execute(
+                    "UPDATE cases SET responsible_user_id = NULL, version = version + 1, updated_at = ?3
+                     WHERE id = ?1 AND responsible_user_id = ?2
+                       AND NOT EXISTS (SELECT 1 FROM case_assignments WHERE case_id = ?1 AND user_id = ?2 AND role = 'clerk' AND end_at IS NULL)",
+                    params![id, user_id, crate::time::now_utc()],
+                )? > 0;
             // Report residual access so the person ending the assignment sees what remains.
-            let remaining = query_json(
-                tx,
-                "SELECT role FROM case_assignments WHERE case_id = ?1 AND user_id = ?2 AND end_at IS NULL",
-                params![id, user_id],
-            )?;
+            let residual = residual_access(tx, &actor, id, user_id)?;
             audit::record(
                 tx,
                 Some(&actor),
                 Event::new("case.unassigned", "case", id, format!("{name} no longer assigned to {} as {}", case.number, role.replace('_', " ")))
                     .case(Some(id))
-                    .details(json!({ "user_id": user_id, "role": role, "reason": why, "remaining_roles": remaining })),
+                    // Document counts depend on the viewer's own access, so the audit keeps only the policy result.
+                    .details(json!({ "user_id": user_id, "role": role, "reason": why, "remaining_roles": residual["roles"].clone(),
+                        "can_view_case": residual["can_view_case"].clone(), "via": residual["via"].clone(),
+                        "responsible_cleared": responsible_cleared })),
             )?;
             let mut out = case_json(tx, &actor, id).unwrap_or_else(|_| json!({ "case": null }));
-            out["residual_access"] = json!(remaining);
+            out["residual_access"] = residual["roles"].clone();
+            out["residual"] = residual;
+            out["responsible_cleared"] = json!(responsible_cleared);
             Ok(out)
         })
         .await?;
     Ok(Json(v))
+}
+
+/// What a (former) assignee can still reach on a case, evaluated by the real access policy
+/// for that user rather than inferred from the remaining assignment rows. Document counts
+/// include only documents the acting user may see themselves.
+pub fn residual_access(tx: &Connection, actor: &Actor, case_id: i64, user_id: i64) -> AppResult<Value> {
+    let roles = query_json(
+        tx,
+        "SELECT role FROM case_assignments WHERE case_id = ?1 AND user_id = ?2 AND end_at IS NULL",
+        params![case_id, user_id],
+    )?;
+    let grants: i64 = tx.query_row(
+        &format!(
+            "SELECT COUNT(*) FROM document_grants g JOIN documents d ON d.id = g.document_id
+             WHERE d.case_id = ?1 AND g.user_id = ?2 AND g.revoked_at IS NULL AND {}",
+            policy::document_visible_sql(actor, "d")
+        ),
+        params![case_id, user_id],
+        |r| r.get(0),
+    )?;
+    let authored: i64 = tx.query_row(
+        &format!(
+            "SELECT COUNT(*) FROM documents d WHERE d.case_id = ?1 AND d.created_by = ?2
+               AND d.visibility NOT IN ('administrative','party_material') AND {}",
+            policy::document_visible_sql(actor, "d")
+        ),
+        params![case_id, user_id],
+        |r| r.get(0),
+    )?;
+    let mut via: Vec<String> = Vec::new();
+    let can_view = match crate::auth::load_actor(tx, user_id, None)? {
+        Some(target) => {
+            let visible = policy::can_view_case(tx, &target, case_id)?;
+            if visible {
+                let restricted: bool = tx.query_row("SELECT restricted FROM cases WHERE id = ?1", [case_id], |r| r.get(0))?;
+                if target.has(perm::CASE_VIEW_RESTRICTED) {
+                    via.push(perm::CASE_VIEW_RESTRICTED.to_string());
+                } else if target.has(perm::CASE_VIEW_ALL) && !restricted {
+                    via.push(perm::CASE_VIEW_ALL.to_string());
+                }
+                for r in &roles {
+                    if let Some(role) = r["role"].as_str() {
+                        via.push(format!("assignment:{role}"));
+                    }
+                }
+            }
+            visible
+        }
+        None => false,
+    };
+    Ok(json!({
+        "user_id": user_id,
+        "roles": roles,
+        "can_view_case": can_view,
+        "via": via,
+        "document_grants": grants,
+        "authored_restricted_documents": authored,
+    }))
 }

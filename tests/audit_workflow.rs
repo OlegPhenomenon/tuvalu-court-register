@@ -931,6 +931,7 @@ async fn e2e_d2_existing_closures_and_d5_legacy_renotify_bindings_survive_migrat
         ALTER TABLE case_status_history DROP COLUMN basis_decision_id;
         ALTER TABLE case_status_history DROP COLUMN basis_hearing_id;
         ALTER TABLE tasks DROP COLUMN renotify_party_id;
+        ALTER TABLE hearings DROP COLUMN record_version_id;
         PRAGMA user_version=12;").unwrap();
     drop(conn);
     db.init().unwrap();
