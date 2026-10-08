@@ -1,0 +1,8 @@
+target/
+web/node_modules/
+web/dist/
+data/
+*.tcrb
+*.key
+.orch/
+.worktrees/

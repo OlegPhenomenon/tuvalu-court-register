@@ -1,0 +1,45 @@
+[package]
+name = "tuvalu-court"
+version = "0.1.0"
+edition = "2024"
+license = "MIT"
+description = "Tuvalu Court Register — independent demonstration prototype of a court registry case management system"
+publish = false
+
+[dependencies]
+axum = { version = "0.8.9", default-features = false, features = ["http1", "json", "query", "tokio", "multipart", "macros"] }
+tokio = { version = "1.53", features = ["rt-multi-thread", "macros", "signal", "time", "fs", "sync"] }
+tower = { version = "0.5.3", default-features = false, features = ["util"] }
+rusqlite = { version = "0.40.2", features = ["bundled"] }
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+time = { version = "0.3.55", features = ["formatting", "parsing", "macros"] }
+argon2 = "0.6"
+sha2 = "0.11"
+sha1 = "0.11"
+hmac = "0.13"
+getrandom = "0.4"
+hex = "0.4"
+rust-embed = "8.13"
+zip = { version = "8.6", default-features = false, features = ["deflate"] }
+chacha20poly1305 = "0.11"
+csv = "1.4"
+parking_lot = "0.12"
+tracing = "0.1"
+tracing-subscriber = { version = "0.3", default-features = false, features = ["fmt", "env-filter", "ansi"] }
+
+[dev-dependencies]
+http-body-util = "0.1.5"
+
+[profile.dev]
+debug = 0
+
+[profile.dev.package."*"]
+opt-level = 1
+
+[profile.release]
+opt-level = "s"
+lto = "thin"
+codegen-units = 1
+strip = true
+panic = "abort"
