@@ -23,6 +23,7 @@ import { FormErrors } from '../intake/FormErrors';
 import { CasePicker } from '../intake/pickers';
 import type { CaseHit } from '../intake/pickers';
 import type { Assignment, CaseData, CaseTabProps, OpenItem } from './types';
+import ExportDialog from './ExportDialog';
 
 function Detail({ term, children }: { term: string; children: ReactNode }) {
   return (
@@ -408,6 +409,7 @@ function AddRelationModal({ caseId, onClose, onSaved }: {
 /* ------------------------------ the tab ------------------------------ */
 
 export default function SummaryTab({ caseId, caseData, reload }: CaseTabProps) {
+  const [exportOpen, setExportOpen] = useState(false);
   const navigate = useNavigate();
   const { data: ref, error: refError, reload: reloadRef } = useRefData();
   const c = caseData.case;
@@ -501,10 +503,11 @@ export default function SummaryTab({ caseId, caseData, reload }: CaseTabProps) {
 
   return (
     <>
+      {exportOpen && <ExportDialog caseId={caseId} onClose={() => setExportOpen(false)} />}
       <ErrorBanner error={refError} onRetry={reloadRef} />
       <Card
         title="Case details"
-        actions={allowed.edit ? <Button variant="secondary" onClick={() => openModal('edit')}>Edit</Button> : undefined}
+        actions={<>{allowed.export && <Button variant="secondary" onClick={() => setExportOpen(true)}>Export package</Button>}{allowed.edit && <Button variant="secondary" onClick={() => openModal('edit')}>Edit</Button>}</>}
       >
         <div className="table-wrap">
           <table>

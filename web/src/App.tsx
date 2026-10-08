@@ -25,6 +25,7 @@ import Reports from './pages/Reports';
 import Import from './pages/Import';
 import Audit from './pages/Audit';
 import Settings from './pages/Settings';
+import GlobalSearch from './components/GlobalSearch';
 
 const NAV: { to: string; label: string; end?: boolean; anyPerm?: string[] }[] = [
   { to: '/', label: 'Work queue', end: true },
@@ -91,6 +92,7 @@ function TopBar() {
   return (
     <header className="topbar">
       <Link to="/" className="brand">{session.court_name}</Link>
+      <GlobalSearch />
       <div className="topbar-right">
         <span className="user-block">
           <span className="user-name">{session.user.display_name}</span>
