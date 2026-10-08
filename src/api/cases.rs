@@ -656,7 +656,7 @@ async fn add_relation(ctx: Ctx, Path(id): Path<i64>, JsonBody(req): JsonBody<Rel
             audit::record(
                 tx,
                 Some(&actor),
-                Event::new("case.related", "case", id, format!("Case {} linked to {} ({})", case.number, other.number, req.kind)).case(Some(id)),
+                Event::new("case.related", "case", id, format!("Case {} linked to {} ({})", case.number, other.number, req.kind)).case(Some(id)).details(json!({"related_case_id": other.id})),
             )?;
             case_json(tx, &actor, id)
         })

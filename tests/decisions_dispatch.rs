@@ -319,8 +319,8 @@ async fn decision_scope_and_document_checks() {
         &viktor,
         &format!("/api/cases/{cid}/decisions"),
         json!({"title":"X","document_version_id":vid}),
-        StatusCode::FORBIDDEN,
-        "forbidden",
+        StatusCode::NOT_FOUND,
+        "not_found",
     )
     .await;
     let viktor = assigned(&olga, cid).await;
@@ -415,8 +415,8 @@ async fn decision_scope_and_document_checks() {
         &viktor,
         &format!("/api/decisions/{id}/finalise"),
         json!({"decision_date":today()}),
-        StatusCode::FORBIDDEN,
-        "forbidden",
+        StatusCode::NOT_FOUND,
+        "not_found",
     )
     .await;
     let pavel = olga.switch("pavel").await;
@@ -1328,4 +1328,193 @@ async fn concurrent_finalisation_queue_and_workers_do_not_duplicate_history() {
             .unwrap()
             .is_empty()
     );
+}
+
+#[tokio::test]
+async fn decisions_reject_notes_and_hide_every_mutation_after_assignment_ends() {
+    let app = TestApp::demo();
+    let olga = app.persona("olga").await;
+    let (cid, _) = register_case(&olga, "Decision policy").await;
+    let viktor = assigned(&olga, cid).await;
+    let uid = user_id(&olga, "Viktor").await;
+    let db = olga.db(&app);
+    let (_, public) = insert_document(&db, cid, "Ruling", "decision", "administrative", uid);
+    let d = draft(&viktor, cid, public).await;
+    let id = d["id"].as_i64().unwrap();
+    let mut notes = vec![];
+    for (doc_type, visibility) in [
+        ("judicial_note", "judicial_note"),
+        ("judicial_note", "administrative"),
+        ("decision", "judicial_note"),
+    ] {
+        let (_, vid) = insert_document(&db, cid, "Private working text", doc_type, visibility, uid);
+        notes.push(vid);
+        denied(
+            &viktor,
+            &format!("/api/cases/{cid}/decisions"),
+            json!({"title":"Draft","document_version_id":vid}),
+            StatusCode::BAD_REQUEST,
+            "validation",
+        )
+        .await;
+        let (s, b) = viktor
+            .patch(
+                &format!("/api/decisions/{id}"),
+                json!({"version":1,"document_version_id":vid}),
+            )
+            .await;
+        err(s, &b, StatusCode::BAD_REQUEST, "validation");
+    }
+    posted(
+        &viktor,
+        &format!("/api/decisions/{id}/finalise"),
+        json!({"decision_date":today()}),
+    )
+    .await;
+    for vid in notes {
+        denied(
+            &viktor,
+            &format!("/api/decisions/{id}/amend"),
+            json!({"amendment_basis":"Correction","document_version_id":vid}),
+            StatusCode::BAD_REQUEST,
+            "validation",
+        )
+        .await;
+    }
+    db.open()
+        .unwrap()
+        .execute(
+            "UPDATE case_assignments SET end_at=?1 WHERE case_id=?2 AND user_id=?3",
+            params![tuvalu_court::time::now_utc(), cid, uid],
+        )
+        .unwrap();
+    for (action, body) in [
+        ("finalise", json!({"decision_date":today()})),
+        ("withdraw", json!({"reason":"Withdraw"})),
+        (
+            "amend",
+            json!({"amendment_basis":"Correction","document_version_id":public}),
+        ),
+    ] {
+        denied(
+            &viktor,
+            &format!("/api/decisions/{id}/{action}"),
+            body,
+            StatusCode::NOT_FOUND,
+            "not_found",
+        )
+        .await;
+    }
+    let (s, b) = viktor
+        .patch(
+            &format!("/api/decisions/{id}"),
+            json!({"version":2,"title":"Hidden"}),
+        )
+        .await;
+    err(s, &b, StatusCode::NOT_FOUND, "not_found");
+    // Visible case, but no judge assignment, still returns 403.
+    db.open().unwrap().execute("INSERT INTO case_assignments(case_id,user_id,role,reason,start_at) VALUES(?1,?2,'clerk','Read only',?3)", params![cid,uid,tuvalu_court::time::now_utc()]).unwrap();
+    denied(
+        &viktor,
+        &format!("/api/cases/{cid}/decisions"),
+        json!({"title":"Draft","document_version_id":public}),
+        StatusCode::FORBIDDEN,
+        "forbidden",
+    )
+    .await;
+}
+
+#[tokio::test]
+async fn restricted_dispatch_and_mailbox_inventory_is_redacted_and_patch_keeps_cover_letter() {
+    let app = TestApp::demo();
+    let olga = app.persona("olga").await;
+    let (cid, _) = register_case(&olga, "Restricted dispatch").await;
+    let uid = user_id(&olga, "Olga").await;
+    let db = olga.db(&app);
+    let (_, secret) = insert_document(
+        &db,
+        cid,
+        "Confidential medical file",
+        "medical",
+        "restricted",
+        uid,
+    );
+    let (_, public) = insert_document(
+        &db,
+        cid,
+        "Public evidence",
+        "evidence",
+        "administrative",
+        uid,
+    );
+    let d = posted(&olga, &format!("/api/cases/{cid}/dispatches"), json!({"kind":"copies","recipient_name":"Maria","method":"email","address":"maria@example.invalid","version_ids":[secret],"include_restricted":true,"body":"Please retain this covering letter."})).await;
+    let id = d["id"].as_i64().unwrap();
+    let (s, edited) = olga
+        .patch(
+            &format!("/api/dispatches/{id}"),
+            json!({"version":d["version"],"recipient_name":"Alexei"}),
+        )
+        .await;
+    ok(s, &edited);
+    assert_eq!(edited["body"], d["body"]);
+    preview_queue(&olga, id, "secret-copy").await;
+    tuvalu_court::outbox::process(&db).unwrap();
+    let elena = olga.switch("elena").await;
+    let placeholder = json!({"document_version_id":secret,"restricted":true,"document_title":"Restricted document"});
+    for path in [
+        format!("/api/dispatches/{id}"),
+        format!("/api/cases/{cid}/dispatches"),
+        "/api/dispatches".into(),
+    ] {
+        let b = fetched(&elena, &path).await;
+        let d = if b["items"]
+            .as_array()
+            .is_some_and(|items| items.iter().any(|v| v["id"] == id))
+        {
+            b["items"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .find(|v| v["id"] == id)
+                .unwrap()
+        } else {
+            &b
+        };
+        assert_eq!(d["items"][0], placeholder);
+        assert!(
+            !d["body"]
+                .as_str()
+                .unwrap()
+                .contains("Confidential medical file")
+        );
+        assert!(d["body"].as_str().unwrap().contains("Restricted document"));
+    }
+    let mailbox = fetched(&elena, &format!("/api/mailbox?dispatch_id={id}")).await;
+    let mid = mailbox["items"][0]["id"].as_i64().unwrap();
+    for b in [
+        mailbox["items"][0].clone(),
+        fetched(&elena, &format!("/api/mailbox/{mid}")).await,
+    ] {
+        assert_eq!(b["attachments"][0], placeholder);
+        assert!(
+            !b["body"]
+                .as_str()
+                .unwrap()
+                .contains("Confidential medical file")
+        );
+    }
+    let own = fetched(&olga, &format!("/api/mailbox/{mid}")).await;
+    assert!(own["attachments"][0]["filename"].is_string());
+    let draft = posted(&olga,&format!("/api/cases/{cid}/dispatches"),json!({"kind":"copies","recipient_name":"Maria","method":"post","version_ids":[secret],"include_restricted":true,"body":"Custom letter."})).await;
+    let (s, b) = olga
+        .patch(
+            &format!("/api/dispatches/{}", draft["id"]),
+            json!({"version":draft["version"],"version_ids":[public]}),
+        )
+        .await;
+    ok(s, &b);
+    let body = b["body"].as_str().unwrap();
+    assert!(body.starts_with("Custom letter."));
+    assert!(body.contains("Public evidence (version 1, Public_evidence.pdf)"));
+    assert!(!body.contains("Confidential medical file"));
 }

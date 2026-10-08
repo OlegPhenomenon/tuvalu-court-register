@@ -296,3 +296,74 @@ async fn search_and_history_redact_sensitive_materials() {
         StatusCode::NOT_FOUND
     );
 }
+
+#[tokio::test]
+async fn hidden_counterpart_case_is_redacted_in_history_and_audit() {
+    let app = TestApp::demo();
+    let olga = app.persona("olga").await;
+    let (visible, _) = register_case(&olga, "Visible relation").await;
+    let (hidden, number) = register_case(&olga, "Secret counterpart").await;
+    let (s, b) = olga
+        .post(
+            &format!("/api/cases/{visible}/relations"),
+            json!({"to_case_id":hidden,"kind":"related"}),
+        )
+        .await;
+    ok(s, &b);
+    let db = olga.db(&app);
+    let c = db.open().unwrap();
+    let details: String = c
+        .query_row(
+            "SELECT details FROM audit_events WHERE action='case.related' AND case_id=?1",
+            [visible],
+            |r| r.get(0),
+        )
+        .unwrap();
+    assert_eq!(
+        serde_json::from_str::<Value>(&details).unwrap()["related_case_id"],
+        hidden
+    );
+    c.execute("UPDATE cases SET restricted=1 WHERE id=?1", [hidden])
+        .unwrap();
+    let elena = olga.switch("elena").await;
+    for path in [
+        format!("/api/cases/{visible}/history"),
+        format!("/api/audit?case_id={visible}"),
+    ] {
+        let (s, b) = elena.get(&path).await;
+        ok(s, &b);
+        let event = b["events"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|e| e["action"] == "case.related")
+            .unwrap();
+        assert_eq!(
+            event["summary"],
+            "Activity on a case you do not have access to"
+        );
+        assert!(event["details"].is_null());
+        assert!(!b.to_string().contains(&number));
+    }
+    let (s, b) = olga.get(&format!("/api/cases/{visible}/history")).await;
+    ok(s, &b);
+    assert!(b.to_string().contains(&number));
+    // Legacy events without details also fail closed when a counterpart is hidden.
+    db.write_blocking(|tx| {
+        tuvalu_court::audit::record(
+            tx,
+            None,
+            tuvalu_court::audit::Event::new(
+                "case.related",
+                "case",
+                visible,
+                format!("Linked to {number}"),
+            )
+            .case(Some(visible)),
+        )?;
+        Ok(())
+    })
+    .unwrap();
+    let (_, b) = elena.get(&format!("/api/cases/{visible}/history")).await;
+    assert!(!b.to_string().contains(&number));
+}

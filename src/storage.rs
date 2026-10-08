@@ -134,7 +134,30 @@ pub fn used_bytes(conn: &Connection) -> AppResult<u64> {
         [],
         |r| r.get(0),
     )?;
-    Ok(n.max(0) as u64)
+    let mut used = n.max(0) as u64;
+    let mut stmt = conn.prepare(
+        "SELECT storage_key, json_extract(source_options, '$.size_bytes') FROM import_batches",
+    )?;
+    let rows = stmt.query_map([], |r| {
+        Ok((r.get::<_, String>(0)?, r.get::<_, Option<i64>>(1)?))
+    })?;
+    for row in rows {
+        let (key, size) = row?;
+        let size = match size {
+            Some(size) => size.max(0) as u64,
+            // Older batches predate source sizes in the immutable source options.
+            None => {
+                let parent = conn
+                    .path()
+                    .and_then(|p| std::path::Path::new(p).parent())
+                    .ok_or_else(|| AppError::internal("Missing database path."))?;
+                let db = Db::new(parent.join("court.sqlite"), parent.join("files"), None);
+                std::fs::metadata(path_for(&db, &key)?)?.len()
+            }
+        };
+        used = used.saturating_add(size);
+    }
+    Ok(used)
 }
 
 fn path_for(db: &Db, storage_key: &str) -> AppResult<PathBuf> {
@@ -215,10 +238,13 @@ pub fn write_blob(db: &Db, bytes: &[u8]) -> AppResult<(String, String)> {
 
 /// Read stored bytes and verify their checksum.
 pub fn read(db: &Db, storage_key: &str, expected_sha256: &str) -> AppResult<Vec<u8>> {
-    let mut buf = Vec::new();
-    std::fs::File::open(path_for(db, storage_key)?)?.read_to_end(&mut buf)?;
+    let mut file = std::fs::File::open(path_for(db, storage_key)?)?;
+    let mut buf = Vec::with_capacity(file.metadata()?.len() as usize);
+    file.read_to_end(&mut buf)?;
     if crate::auth::sha256_hex(&buf) != expected_sha256 {
-        return Err(AppError::internal("Stored file failed its integrity check."));
+        return Err(AppError::internal(
+            "Stored file failed its integrity check.",
+        ));
     }
     Ok(buf)
 }

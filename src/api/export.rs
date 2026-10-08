@@ -18,7 +18,7 @@ use std::{
     io::{Cursor, Seek, SeekFrom, Write},
 };
 use zip::{ZipWriter, write::SimpleFileOptions};
-const CAP: usize = 100 * 1024 * 1024;
+const CAP: usize = 40 * 1024 * 1024;
 pub fn routes() -> Router<AppState> {
     Router::new().route("/cases/{id}/export", post(export))
 }
@@ -31,7 +31,7 @@ fn large() -> AppError {
     AppError::new(
         StatusCode::PAYLOAD_TOO_LARGE,
         "too_large",
-        "The case package exceeds 100 MB.",
+        "The case package exceeds 40 MB.",
     )
 }
 struct LimitedZip(Cursor<Vec<u8>>);
@@ -56,10 +56,15 @@ async fn export(
     Path(id): Path<i64>,
     JsonBody(req): JsonBody<ExportReq>,
 ) -> AppResult<Response> {
+    let permit = std::sync::Arc::new(super::import::heavy_operation()?);
+    let _request_permit = permit.clone();
     let actor = ctx.actor;
     let db = ctx.db.clone();
     ctx.db
-        .write(move |tx| build_package(tx, &actor, &db, id, req))
+        .write(move |tx| {
+            let _permit = permit;
+            build_package(tx, &actor, &db, id, req)
+        })
         .await
 }
 
@@ -102,7 +107,15 @@ fn build_package(
     let (mut total, mut files) = (0usize, vec![]);
     for vid in &ids {
         let (doc, _) = policy::require_version(tx, actor, *vid)?;
-        if doc.case_id != Some(id) || doc.visibility == "judicial_note" {
+        let doc_type: String = tx.query_row(
+            "SELECT doc_type FROM documents WHERE id=?1",
+            [doc.id],
+            |r| r.get(0),
+        )?;
+        if doc.case_id != Some(id)
+            || doc.visibility == "judicial_note"
+            || doc_type == "judicial_note"
+        {
             return Err(AppError::not_found());
         }
         let v = query_one_json(
@@ -170,7 +183,7 @@ fn build_package(
             "participants":query_json(tx,"SELECT cp.id,cp.role,cp.active,cp.service_contact,p.name,p.kind,cp.representative_party_id,cp.representation_basis
                  FROM case_participations cp JOIN parties p ON p.id=cp.party_id WHERE cp.case_id=?1
                  ORDER BY cp.id",[id])?,
-            "hearings":hearings,"decisions":decisions,"relations":relations,"chronology":super::audit_log::case_history(tx,actor,id)?,"files":files});
+            "hearings":hearings,"decisions":decisions,"relations":relations,"chronology":super::audit_log::package_history(tx,actor,id,&ids)?,"files":files});
     let manifest_bytes = serde_json::to_vec_pretty(&manifest)?;
     if manifest_bytes.len() + total > CAP {
         return Err(large());

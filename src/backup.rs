@@ -49,7 +49,9 @@ struct Manifest {
 struct Scratch(PathBuf);
 impl Scratch {
     fn new(parent: &Path) -> AppResult<Self> {
-        let path = parent.join(format!(".tcr-backup-{}", hex::encode(random_bytes::<16>())));
+        Self::at(parent.join(format!(".tcr-backup-{}", hex::encode(random_bytes::<16>()))))
+    }
+    fn at(path: PathBuf) -> AppResult<Self> {
         #[cfg(unix)]
         {
             use std::os::unix::fs::DirBuilderExt;
@@ -418,11 +420,8 @@ pub fn restore(input: &Path, keyfile: &Path, target_dir: &Path) -> AppResult<Str
         return Err(invalid("Restore target must not be a symlink."));
     }
     let cipher = cipher(keyfile)?;
-    let parent = target_dir
-        .parent()
-        .filter(|p| !p.as_os_str().is_empty())
-        .unwrap_or(Path::new("."));
-    let scratch = Scratch::new(parent)?;
+    fs::create_dir_all(target_dir)?;
+    let scratch = Scratch::at(target_dir.join(".restore-tmp"))?;
     let packed = scratch.0.join("backup.zip");
     decrypt(input, &packed, &cipher)?;
     let mut zip = ZipArchive::new(File::open(&packed)?).map_err(zip_err)?;
@@ -527,11 +526,32 @@ pub fn restore(input: &Path, keyfile: &Path, target_dir: &Path) -> AppResult<Str
     verify_blob_rows(&c, &manifest.files)?;
     drop(c);
     drop(zip);
-    // Recheck immediately before publishing; never replace data added during verification.
-    if target_dir.exists() {
-        fs::remove_dir(target_dir)?;
+    // Keep the target itself in place: it may be a mounted volume.
+    for entry in fs::read_dir(target_dir)? {
+        if entry?.path() != scratch.0 {
+            return Err(invalid("Restore target changed during verification."));
+        }
     }
-    fs::rename(&layout, target_dir)?;
+    let mut published = Vec::new();
+    let publish = (|| -> AppResult<()> {
+        for entry in fs::read_dir(&layout)? {
+            let entry = entry?;
+            let dest = target_dir.join(entry.file_name());
+            fs::rename(entry.path(), &dest)?;
+            published.push(dest);
+        }
+        Ok(())
+    })();
+    if let Err(error) = publish {
+        for path in published {
+            if path.is_dir() {
+                fs::remove_dir_all(path)?;
+            } else {
+                fs::remove_file(path)?;
+            }
+        }
+        return Err(error);
+    }
     Ok(format!(
         "Backup restored: {} tables, {} files, {} audit events.",
         manifest.tables.len(),

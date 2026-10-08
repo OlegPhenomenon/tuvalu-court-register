@@ -851,7 +851,12 @@ struct OutcomeReq {
 /// Record the outcome: held (summary, attendance, next step) or not held (mandatory reason, kept
 /// on record). A held hearing never changes the case status. In production an outcome can only be
 /// recorded once the hearing has started; demo mode allows it so visitors can finish the walkthrough.
-async fn outcome(ctx: Ctx, State(state): State<AppState>, Path(id): Path<i64>, JsonBody(req): JsonBody<OutcomeReq>) -> JsonResult {
+async fn outcome(
+    ctx: Ctx,
+    State(state): State<AppState>,
+    Path(id): Path<i64>,
+    JsonBody(req): JsonBody<OutcomeReq>,
+) -> JsonResult {
     let demo = state.is_demo();
     let actor = ctx.actor;
     let v = ctx
@@ -939,8 +944,9 @@ async fn outcome(ctx: Ctx, State(state): State<AppState>, Path(id): Path<i64>, J
                     None,
                     h["judge_user_id"].as_i64(),
                 )?;
-                let over = conflict_gate(tx, &actor, None, &slot, None)?;
-                let nid = insert_hearing(tx, &actor, case_id, &slot, "scheduled", Some(id), over.as_deref(), None)?;
+                let scheduled = actor.has(perm::HEARING_SCHEDULE);
+                let over = if scheduled { conflict_gate(tx, &actor, None, &slot, None)? } else { None };
+                let nid = insert_hearing(tx, &actor, case_id, &slot, if scheduled { "scheduled" } else { "draft" }, Some(id), over.as_deref(), None)?;
                 copy_participants(tx, id, nid)?;
                 next_v = hearing_json(tx, nid)?;
             }
@@ -963,6 +969,9 @@ async fn outcome(ctx: Ctx, State(state): State<AppState>, Path(id): Path<i64>, J
                 ),
             )?;
             let mut out = json!({ "hearing": hearing_json(tx, id)?, "task": task_v, "next_hearing": next_v });
+            if out["next_hearing"]["status"] == "draft" {
+                out["next_hearing_note"] = json!("Next hearing saved as a draft for a scheduler to confirm.");
+            }
             if future && demo {
                 out["demo_note"] = json!("Recorded ahead of the hearing time (demo only)");
             }

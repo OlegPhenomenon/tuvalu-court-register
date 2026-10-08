@@ -359,7 +359,9 @@ async fn outcome_held_with_attendance_task_and_next_hearing() {
         { "party_id": pids[0], "role": "claimant" },
         { "party_id": pids[1], "role": "respondent" },
     ]);
-    let (s, h) = olga.post(&format!("/api/cases/{case_id}/hearings"), body).await;
+    let (s, h) = olga
+        .post(&format!("/api/cases/{case_id}/hearings"), body)
+        .await;
     ok(s, &h);
     let hid = h["id"].as_i64().unwrap();
     let p0 = h["participants"][0]["id"].as_i64().unwrap();
@@ -393,7 +395,10 @@ async fn outcome_held_with_attendance_task_and_next_hearing() {
         .await;
     ok(s, &b);
     // Demo mode permits recording ahead of the hearing time and says so.
-    assert_eq!(b["demo_note"], "Recorded ahead of the hearing time (demo only)");
+    assert_eq!(
+        b["demo_note"],
+        "Recorded ahead of the hearing time (demo only)"
+    );
     let h = &b["hearing"];
     assert_eq!(h["status"], "held");
     assert_eq!(h["outcome_summary"], "Heard both sides; decision reserved.");
@@ -405,9 +410,16 @@ async fn outcome_held_with_attendance_task_and_next_hearing() {
     assert_eq!(b["task"]["kind"], "follow_up");
     assert_eq!(b["task"]["hearing_id"], hid);
     assert_eq!(b["task"]["assignee_name"], "Viktor Hale");
-    assert_eq!(b["next_hearing"]["status"], "scheduled");
+    assert_eq!(b["next_hearing"]["status"], "draft");
+    assert_eq!(
+        b["next_hearing_note"],
+        "Next hearing saved as a draft for a scheduler to confirm."
+    );
     assert_eq!(b["next_hearing"]["previous_hearing_id"], hid);
-    assert_eq!(b["next_hearing"]["participants"].as_array().unwrap().len(), 2);
+    assert_eq!(
+        b["next_hearing"]["participants"].as_array().unwrap().len(),
+        2
+    );
 
     // A held hearing NEVER changes the case status.
     let (_, card) = olga.get(&format!("/api/cases/{case_id}")).await;
@@ -892,6 +904,7 @@ async fn outcome_followups_are_atomic_and_correction_checks_conflicts() {
     let app = TestApp::demo();
     let olga = app.persona("olga").await;
     let (cid, _, judge, room) = seeded_case(&olga, "Outcome rollback").await;
+    grant_perm(&olga, &app, "Viktor", "hearing.schedule").await;
     let viktor = olga.switch("viktor").await;
     let party = party_ids(&olga, cid).await[0];
     let mut body = hearing_body("2026-11-17T09:00", "2026-11-17T10:00", room, true);
@@ -905,9 +918,14 @@ async fn outcome_followups_are_atomic_and_correction_checks_conflicts() {
     let req = json!({"held": true, "outcome_summary": "Decision reserved", "attendance": [{"participant_id": pid, "attended": true}],
         "next_task": {"title": "Draft decision", "assignee_user_id": judge},
         "next_hearing": {"starts_local": "2026-11-19T09:00", "ends_local": "2026-11-19T10:00"}});
-    let (s, b) = viktor.post(&format!("/api/hearings/{id}/outcome"), req).await;
+    let (s, b) = viktor
+        .post(&format!("/api/hearings/{id}/outcome"), req)
+        .await;
     err(s, &b, StatusCode::CONFLICT, "hearing_conflict");
-    assert_eq!(b["error"]["details"]["conflicts"][0]["hearing_id"], blocked["id"]);
+    assert_eq!(
+        b["error"]["details"]["conflicts"][0]["hearing_id"],
+        blocked["id"]
+    );
     assert_eq!(case_counts(&olga, &app, cid), before);
     let (_, unchanged) = olga.get(&format!("/api/hearings/{id}")).await;
     assert_eq!(unchanged, original);
@@ -917,7 +935,9 @@ async fn outcome_followups_are_atomic_and_correction_checks_conflicts() {
         json!({"held": true, "outcome_summary": "x", "attendance": [{"participant_id": 999999, "attended": true}]}),
         json!({"held": true, "outcome_summary": "x", "next_task": {"title": "No access", "assignee_user_id": sergei}}),
     ] {
-        let (s, b) = viktor.post(&format!("/api/hearings/{id}/outcome"), req).await;
+        let (s, b) = viktor
+            .post(&format!("/api/hearings/{id}/outcome"), req)
+            .await;
         err(s, &b, StatusCode::BAD_REQUEST, "validation");
         assert_eq!(case_counts(&olga, &app, cid), before);
     }
@@ -929,15 +949,23 @@ async fn outcome_followups_are_atomic_and_correction_checks_conflicts() {
         .await;
     ok(s, &outcome);
     let held = outcome["hearing"].clone();
-    for req in [json!({"status": "scheduled"}), json!({"status": "draft", "reason": "Wrong record"})] {
-        let (s, b) = viktor.post(&format!("/api/hearings/{id}/correct"), req).await;
+    for req in [
+        json!({"status": "scheduled"}),
+        json!({"status": "draft", "reason": "Wrong record"}),
+    ] {
+        let (s, b) = viktor
+            .post(&format!("/api/hearings/{id}/correct"), req)
+            .await;
         err(s, &b, StatusCode::BAD_REQUEST, "validation");
     }
     let other = scheduled(&olga, cid, "2026-11-17T10:00", "2026-11-17T11:00", room).await;
     olga.db(&app)
         .open()
         .unwrap()
-        .execute("UPDATE settings SET value = '15' WHERE key = 'hearing_buffer_minutes'", [])
+        .execute(
+            "UPDATE settings SET value = '15' WHERE key = 'hearing_buffer_minutes'",
+            [],
+        )
         .unwrap();
     let (s, b) = viktor
         .post(
@@ -963,7 +991,13 @@ async fn outcome_followups_are_atomic_and_correction_checks_conflicts() {
         .await;
     ok(s, &corrected);
     assert_eq!(corrected["status"], "scheduled");
-    for field in ["starts_at", "ends_at", "outcome_summary", "outcome_recorded_at", "participants"] {
+    for field in [
+        "starts_at",
+        "ends_at",
+        "outcome_summary",
+        "outcome_recorded_at",
+        "participants",
+    ] {
         assert_eq!(corrected[field], held[field], "correction changed {field}");
     }
     let conn = olga.db(&app).open().unwrap();
@@ -1407,4 +1441,51 @@ async fn intake_tasks_require_intake_permission_and_orphan_tasks_are_hidden() {
     let (s, b) = olga.post(&format!("/api/tasks/{id}/complete"), json!({"result": "Checked"})).await;
     ok(s, &b);
     assert_eq!(b["status"], "done");
+}
+
+#[tokio::test]
+async fn continuation_requires_scheduler_confirmation_and_scheduled_outcome_checks_conflicts() {
+    let app = TestApp::demo();
+    let olga = app.persona("olga").await;
+    let (cid, _, _, room) = seeded_case(&olga, "Continuation permissions").await;
+    let h = scheduled(&olga, cid, "2026-11-19T09:00", "2026-11-19T10:00", room).await;
+    let blocked = scheduled(&olga, cid, "2026-11-20T09:00", "2026-11-20T10:00", room).await;
+    let viktor = olga.switch("viktor").await;
+    let body = json!({"held":true,"outcome_summary":"Continue later","next_hearing":{"starts_local":"2026-11-20T09:00","ends_local":"2026-11-20T10:00"}});
+    let (s, b) = viktor
+        .post(&format!("/api/hearings/{}/outcome", h["id"]), body.clone())
+        .await;
+    ok(s, &b);
+    assert_eq!(b["next_hearing"]["status"], "draft");
+    let nid = b["next_hearing"]["id"].as_i64().unwrap();
+    let (s, b) = olga
+        .post(&format!("/api/hearings/{nid}/confirm"), json!({}))
+        .await;
+    err(s, &b, StatusCode::CONFLICT, "hearing_conflict");
+    let (s, b) = olga
+        .post(
+            &format!("/api/hearings/{}/cancel", blocked["id"]),
+            json!({"reason":"Rescheduled"}),
+        )
+        .await;
+    ok(s, &b);
+    let (s, b) = olga
+        .post(&format!("/api/hearings/{nid}/confirm"), json!({}))
+        .await;
+    ok(s, &b);
+    assert_eq!(b["status"], "scheduled");
+    grant_perm(&olga, &app, "Viktor", "hearing.schedule").await;
+    let blocked = scheduled(&olga, cid, "2026-11-21T09:00", "2026-11-21T10:00", room).await;
+    let request = json!({"held":true,"outcome_summary":"Continue again","next_hearing":{"starts_local":"2026-11-21T09:00","ends_local":"2026-11-21T10:00"}});
+    let (s, b) = viktor
+        .post(&format!("/api/hearings/{nid}/outcome"), request)
+        .await;
+    err(s, &b, StatusCode::CONFLICT, "hearing_conflict");
+    let (_, h) = olga.get(&format!("/api/hearings/{nid}")).await;
+    assert_eq!(h["status"], "scheduled");
+    let (s,b)=viktor.post(&format!("/api/hearings/{nid}/outcome"),json!({"held":true,"outcome_summary":"Continue again","next_hearing":{"starts_local":"2026-11-22T09:00","ends_local":"2026-11-22T10:00"}})).await;
+    ok(s, &b);
+    assert_eq!(b["next_hearing"]["status"], "scheduled");
+    assert!(b["next_hearing_note"].is_null());
+    assert_eq!(blocked["status"], "scheduled");
 }

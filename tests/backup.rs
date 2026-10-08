@@ -105,7 +105,18 @@ fn encrypted_backup_restore_checks_all_data_and_failure_paths() {
     assert!(!app.dir.join("encrypted.tcrb.tmp").exists());
     let target = app.dir.join("restored");
     std::fs::create_dir(&target).unwrap();
+    #[cfg(unix)]
+    let target_inode = {
+        use std::os::unix::fs::MetadataExt;
+        std::fs::metadata(&target).unwrap().ino()
+    };
     let summary = backup::restore(&out, &keyfile, &target).unwrap();
+    assert!(!target.join(".restore-tmp").exists());
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::MetadataExt;
+        assert_eq!(std::fs::metadata(&target).unwrap().ino(), target_inode);
+    }
     assert!(summary.contains("3 files"));
     let restored = Db::new(target.join("court.sqlite"), target.join("files"), None);
     assert_eq!(counts(db), counts(&restored));

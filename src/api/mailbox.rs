@@ -2,7 +2,7 @@
 //! independently checks current document access on every request.
 use super::common::{JsonResult, query_json, query_one_json};
 use super::dispatch::dispatch_visible_sql;
-use crate::auth::Ctx;
+use crate::auth::{Actor, Ctx};
 use crate::error::AppResult;
 use crate::state::AppState;
 use axum::extract::{Path, Query};
@@ -23,8 +23,9 @@ const MAILBOX_SQL: &str = "SELECT m.id, m.dispatch_id, c.number AS case_number, 
     FROM mailbox m JOIN dispatches d ON d.id = m.dispatch_id
     LEFT JOIN cases c ON c.id = d.case_id LEFT JOIN intakes i ON i.id = d.intake_id";
 
-fn message(mut value: Value) -> AppResult<Value> {
+fn message(c: &rusqlite::Connection, actor: &Actor, mut value: Value) -> AppResult<Value> {
     value["attachments"] = serde_json::from_str(value["attachments"].as_str().unwrap_or("[]"))?;
+    super::dispatch::redact_items(c, actor, &mut value, "attachments")?;
     Ok(value)
 }
 
@@ -37,7 +38,7 @@ async fn list(ctx: Ctx, Query(q): Query<ListQuery>) -> JsonResult {
     let actor = ctx.actor;
     let v = ctx.db.read(move |c| {
         let sql = format!("{MAILBOX_SQL} WHERE {} AND (?1 IS NULL OR m.dispatch_id = ?1) ORDER BY m.delivered_at DESC, m.id DESC", dispatch_visible_sql(&actor));
-        let items = query_json(c, &sql, params![q.dispatch_id])?.into_iter().map(message).collect::<AppResult<Vec<_>>>()?;
+        let items = query_json(c, &sql, params![q.dispatch_id])?.into_iter().map(|v| message(c, &actor, v)).collect::<AppResult<Vec<_>>>()?;
         Ok(json!({"items": items}))
     }).await?;
     Ok(Json(v))
@@ -52,7 +53,7 @@ async fn detail(ctx: Ctx, Path(id): Path<i64>) -> JsonResult {
                 "{MAILBOX_SQL} WHERE m.id = ?1 AND {}",
                 dispatch_visible_sql(&actor)
             );
-            message(query_one_json(c, &sql, [id])?)
+            message(c, &actor, query_one_json(c, &sql, [id])?)
         })
         .await?;
     Ok(Json(v))

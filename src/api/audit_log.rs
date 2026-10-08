@@ -56,7 +56,26 @@ fn event_json(c: &Connection, actor: &Actor, ev: &Value, with_details: bool) -> 
     let entity_type = ev["entity_type"].as_str().unwrap_or_default();
     let entity_id = ev["entity_id"].as_i64();
     let action = ev["action"].as_str().unwrap_or_default();
-    let hidden = touches_hidden_document(c, actor, entity_type, entity_id, action)?;
+    let details: Value = serde_json::from_str(ev["details"].as_str().unwrap_or("{}"))?;
+    let hidden_relation = if action == "case.related" {
+        if let Some(other) = details["related_case_id"].as_i64() {
+            policy::require_case(c, actor, other).is_err()
+        } else {
+            // Old events have no counterpart id: redact if any related case is hidden.
+            let sql = format!(
+                "SELECT COUNT(*) FROM case_relations r WHERE (r.from_case_id=?1 OR r.to_case_id=?1) AND NOT ({})",
+                policy::case_visible_sql(
+                    actor,
+                    "CASE WHEN r.from_case_id=?1 THEN r.to_case_id ELSE r.from_case_id END"
+                )
+            );
+            c.query_row(&sql, [entity_id], |r| r.get::<_, i64>(0))? > 0
+        }
+    } else {
+        false
+    };
+    let hidden =
+        hidden_relation || touches_hidden_document(c, actor, entity_type, entity_id, action)?;
     let mut out = json!({
         "id": ev["id"],
         "at": ev["at"],
@@ -64,7 +83,7 @@ fn event_json(c: &Connection, actor: &Actor, ev: &Value, with_details: bool) -> 
         "user_id": ev["user_id"],
         "user_name": ev["user_name"],
         "action": ev["action"],
-        "summary": if hidden { REDACTED } else { ev["summary"].as_str().unwrap_or_default() },
+        "summary": if hidden_relation { "Activity on a case you do not have access to" } else if hidden { REDACTED } else { ev["summary"].as_str().unwrap_or_default() },
     });
     if with_details {
         out["entity_type"] = ev["entity_type"].clone();
@@ -81,10 +100,33 @@ fn event_json(c: &Connection, actor: &Actor, ev: &Value, with_details: bool) -> 
 /// Audit events of one case, oldest first, redacted for the given actor.
 /// Shared with the case export (chronology section).
 pub fn case_history(c: &Connection, actor: &Actor, case_id: i64) -> AppResult<Vec<Value>> {
+    history(c, actor, case_id, None)
+}
+
+/// Participant chronology excludes private notes and restricted material outside this package.
+pub(super) fn package_history(
+    c: &Connection,
+    actor: &Actor,
+    case_id: i64,
+    ids: &[i64],
+) -> AppResult<Vec<Value>> {
+    history(c, actor, case_id, Some(ids))
+}
+
+fn history(
+    c: &Connection,
+    actor: &Actor,
+    case_id: i64,
+    package_ids: Option<&[i64]>,
+) -> AppResult<Vec<Value>> {
     policy::require_case(c, actor, case_id)?;
+    let included_documents: std::collections::BTreeSet<i64> = match package_ids {
+        Some(ids) => query_json(c, "SELECT DISTINCT document_id FROM document_versions WHERE id IN (SELECT value FROM json_each(?1))", [serde_json::to_string(ids)?])?.iter().filter_map(|v| v["document_id"].as_i64()).collect(),
+        None => Default::default(),
+    };
     let rows = query_json(
         c,
-        "SELECT a.id, a.at, a.user_id, u.display_name AS user_name, a.action, a.entity_type, a.entity_id, a.summary
+        "SELECT a.id, a.at, a.user_id, u.display_name AS user_name, a.action, a.entity_type, a.entity_id, a.summary, a.details
          FROM audit_events a LEFT JOIN users u ON u.id = a.user_id
          WHERE a.case_id = ?1
             OR (a.entity_type = 'case' AND a.entity_id = ?1)
@@ -97,9 +139,50 @@ pub fn case_history(c: &Connection, actor: &Actor, case_id: i64) -> AppResult<Ve
          ORDER BY a.id",
         [case_id],
     )?;
-    rows.iter()
-        .map(|ev| event_json(c, actor, ev, false))
-        .collect()
+    let mut events = Vec::with_capacity(rows.len());
+    for ev in &rows {
+        if let Some(ids) = package_ids {
+            let entity = ev["entity_type"].as_str().unwrap_or_default();
+            if matches!(entity, "document" | "document_version") {
+                let did = if entity == "document_version" {
+                    c.query_row(
+                        "SELECT document_id FROM document_versions WHERE id=?1",
+                        [ev["entity_id"].as_i64()],
+                        |r| r.get::<_, i64>(0),
+                    )?
+                } else {
+                    ev["entity_id"].as_i64().unwrap_or_default()
+                };
+                let (visibility, doc_type): (String, String) = c.query_row(
+                    "SELECT visibility, doc_type FROM documents WHERE id=?1",
+                    [did],
+                    |r| Ok((r.get(0)?, r.get(1)?)),
+                )?;
+                if visibility == "judicial_note" || doc_type == "judicial_note" {
+                    continue;
+                }
+                if visibility == "restricted" {
+                    let details: Value =
+                        serde_json::from_str(ev["details"].as_str().unwrap_or("{}"))?;
+                    let version_id = if entity == "document_version" {
+                        ev["entity_id"].as_i64()
+                    } else {
+                        details["version_id"].as_i64()
+                    };
+                    let included = if let Some(vid) = version_id {
+                        ids.contains(&vid)
+                    } else {
+                        included_documents.contains(&did)
+                    };
+                    if !included {
+                        continue;
+                    }
+                }
+            }
+        }
+        events.push(event_json(c, actor, ev, false)?);
+    }
+    Ok(events)
 }
 
 async fn case_history_handler(ctx: Ctx, Path(id): Path<i64>) -> JsonResult {

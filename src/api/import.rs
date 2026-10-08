@@ -21,9 +21,19 @@ use serde_json::{Value, json};
 use std::{
     collections::{BTreeMap, BTreeSet},
     io::{Cursor, Read},
+    sync::{Arc, LazyLock},
 };
 
 const MB: usize = 1024 * 1024;
+static HEAVY_OPERATION: LazyLock<Arc<tokio::sync::Semaphore>> =
+    LazyLock::new(|| Arc::new(tokio::sync::Semaphore::new(1)));
+
+pub(super) fn heavy_operation() -> AppResult<tokio::sync::OwnedSemaphorePermit> {
+    HEAVY_OPERATION
+        .clone()
+        .try_acquire_owned()
+        .map_err(|_| AppError::new(StatusCode::SERVICE_UNAVAILABLE, "busy", "busy, try again"))
+}
 pub fn routes() -> Router<AppState> {
     Router::new()
         .route("/import", get(list))
@@ -35,7 +45,7 @@ pub fn routes() -> Router<AppState> {
         )
         .route(
             "/import/files/preview",
-            post(preview_files).layer(DefaultBodyLimit::max(51 * MB)),
+            post(preview_files).layer(DefaultBodyLimit::max(21 * MB)),
         )
 }
 fn invalid(s: impl Into<String>) -> AppError {
@@ -108,6 +118,9 @@ struct FileRow {
     document_date: String,
 }
 fn csv_rows<T: for<'a> Deserialize<'a>>(bytes: &[u8], headers: &[&str]) -> AppResult<Vec<T>> {
+    if bytes.len() > 5 * MB {
+        return Err(too_large());
+    }
     std::str::from_utf8(bytes).map_err(|_| invalid("The CSV must be UTF-8."))?;
     let mut r = csv::ReaderBuilder::new()
         .trim(csv::Trim::All)
@@ -257,6 +270,9 @@ fn case_preview(
             }
         }
         if r.status == "closed" {
+            if r.closed_date.is_empty() {
+                problems.push("Closed date is required for a closed case.".into());
+            }
             for (key, value) in [
                 ("closed_date", &r.closed_date),
                 ("closure_basis", &r.closure_basis),
@@ -420,8 +436,8 @@ fn unpack(bytes: &[u8]) -> AppResult<BTreeMap<String, Vec<u8>>> {
             return Err(invalid("Unsafe or duplicate archive path."));
         }
         total = total.checked_add(f.size()).ok_or_else(too_large)?;
-        if f.size() > 20 * MB as u64
-            || total > 100 * MB as u64
+        if f.size() > 15 * MB as u64
+            || total > 40 * MB as u64
             || f.size() > f.compressed_size().saturating_mul(100)
         {
             return Err(too_large());
@@ -441,8 +457,11 @@ fn unpack(bytes: &[u8]) -> AppResult<BTreeMap<String, Vec<u8>>> {
         }
         let n = f.name().to_string();
         let expected = f.size();
-        let mut data = Vec::new();
-        (&mut f).take(20 * MB as u64 + 1).read_to_end(&mut data)?;
+        let mut data = Vec::with_capacity(expected as usize);
+        (&mut f)
+            .take(15 * MB as u64 + 1)
+            .read_to_end(&mut data)
+            .map_err(|_| invalid("Invalid ZIP entry."))?;
         if data.len() as u64 != expected {
             return Err(invalid("Invalid archive size."));
         }
@@ -538,6 +557,14 @@ fn files_preview(
         ) {
             problems.push("Unknown visibility.".into());
         }
+        if r.visibility == "judicial_note" || r.doc_type == "judicial_note" {
+            if !actor.is_judge {
+                problems.push("Only judges can import judicial notes.".into());
+            }
+            if (r.visibility == "judicial_note") != (r.doc_type == "judicial_note") {
+                problems.push("Judicial-note type and visibility must agree.".into());
+            }
+        }
         if r.title.is_empty() {
             problems.push("Title is required.".into());
         }
@@ -555,7 +582,14 @@ fn files_preview(
         if counts[&r.filename] > 1 {
             problems.push("Duplicate file in manifest.".into());
         }
-        rows.push(json!({"row":i+2,"case_number":r.case_number,"filename":r.filename,"title":r.title,"action":if problems.is_empty(){"create"}else{"error"},"problems":problems,"missing":if r.document_date.is_empty(){vec!["document_date"]}else{vec![]}}));
+        let existing = if problems.is_empty() {
+            let cid = matching_case(c, actor, &r.case_number)?;
+            let sha = crate::auth::sha256_hex(&files[&r.filename]);
+            c.query_row("SELECT EXISTS(SELECT 1 FROM document_versions v JOIN documents d ON d.id=v.document_id WHERE d.case_id=?1 AND v.sha256=?2)", params![cid,sha], |r| r.get::<_, bool>(0))?
+        } else {
+            false
+        };
+        rows.push(json!({"row":i+2,"case_number":r.case_number,"filename":r.filename,"title":r.title,"action":if !problems.is_empty(){"error"}else if existing{"skip_existing"}else{"create"},"problems":problems,"missing":if r.document_date.is_empty(){vec!["document_date"]}else{vec![]}}));
     }
     Ok(preview_value(rows))
 }
@@ -567,19 +601,33 @@ async fn preview_files(ctx: Ctx, mp: Multipart) -> JsonResult {
 }
 async fn preview(ctx: Ctx, mp: Multipart, is_zip: bool) -> JsonResult {
     ctx.actor.require(perm::IMPORT_RUN)?;
-    let (filename, bytes, registry) = upload(mp, if is_zip { 50 * MB } else { 5 * MB }).await?;
+    let permit = Arc::new(heavy_operation()?);
+    let _request_permit = permit.clone();
+    let (filename, bytes, registry) = upload(mp, if is_zip { 20 * MB } else { 5 * MB }).await?;
     let actor = ctx.actor;
     let db = ctx.db.clone();
-    let v=ctx.db.write(move |tx| {
+    let written = Arc::new(parking_lot::Mutex::new(Vec::new()));
+    let keys = written.clone();
+    let result=ctx.db.write(move |tx| {
+        let _permit = permit;
         let mut v=if is_zip { let files=unpack(&bytes)?; files_preview(tx,&actor,&file_rows(&files)?,&files)? } else { case_preview(tx,&actor,&cases_rows(&bytes)?,registry)? };
+        if let Some(quota) = db.quota_bytes() {
+            if storage::used_bytes(tx)?.saturating_add(bytes.len() as u64) > quota { return Err(too_large()); }
+        }
         let (key,sha)=storage::write_blob(&db,&bytes)?;
+        keys.lock().push(key.clone());
         tx.execute("INSERT INTO import_batches(kind,filename,source_sha256,storage_key,status,preview_json,created_by,created_at,source_options)
-                 VALUES(?1,?2,?3,?4,'previewed',?5,?6,?7,?8)",params![if is_zip{"files_zip"}else{"cases_csv"},filename,sha,key,v.to_string(),actor.user_id,crate::time::now_utc(),json!({"registry_id":registry}).to_string()])?;
+                 VALUES(?1,?2,?3,?4,'previewed',?5,?6,?7,?8)",params![if is_zip{"files_zip"}else{"cases_csv"},filename,sha,key,v.to_string(),actor.user_id,crate::time::now_utc(),json!({"registry_id":registry,"size_bytes":bytes.len()}).to_string()])?;
         let id=tx.last_insert_rowid();
         audit::record(tx,Some(&actor),Event::new("import.previewed","import_batch",id,"Legacy import previewed"))?;
         v["batch_id"]=json!(id); Ok(v)
-    }).await?;
-    Ok(Json(v))
+    }).await;
+    if result.is_err() {
+        for key in written.lock().iter() {
+            storage::discard(&ctx.db, key);
+        }
+    }
+    Ok(Json(result?))
 }
 async fn list(ctx: Ctx) -> JsonResult {
     ctx.actor.require(perm::IMPORT_RUN)?;
@@ -616,22 +664,39 @@ fn text<'a>(b: &'a Value, key: &str) -> &'a str {
 }
 async fn commit(ctx: Ctx, Path(id): Path<i64>, IdemKey(key): IdemKey) -> JsonResult {
     ctx.actor.require(perm::IMPORT_RUN)?;
+    let permit = Arc::new(heavy_operation()?);
+    let _request_permit = permit.clone();
+    let written = Arc::new(parking_lot::Mutex::new(Vec::new()));
+    let keys = written.clone();
     let actor = ctx.actor;
     let db = ctx.db.clone();
     let value = ctx
         .db
         .write(move |tx| {
+            let _permit = permit;
             // Re-authorize the batch and its cases even when replaying a stored result.
             let b = batch(tx, &actor, id)?;
             idempotent(tx, &actor, &key, "import.commit", &id, || {
-                commit_rows(tx, &actor, &db, id, &b)
+                commit_rows(tx, &actor, &db, id, &b, &mut keys.lock())
             })
         })
-        .await?;
-    Ok(Json(value))
+        .await;
+    if value.is_err() {
+        for key in written.lock().iter() {
+            storage::discard(&ctx.db, key);
+        }
+    }
+    Ok(Json(value?))
 }
 
-fn commit_rows(tx: &Transaction, actor: &Actor, db: &Db, id: i64, b: &Value) -> AppResult<Value> {
+fn commit_rows(
+    tx: &Transaction,
+    actor: &Actor,
+    db: &Db,
+    id: i64,
+    b: &Value,
+    written: &mut Vec<String>,
+) -> AppResult<Value> {
     if b["status"] != "previewed" {
         return Err(AppError::invalid_transition(
             "This batch has already been committed.",
@@ -640,6 +705,7 @@ fn commit_rows(tx: &Transaction, actor: &Actor, db: &Db, id: i64, b: &Value) -> 
     let bytes = storage::read(db, text(b, "storage_key"), text(b, "source_sha256"))?;
     let old: Value = serde_json::from_str(text(b, "preview_json"))?;
     let mut created = vec![];
+    let mut skipped = old["summary"]["skip_existing"].as_u64().unwrap_or_default();
     let now = crate::time::now_utc();
     if b["kind"] == "cases_csv" {
         let options: Value = serde_json::from_str(text(b, "source_options"))?;
@@ -717,12 +783,15 @@ fn commit_rows(tx: &Transaction, actor: &Actor, db: &Db, id: i64, b: &Value) -> 
         let files = unpack(&bytes)?;
         let input = file_rows(&files)?;
         let current = files_preview(tx, actor, &input, &files)?;
-        let mut written = vec![];
-        let result = (|| -> AppResult<()> {
+        {
             let mut added_bytes = 0u64;
             let used = storage::used_bytes(tx)?;
             for (i, r) in input.iter().enumerate() {
                 if old["rows"][i]["action"] != "create" {
+                    continue;
+                }
+                if current["rows"][i]["action"] == "skip_existing" {
+                    skipped += 1;
                     continue;
                 }
                 if current["rows"][i]["action"] != "create" {
@@ -736,11 +805,16 @@ fn commit_rows(tx: &Transaction, actor: &Actor, db: &Db, id: i64, b: &Value) -> 
                 let data = files
                     .get(&r.filename)
                     .ok_or_else(|| invalid("Missing file."))?;
+                let existing: bool = tx.query_row("SELECT EXISTS(SELECT 1 FROM document_versions v JOIN documents d ON d.id=v.document_id WHERE d.case_id=?1 AND v.sha256=?2)", params![cid,crate::auth::sha256_hex(data)], |r| r.get(0))?;
+                if existing {
+                    skipped += 1;
+                    continue;
+                }
                 added_bytes += data.len() as u64;
                 if db.quota_bytes().is_some_and(|q| used + added_bytes > q) {
                     return Err(too_large());
                 }
-                let f = storage::store(db, data, &r.filename, 20 * MB as u64)?;
+                let f = storage::store(db, data, &r.filename, 15 * MB as u64)?;
                 written.push(f.storage_key.clone());
                 tx.execute("INSERT INTO documents(case_id,title,doc_type,source,visibility,document_date,created_by,created_at)
                  VALUES(?1,?2,?3,'external',?4,?5,?6,?7)",params![cid,r.title,r.doc_type,r.visibility,(!r.document_date.is_empty()).then_some(&r.document_date),actor.user_id,now])?;
@@ -762,16 +836,9 @@ fn commit_rows(tx: &Transaction, actor: &Actor, db: &Db, id: i64, b: &Value) -> 
                 )?;
                 created.push(json!({"case_id":cid,"document_id":did,"version_id":vid}));
             }
-            Ok(())
-        })();
-        if result.is_err() {
-            for k in written {
-                let _ = std::fs::remove_file(db.files_dir().join(k));
-            }
         }
-        result?;
     }
-    let result = json!({"batch_id":id,"status":"committed","created":created,"summary":{"created":created.len(),"skip_existing":old["summary"]["skip_existing"],"error":old["summary"]["error"]}});
+    let result = json!({"batch_id":id,"status":"committed","created":created,"summary":{"created":created.len(),"skip_existing":skipped,"error":old["summary"]["error"]}});
     tx.execute("UPDATE import_batches SET status='committed',result_json=?2,committed_by=?3,committed_at=?4 WHERE id=?1",params![id,result.to_string(),actor.user_id,now])?;
     audit::record(
         tx,

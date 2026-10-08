@@ -8,6 +8,9 @@ use rusqlite::params;
 use serde_json::{Value, json};
 use std::io::{Cursor, Read, Write};
 use zip::write::SimpleFileOptions;
+// Each test owns the process-wide heavy-operation slot; concurrency is tested within a test.
+static IMPORT_EXPORT_TEST: std::sync::LazyLock<tokio::sync::Mutex<()>> =
+    std::sync::LazyLock::new(|| tokio::sync::Mutex::new(()));
 const HEADER: &str = "number,category,title,registered_date,status,responsible_username,closed_date,closure_basis,parties\n";
 fn zip_entries(entries: &[(&str, &[u8])]) -> Vec<u8> {
     let mut z = zip::ZipWriter::new(Cursor::new(Vec::new()));
@@ -43,6 +46,7 @@ async fn package(client: &Client, id: i64, body: Value) -> (StatusCode, Value, V
 }
 #[tokio::test]
 async fn csv_preview_commit_history_idempotency_and_numbering() {
+    let _test_guard = IMPORT_EXPORT_TEST.lock().await;
     let app = TestApp::demo();
     let olga = app.persona("olga").await;
     let (_, existing) = register_case(&olga, "Existing case").await;
@@ -57,7 +61,7 @@ async fn csv_preview_commit_history_idempotency_and_numbering() {
     let year = &today()[..4];
     let number = format!("DEMO-CIV-{year}-0040");
     let csv = format!(
-        "{HEADER}{existing},civil_contract,Existing,2000-01-01,registered,,,,\nDUP,civil_contract,Duplicate,2000-01-01,registered,,,,\nDUP,civil_contract,Duplicate,2000-01-01,registered,,,,\nBAD,civil_contract,Bad date,nonsense,registered,,,,\n{number},civil_contract,Historical,2001-04-03,closed,{username},,,Legacy Person (claimant)\n"
+        "{HEADER}{existing},civil_contract,Existing,2000-01-01,registered,,,,\nDUP,civil_contract,Duplicate,2000-01-01,registered,,,,\nDUP,civil_contract,Duplicate,2000-01-01,registered,,,,\nBAD,civil_contract,Bad date,nonsense,registered,,,,\n{number},civil_contract,Historical,2001-04-03,closed,{username},2001-04-04,,Legacy Person (claimant)\n"
     );
     let reg: i64 = c
         .query_row(
@@ -90,10 +94,7 @@ async fn csv_preview_commit_history_idempotency_and_numbering() {
             .to_string()
             .contains("Invalid date")
     );
-    assert_eq!(
-        preview["rows"][4]["missing"],
-        json!(["closed_date", "closure_basis"])
-    );
+    assert_eq!(preview["rows"][4]["missing"], json!(["closure_basis"]));
     let id = preview["batch_id"].as_i64().unwrap();
     let key: String = c
         .query_row(
@@ -113,7 +114,7 @@ async fn csv_preview_commit_history_idempotency_and_numbering() {
     let (date,incomplete,closed,basis):(String,i64,Option<String>,Option<String>)=c.query_row("SELECT registered_date,historical_incomplete,closed_date,closure_basis FROM cases WHERE id=?1",[cid],|r|Ok((r.get(0)?,r.get(1)?,r.get(2)?,r.get(3)?))).unwrap();
     assert_eq!(date, "2001-04-03");
     assert_eq!(incomplete, 1);
-    assert_eq!(closed, None);
+    assert_eq!(closed.as_deref(), Some("2001-04-04"));
     assert_eq!(basis, None);
     let (_, replayed) = elena.post_idem(&path, "commit-legacy", json!({})).await;
     assert_eq!(result, replayed);
@@ -133,7 +134,7 @@ async fn csv_preview_commit_history_idempotency_and_numbering() {
             .any(|b| b["id"] == id)
     );
     let clean = format!(
-        "{HEADER}{number},civil_contract,Historical,2001-04-03,closed,{username},,,Legacy Person (claimant)\n{existing},civil_contract,Existing,2000-01-01,registered,,,,\n"
+        "{HEADER}{number},civil_contract,Historical,2001-04-03,closed,{username},2001-04-04,,Legacy Person (claimant)\n{existing},civil_contract,Existing,2000-01-01,registered,,,,\n"
     );
     let (s, p) = elena
         .upload(
@@ -188,6 +189,7 @@ async fn csv_preview_commit_history_idempotency_and_numbering() {
 }
 #[tokio::test]
 async fn legacy_numbers_dates_and_validation() {
+    let _test_guard = IMPORT_EXPORT_TEST.lock().await;
     let app = TestApp::demo();
     let client = app.persona("elena").await;
     let db = client.db(&app);
@@ -298,6 +300,7 @@ async fn legacy_numbers_dates_and_validation() {
 }
 #[tokio::test]
 async fn zip_import_safety_policy_and_commit() {
+    let _test_guard = IMPORT_EXPORT_TEST.lock().await;
     let app = TestApp::demo();
     let olga = app.persona("olga").await;
     let (cid, number) = register_case(&olga, "File import").await;
@@ -411,6 +414,7 @@ async fn zip_import_safety_policy_and_commit() {
 }
 #[tokio::test]
 async fn export_only_permitted_versions_and_checksums() {
+    let _test_guard = IMPORT_EXPORT_TEST.lock().await;
     let app = TestApp::demo();
     let olga = app.persona("olga").await;
     let (cid, _) = register_case(&olga, "Exportable").await;
@@ -541,6 +545,7 @@ async fn export_only_permitted_versions_and_checksums() {
 
 #[tokio::test]
 async fn commits_serialize_and_recheck_case_access() {
+    let _test_guard = IMPORT_EXPORT_TEST.lock().await;
     let app = TestApp::demo();
     let olga = app.persona("olga").await;
     let (cid, number) = register_case(&olga, "Import access").await;
@@ -560,9 +565,21 @@ async fn commits_serialize_and_recheck_case_access() {
         elena.post_idem(&path, "same-import", json!({})),
         elena.post_idem(&path, "same-import", json!({}))
     );
-    ok(a.0, &a.1);
-    ok(b.0, &b.1);
-    assert_eq!(a.1, b.1);
+    let (success, busy) = if a.0 == StatusCode::OK {
+        (a, b)
+    } else {
+        (b, a)
+    };
+    ok(success.0, &success.1);
+    if busy.0 == StatusCode::SERVICE_UNAVAILABLE {
+        err(busy.0, &busy.1, StatusCode::SERVICE_UNAVAILABLE, "busy");
+    } else {
+        ok(busy.0, &busy.1);
+        assert_eq!(success.1, busy.1);
+    }
+    let retry = elena.post_idem(&path, "same-import", json!({})).await;
+    ok(retry.0, &retry.1);
+    assert_eq!(success.1, retry.1);
     let db = elena.db(&app);
     let c = db.open().unwrap();
     assert_eq!(
@@ -619,6 +636,7 @@ async fn commits_serialize_and_recheck_case_access() {
 
 #[tokio::test]
 async fn export_manifest_preserves_versions_times_relations_and_redacted_history() {
+    let _test_guard = IMPORT_EXPORT_TEST.lock().await;
     let app = TestApp::demo();
     let olga = app.persona("olga").await;
     let (cid, _) = register_case(&olga, "Manifest").await;
@@ -654,7 +672,13 @@ async fn export_manifest_preserves_versions_times_relations_and_redacted_history
         uid,
     );
     for other in [visible, hidden] {
-        c.execute("INSERT INTO case_relations(from_case_id,to_case_id,kind,created_at) VALUES(?1,?2,'related',?3)",params![cid,other,now]).unwrap();
+        let (s, b) = olga
+            .post(
+                &format!("/api/cases/{cid}/relations"),
+                json!({"to_case_id":other,"kind":"related"}),
+            )
+            .await;
+        ok(s, &b);
     }
     let local = format!("{}T09:00", today());
     let start = tuvalu_court::time::local_to_utc(&local).unwrap();
@@ -708,7 +732,7 @@ async fn export_manifest_preserves_versions_times_relations_and_redacted_history
             .as_array()
             .unwrap()
             .iter()
-            .any(|e| e["summary"] == "Activity on a document you do not have access to")
+            .all(|e| e["action"] != "document.created")
     );
     assert_eq!(
         package(
@@ -724,6 +748,7 @@ async fn export_manifest_preserves_versions_times_relations_and_redacted_history
 
 #[tokio::test]
 async fn zip_symlinks_duplicates_and_declared_expansion_limits_are_rejected() {
+    let _test_guard = IMPORT_EXPORT_TEST.lock().await;
     let app = TestApp::demo();
     let elena = app.persona("elena").await;
     let mut writer = zip::ZipWriter::new(Cursor::new(Vec::new()));
@@ -765,11 +790,11 @@ async fn zip_symlinks_duplicates_and_declared_expansion_limits_are_rejected() {
         ("f.pdf", b"f"),
     ]);
     // The central directory is examined before any contents are decompressed. Forge plausible
-    // per-entry metadata whose aggregate exceeds 100 MiB, without a large test allocation.
+    // per-entry metadata whose aggregate exceeds 40 MiB, without a large test allocation.
     for i in 0..expanded.len() - 46 {
         if &expanded[i..i + 4] == b"PK\x01\x02" {
             expanded[i + 20..i + 24].copy_from_slice(&(1024 * 1024u32).to_le_bytes());
-            expanded[i + 24..i + 28].copy_from_slice(&(20 * 1024 * 1024u32).to_le_bytes());
+            expanded[i + 24..i + 28].copy_from_slice(&(14 * 1024 * 1024u32).to_le_bytes());
         }
     }
     assert_eq!(
@@ -779,4 +804,467 @@ async fn zip_symlinks_duplicates_and_declared_expansion_limits_are_rejected() {
             .0,
         StatusCode::PAYLOAD_TOO_LARGE
     );
+}
+
+fn stored_keys(db: &tuvalu_court::db::Db) -> Vec<std::path::PathBuf> {
+    fn visit(dir: &std::path::Path, keys: &mut Vec<std::path::PathBuf>) {
+        for entry in std::fs::read_dir(dir).unwrap() {
+            let path = entry.unwrap().path();
+            if path.is_dir() {
+                visit(&path, keys);
+            } else {
+                keys.push(path);
+            }
+        }
+    }
+    let mut keys = vec![];
+    visit(db.files_dir(), &mut keys);
+    keys.sort();
+    keys
+}
+
+#[tokio::test]
+async fn import_notes_require_judge_and_matching_visibility_and_closed_rows_require_dates() {
+    let _test_guard = IMPORT_EXPORT_TEST.lock().await;
+    let app = TestApp::demo();
+    let olga = app.persona("olga").await;
+    let (cid, number) = register_case(&olga, "Import validation").await;
+    let elena = olga.switch("elena").await;
+    let db = olga.db(&app);
+    let uid = user_id(&olga, "Viktor").await;
+    let c = db.open().unwrap();
+    c.execute("INSERT INTO case_assignments(case_id,user_id,role,reason,start_at) VALUES(?1,?2,'judge','Import notes',?3)",params![cid,uid,tuvalu_court::time::now_utc()]).unwrap();
+    c.execute(
+        "INSERT INTO user_permissions(user_id,permission,granted_at) VALUES(?1,'import.run',?2)",
+        params![uid, tuvalu_court::time::now_utc()],
+    )
+    .unwrap();
+    let viktor = olga.switch("viktor").await;
+    for (doc_type, visibility) in [
+        ("judicial_note", "judicial_note"),
+        ("evidence", "judicial_note"),
+        ("judicial_note", "administrative"),
+    ] {
+        let manifest = format!(
+            "case_number,filename,title,doc_type,visibility,document_date\n{number},note.pdf,Working note,{doc_type},{visibility},\n"
+        );
+        let data = pdf("Private note");
+        let z = zip_entries(&[("manifest.csv", manifest.as_bytes()), ("note.pdf", &data)]);
+        let (s, p) = elena
+            .upload("/api/import/files/preview", &[], "notes.zip", &z)
+            .await;
+        ok(s, &p);
+        assert_eq!(p["rows"][0]["action"], "error");
+        let (s, r) = elena
+            .post(&format!("/api/import/{}/commit", p["batch_id"]), json!({}))
+            .await;
+        ok(s, &r);
+        assert_eq!(r["summary"]["created"], 0);
+        let (s, p) = viktor
+            .upload("/api/import/files/preview", &[], "notes.zip", &z)
+            .await;
+        ok(s, &p);
+        assert_eq!(
+            p["rows"][0]["action"],
+            if doc_type == visibility {
+                "create"
+            } else {
+                "error"
+            }
+        );
+        // Commit revalidates judge status, rather than trusting the old preview.
+        if doc_type == visibility {
+            c.execute("UPDATE users SET is_judge=0 WHERE id=?1", [uid])
+                .unwrap();
+            let (s, b) = viktor
+                .post(&format!("/api/import/{}/commit", p["batch_id"]), json!({}))
+                .await;
+            err(s, &b, StatusCode::CONFLICT, "import_changed");
+            c.execute("UPDATE users SET is_judge=1 WHERE id=?1", [uid])
+                .unwrap();
+            let (s, b) = viktor
+                .post(&format!("/api/import/{}/commit", p["batch_id"]), json!({}))
+                .await;
+            ok(s, &b);
+            assert_eq!(b["summary"]["created"], 1);
+        }
+    }
+    let csv = format!(
+        "{HEADER}DEMO-CIV-2000-0999,civil_contract,Undated closure,2000-01-01,closed,,,,\n"
+    );
+    let (s, p) = elena
+        .upload(
+            "/api/import/cases/preview",
+            &[],
+            "closed.csv",
+            csv.as_bytes(),
+        )
+        .await;
+    ok(s, &p);
+    assert_eq!(p["rows"][0]["action"], "error");
+    assert!(
+        p["rows"][0]["problems"]
+            .to_string()
+            .contains("Closed date is required")
+    );
+    let (s, r) = elena
+        .post(&format!("/api/import/{}/commit", p["batch_id"]), json!({}))
+        .await;
+    ok(s, &r);
+    assert_eq!(r["summary"]["created"], 0);
+    assert_eq!(
+        c.query_row(
+            "SELECT COUNT(*) FROM cases WHERE status='closed' AND closed_date IS NULL",
+            [],
+            |r| r.get::<_, i64>(0)
+        )
+        .unwrap(),
+        0
+    );
+}
+
+#[tokio::test]
+async fn repeated_zip_content_is_skipped_in_new_and_previously_previewed_batches() {
+    let _test_guard = IMPORT_EXPORT_TEST.lock().await;
+    let app = TestApp::demo();
+    let olga = app.persona("olga").await;
+    let (cid, number) = register_case(&olga, "Repeated ZIP").await;
+    let elena = olga.switch("elena").await;
+    let manifest = format!(
+        "case_number,filename,title,doc_type,visibility,document_date\n{number},a.pdf,Imported once,evidence,administrative,\n"
+    );
+    let bytes = pdf("Same content");
+    let z = zip_entries(&[("manifest.csv", manifest.as_bytes()), ("a.pdf", &bytes)]);
+    let (_, a) = elena
+        .upload("/api/import/files/preview", &[], "files.zip", &z)
+        .await;
+    let (_, b) = elena
+        .upload("/api/import/files/preview", &[], "files.zip", &z)
+        .await;
+    for (p, created, skipped) in [(&a, 1, 0), (&b, 0, 1)] {
+        let (s, r) = elena
+            .post(&format!("/api/import/{}/commit", p["batch_id"]), json!({}))
+            .await;
+        ok(s, &r);
+        assert_eq!(r["summary"]["created"], created);
+        assert_eq!(r["summary"]["skip_existing"], skipped);
+    }
+    let (s, p) = elena
+        .upload("/api/import/files/preview", &[], "files.zip", &z)
+        .await;
+    ok(s, &p);
+    assert_eq!(p["summary"]["skip_existing"], 1);
+    let c = elena.db(&app).open().unwrap();
+    assert_eq!(
+        c.query_row(
+            "SELECT COUNT(*) FROM documents WHERE case_id=?1 AND title='Imported once'",
+            [cid],
+            |r| r.get::<_, i64>(0)
+        )
+        .unwrap(),
+        1
+    );
+    let (_, other_number) = register_case(&olga, "Another case").await;
+    let manifest = manifest.replace(&number, &other_number);
+    let z = zip_entries(&[("manifest.csv", manifest.as_bytes()), ("a.pdf", &bytes)]);
+    let (_, p) = elena
+        .upload("/api/import/files/preview", &[], "files.zip", &z)
+        .await;
+    assert_eq!(p["summary"]["create"], 1);
+}
+
+#[tokio::test]
+async fn import_quota_counts_sources_and_failed_transactions_discard_all_blobs() {
+    let _test_guard = IMPORT_EXPORT_TEST.lock().await;
+    let app = TestApp::demo();
+    let olga = app.persona("olga").await;
+    let (cid, number) = register_case(&olga, "Import rollback").await;
+    let elena = olga.switch("elena").await;
+    let db = olga.db(&app);
+    let c = db.open().unwrap();
+    let csv =
+        format!("{HEADER}DEMO-CIV-2000-0777,civil_contract,Imported,2000-01-01,registered,,,,\n");
+    let before = stored_keys(&db);
+    // Fail at source INSERT, audit INSERT, then transaction COMMIT.
+    c.execute_batch("CREATE TABLE failure_probe(user_id INTEGER REFERENCES users(id) DEFERRABLE INITIALLY DEFERRED);").unwrap();
+    for trigger in [
+        "CREATE TRIGGER fail_import BEFORE INSERT ON import_batches BEGIN SELECT RAISE(ABORT,'forced_failure'); END;",
+        "CREATE TRIGGER fail_import BEFORE INSERT ON audit_events WHEN NEW.action='import.previewed' BEGIN SELECT RAISE(ABORT,'forced_failure'); END;",
+        "CREATE TRIGGER fail_import AFTER INSERT ON import_batches BEGIN INSERT INTO failure_probe VALUES(-1); END;",
+    ] {
+        c.execute_batch(trigger).unwrap();
+        let (s, _) = elena
+            .upload(
+                "/api/import/cases/preview",
+                &[],
+                "source.csv",
+                csv.as_bytes(),
+            )
+            .await;
+        assert_eq!(s, StatusCode::INTERNAL_SERVER_ERROR);
+        assert_eq!(stored_keys(&db), before);
+        c.execute_batch("DROP TRIGGER fail_import;").unwrap();
+    }
+    let data = pdf("Rollback bytes");
+    let manifest = format!(
+        "case_number,filename,title,doc_type,visibility,document_date\n{number},a.pdf,Rollback document,evidence,administrative,\n"
+    );
+    let z = zip_entries(&[("manifest.csv", manifest.as_bytes()), ("a.pdf", &data)]);
+    let (s, p) = elena
+        .upload("/api/import/files/preview", &[], "files.zip", &z)
+        .await;
+    ok(s, &p);
+    let batch = p["batch_id"].as_i64().unwrap();
+    let before = stored_keys(&db);
+    for trigger in [
+        "CREATE TRIGGER fail_import BEFORE UPDATE ON import_batches BEGIN SELECT RAISE(ABORT,'forced_failure'); END;",
+        "CREATE TRIGGER fail_import BEFORE INSERT ON audit_events WHEN NEW.action='import.committed' BEGIN SELECT RAISE(ABORT,'forced_failure'); END;",
+        "CREATE TRIGGER fail_import BEFORE INSERT ON operation_keys WHEN NEW.operation='import.commit' BEGIN SELECT RAISE(ABORT,'forced_failure'); END;",
+        "CREATE TRIGGER fail_import AFTER UPDATE ON import_batches BEGIN INSERT INTO failure_probe VALUES(-1); END;",
+    ] {
+        c.execute_batch(trigger).unwrap();
+        let (s, _) = elena
+            .post_idem(
+                &format!("/api/import/{batch}/commit"),
+                "failed-import",
+                json!({}),
+            )
+            .await;
+        assert_eq!(s, StatusCode::INTERNAL_SERVER_ERROR);
+        assert_eq!(stored_keys(&db), before);
+        assert_eq!(
+            c.query_row(
+                "SELECT COUNT(*) FROM documents WHERE case_id=?1 AND title='Rollback document'",
+                [cid],
+                |r| r.get::<_, i64>(0)
+            )
+            .unwrap(),
+            0
+        );
+        c.execute_batch("DROP TRIGGER fail_import;").unwrap();
+    }
+    let used = tuvalu_court::storage::used_bytes(&c).unwrap();
+    let source = vec![b'x'; (db.quota_bytes().unwrap() - used) as usize];
+    let (key, sha) = tuvalu_court::storage::write_blob(&db, &source).unwrap();
+    let uid = user_id(&olga, "Elena").await;
+    // Also count legacy source rows without a recorded size in source_options.
+    c.execute("INSERT INTO import_batches(kind,filename,source_sha256,storage_key,status,preview_json,created_by,created_at) VALUES('cases_csv','old.csv',?1,?2,'previewed','{}',?3,?4)",params![sha,key,uid,tuvalu_court::time::now_utc()]).unwrap();
+    assert_eq!(
+        tuvalu_court::storage::used_bytes(&c).unwrap(),
+        db.quota_bytes().unwrap()
+    );
+    let before = stored_keys(&db);
+    let (s, b) = elena
+        .upload(
+            "/api/import/cases/preview",
+            &[],
+            "source.csv",
+            csv.as_bytes(),
+        )
+        .await;
+    err(s, &b, StatusCode::PAYLOAD_TOO_LARGE, "too_large");
+    assert_eq!(stored_keys(&db), before);
+}
+
+#[tokio::test]
+async fn corrupt_zip_data_and_reduced_limits_are_rejected() {
+    let _test_guard = IMPORT_EXPORT_TEST.lock().await;
+    let app = TestApp::demo();
+    let elena = app.persona("elena").await;
+    let data = b"content with CRC";
+    let mut z = zip_entries(&[("a.pdf", data)]);
+    let offset = z.windows(data.len()).position(|w| w == data).unwrap();
+    z[offset] ^= 1;
+    let (s, b) = elena
+        .upload("/api/import/files/preview", &[], "corrupt.zip", &z)
+        .await;
+    err(s, &b, StatusCode::BAD_REQUEST, "validation");
+    let z = zip_entries(&[("a.pdf", &vec![0; 15 * 1024 * 1024 + 1])]);
+    assert_eq!(
+        elena
+            .upload("/api/import/files/preview", &[], "large-entry.zip", &z)
+            .await
+            .0,
+        StatusCode::PAYLOAD_TOO_LARGE
+    );
+    assert_eq!(
+        elena
+            .upload(
+                "/api/import/files/preview",
+                &[],
+                "large.zip",
+                &vec![0; 20 * 1024 * 1024 + 1]
+            )
+            .await
+            .0,
+        StatusCode::PAYLOAD_TOO_LARGE
+    );
+    let mut z = zip_entries(&[("a.pdf", b"a"), ("b.pdf", b"b"), ("c.pdf", b"c")]);
+    for i in 0..z.len() - 46 {
+        if &z[i..i + 4] == b"PK\x01\x02" {
+            z[i + 20..i + 24].copy_from_slice(&(1024 * 1024u32).to_le_bytes());
+            z[i + 24..i + 28].copy_from_slice(&(14 * 1024 * 1024u32).to_le_bytes());
+        }
+    }
+    assert_eq!(
+        elena
+            .upload("/api/import/files/preview", &[], "total.zip", &z)
+            .await
+            .0,
+        StatusCode::PAYLOAD_TOO_LARGE
+    );
+}
+
+#[tokio::test]
+async fn chronology_excludes_notes_and_restricted_events_outside_package_even_for_author() {
+    let _test_guard = IMPORT_EXPORT_TEST.lock().await;
+    let app = TestApp::demo();
+    let olga = app.persona("olga").await;
+    let (cid, _) = register_case(&olga, "Scoped chronology").await;
+    let uid = user_id(&olga, "Olga").await;
+    let db = olga.db(&app);
+    let (note, _) = insert_document(
+        &db,
+        cid,
+        "Private note",
+        "judicial_note",
+        "judicial_note",
+        uid,
+    );
+    let (restricted, vid) =
+        insert_document(&db, cid, "Private report", "medical", "restricted", uid);
+    let c = db.open().unwrap();
+    let actor = tuvalu_court::auth::load_actor(&c, uid, None)
+        .unwrap()
+        .unwrap();
+    db.write_blocking(|tx| {
+        for (entity, id, summary) in [
+            ("document", note, "Judicial note added"),
+            ("document", restricted, "Restricted document granted"),
+            ("document_version", vid, "Restricted version added"),
+        ] {
+            tuvalu_court::audit::record(
+                tx,
+                Some(&actor),
+                tuvalu_court::audit::Event::new("document.created", entity, id, summary)
+                    .case(Some(cid)),
+            )?;
+        }
+        Ok(())
+    })
+    .unwrap();
+    for (ids, expected) in [(json!([]), 0), (json!([vid]), 2)] {
+        let (s, _, raw) = package(
+            &olga,
+            cid,
+            json!({"purpose":"Participant copy","version_ids":ids}),
+        )
+        .await;
+        assert_eq!(s, StatusCode::OK);
+        let mut z = zip::ZipArchive::new(Cursor::new(raw)).unwrap();
+        let m: Value = serde_json::from_reader(z.by_name("manifest.json").unwrap()).unwrap();
+        assert!(!m.to_string().contains("Judicial note"));
+        assert_eq!(
+            m["chronology"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .filter(|e| e["action"] == "document.created")
+                .count(),
+            expected
+        );
+    }
+    let (key,sha)=tuvalu_court::storage::write_blob(&db,&pdf("Oversize metadata")).unwrap();
+    c.execute("INSERT INTO document_versions(document_id,version_no,filename,content_type,size_bytes,sha256,storage_key,scan_status,uploaded_by,uploaded_at) VALUES(?1,2,'large.pdf','application/pdf',?2,?3,?4,'clean',?5,?6)",params![restricted,40*1024*1024+1,sha,key,uid,tuvalu_court::time::now_utc()]).unwrap();
+    let oversized=c.last_insert_rowid();
+    let (s, b, _) = package(
+        &olga,
+        cid,
+        json!({"purpose":"Oversize","version_ids":[oversized]}),
+    )
+    .await;
+    err(s, &b, StatusCode::PAYLOAD_TOO_LARGE, "too_large");
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn heavy_operations_are_busy_across_sandboxes_and_release_after_upload() {
+    use http_body_util::{BodyExt, Full};
+    let _test_guard = IMPORT_EXPORT_TEST.lock().await;
+    let app = TestApp::demo();
+    let first = app.persona("elena").await;
+    let second_olga = app.persona("olga").await;
+    let (cid, _) = register_case(&second_olga, "Independent export").await;
+    let second = second_olga.switch("elena").await;
+    let (_, batch) = second
+        .upload(
+            "/api/import/cases/preview",
+            &[],
+            "empty.csv",
+            HEADER.as_bytes(),
+        )
+        .await;
+    let (started_tx, started_rx) = tokio::sync::oneshot::channel();
+    let (release_tx, release_rx) = std::sync::mpsc::channel();
+    let mut started_tx = Some(started_tx);
+    let data = format!(
+        "--hold\r\nContent-Disposition: form-data; name=\"file\"; filename=\"empty.csv\"\r\n\r\n{HEADER}\r\n--hold--\r\n"
+    );
+    let body = Full::new(axum::body::Bytes::from(data)).map_frame(move |frame| {
+        if let Some(tx) = started_tx.take() {
+            tx.send(()).unwrap();
+            release_rx
+                .recv_timeout(std::time::Duration::from_secs(10))
+                .unwrap();
+        }
+        frame
+    });
+    let request = Request::builder()
+        .method("POST")
+        .uri("/api/import/cases/preview")
+        .header("host", "localhost")
+        .header("x-tcr", "1")
+        .header(
+            "cookie",
+            format!(
+                "tcr_sandbox={}; tcr_session={}",
+                first.sandbox.as_ref().unwrap(),
+                first.session.as_ref().unwrap()
+            ),
+        )
+        .header("content-type", "multipart/form-data; boundary=hold")
+        .body(Body::new(body))
+        .unwrap();
+    let pending = tokio::spawn(async move { first.clone().send(request).await });
+    started_rx.await.unwrap();
+    for (s, b) in [
+        second
+            .upload(
+                "/api/import/cases/preview",
+                &[],
+                "empty.csv",
+                HEADER.as_bytes(),
+            )
+            .await,
+        second
+            .upload("/api/import/files/preview", &[], "empty.zip", b"invalid")
+            .await,
+        second
+            .post(
+                &format!("/api/import/{}/commit", batch["batch_id"]),
+                json!({}),
+            )
+            .await,
+    ] {
+        err(s, &b, StatusCode::SERVICE_UNAVAILABLE, "busy");
+        assert_eq!(b["error"]["message"], "busy, try again");
+    }
+    let (s, b, _) = package(&second, cid, json!({"purpose":"Busy export"})).await;
+    err(s, &b, StatusCode::SERVICE_UNAVAILABLE, "busy");
+    let (s, b) = second.get("/api/import").await;
+    ok(s, &b);
+    release_tx.send(()).unwrap();
+    let (s, b, _, _) = pending.await.unwrap();
+    ok(s, &b);
+    let (s, _, _) = package(&second, cid, json!({"purpose":"Available export"})).await;
+    assert_eq!(s, StatusCode::OK);
 }

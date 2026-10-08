@@ -112,6 +112,7 @@ fn dispatch_json(conn: &Connection, actor: &Actor, id: i64) -> AppResult<Value> 
          WHERE di.dispatch_id = ?1 ORDER BY di.id",
         [id]
     )?);
+    redact_items(conn, actor, &mut d, "items")?;
     d["attempts"] = json!(query_json(
         conn,
         "SELECT attempt_no, status, technical_receipt, detail, occurred_date, at
@@ -144,6 +145,54 @@ fn dispatch_json(conn: &Connection, actor: &Actor, id: i64) -> AppResult<Value> 
     );
     d["state_summary"] = json!(state_summary(&d));
     Ok(d)
+}
+
+/// Redact both structured metadata and the inventory embedded in the body.
+/// Mailbox attachments use the same document-version ids and policy.
+pub(super) fn redact_items(
+    conn: &Connection,
+    actor: &Actor,
+    value: &mut Value,
+    field: &str,
+) -> AppResult<()> {
+    let mut body = value["body"].as_str().unwrap_or_default().to_string();
+    if let Some(items) = value[field].as_array_mut() {
+        for item in items {
+            let vid = item["document_version_id"].as_i64();
+            let sql = format!(
+                "SELECT COUNT(*) FROM document_versions v JOIN documents doc ON doc.id=v.document_id WHERE v.id=?1 AND {}",
+                policy::document_visible_sql(actor, "doc")
+            );
+            let visible: i64 = conn.query_row(&sql, [vid], |r| r.get(0))?;
+            if visible == 0 {
+                // Version metadata is immutable; the document title may have changed since send.
+                let metadata = query_one_json(
+                    conn,
+                    "SELECT version_no, filename FROM document_versions WHERE id=?1",
+                    [vid],
+                )?;
+                let suffix = format!(
+                    " (version {}, {})",
+                    metadata["version_no"],
+                    metadata["filename"].as_str().unwrap_or_default()
+                );
+                body = body
+                    .lines()
+                    .map(|line| {
+                        if line.starts_with("- ") && line.ends_with(&suffix) {
+                            "- Restricted document"
+                        } else {
+                            line
+                        }
+                    })
+                    .collect::<Vec<_>>()
+                    .join("\n");
+                *item = json!({"document_version_id":vid,"restricted":true,"document_title":"Restricted document"});
+            }
+        }
+    }
+    value["body"] = json!(body);
+    Ok(())
 }
 
 /// Intake information requests are managed with intake.manage; case dispatches use dispatch permissions.
@@ -563,6 +612,11 @@ async fn update(ctx: Ctx, Path(id): Path<i64>, JsonBody(req): JsonBody<PatchReq>
             }
             let subject = req.subject.as_deref().map(|s| required(s, "Subject")).transpose()?;
             let mut body = req.body.as_deref().map(|s| required(s, "Body")).transpose()?;
+            let old_items = d["items"].as_array().map(|items| items.iter().map(|item| {
+                if item["restricted"] == true { "- Restricted document".to_string() } else {
+                    format!("- {} (version {}, {})", item["document_title"].as_str().unwrap_or_default(), item["version_no"], item["filename"].as_str().unwrap_or_default())
+                }
+            }).collect::<Vec<_>>().join("\n"));
             if let Some(vids) = &req.version_ids {
                 let (ids, _) = check_items(tx, &actor, d["case_id"].as_i64(), d["intake_id"].as_i64(), vids, req.include_restricted.unwrap_or(false))?;
                 if d["kind"] == "copies" && ids.is_empty() {
@@ -579,7 +633,12 @@ async fn update(ctx: Ctx, Path(id): Path<i64>, JsonBody(req): JsonBody<PatchReq>
                     ("case_number", d["case_number"].as_str().unwrap_or_default().into()),
                     ("case_title", title), ("items", items_text.clone()),
                 ])?;
-                body = Some(copy_body(&req.body, rendered, &items_text)?);
+                let custom = req.body.clone().or_else(|| {
+                    let stored = d["body"].as_str().unwrap_or_default();
+                    let old = old_items.as_deref().unwrap_or_default();
+                    Some(if old.is_empty() { stored.to_string() } else { stored.replace(old, &items_text) })
+                });
+                body = Some(copy_body(&custom, rendered, &items_text)?);
             }
             let recipient_name = match &req.recipient_name {
                 Some(n) => Some(required(n, "Recipient name")?),

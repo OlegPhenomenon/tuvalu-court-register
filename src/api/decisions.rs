@@ -67,16 +67,9 @@ fn decision_case_id(conn: &Connection, id: i64) -> AppResult<i64> {
     .ok_or_else(AppError::not_found)
 }
 
-/// Judges act only on cases where they hold the judge assignment (spec: 403, not 404).
+/// Visible cases still require a judge assignment for judicial actors.
 fn require_judge_scope(conn: &Connection, actor: &Actor, case_id: i64) -> AppResult<()> {
-    let exists: bool = conn.query_row(
-        "SELECT EXISTS(SELECT 1 FROM cases WHERE id = ?1)",
-        [case_id],
-        |r| r.get(0),
-    )?;
-    if !exists {
-        return Err(AppError::not_found());
-    }
+    policy::require_case(conn, actor, case_id)?;
     if actor.is_judge && !policy::is_assigned(conn, actor, case_id, Some("judge"))? {
         return Err(AppError::forbidden(
             "Only the judge assigned to this case can do this.",
@@ -96,6 +89,16 @@ fn require_case_version(
     if doc.case_id != Some(case_id) {
         return Err(AppError::validation(
             "That document does not belong to this case.",
+        ));
+    }
+    let doc_type: String = conn.query_row(
+        "SELECT doc_type FROM documents WHERE id = ?1",
+        [doc.id],
+        |r| r.get(0),
+    )?;
+    if doc.visibility == "judicial_note" || doc_type == "judicial_note" {
+        return Err(AppError::validation(
+            "Judicial working notes cannot be used for decisions.",
         ));
     }
     let clean: bool = conn.query_row(
