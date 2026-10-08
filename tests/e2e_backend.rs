@@ -475,7 +475,7 @@ async fn next_action_links_templates_reports_and_dispatch_wording_match_the_cont
     let viktor = olga.switch("viktor").await;
     let (s, draft) = viktor.post(&format!("/api/cases/{cid}/decisions"), json!({"title":"Repair order","document_version_id":vid})).await;
     ok(s, &draft);
-    let (s, b) = viktor.post(&format!("/api/decisions/{}/finalise", draft["id"]), json!({"decision_date":today()})).await;
+    let (s, b) = viktor.post(&format!("/api/decisions/{}/finalise", draft["id"]), json!({"decision_date":today(),"version":draft["version"],"document_version_id":draft["document_version_id"]})).await;
     ok(s, &b);
     let (_, card) = olga.get(&format!("/api/cases/{cid}")).await;
     let action = card["next_actions"]

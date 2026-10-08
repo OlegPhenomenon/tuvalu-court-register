@@ -72,11 +72,13 @@ function ReasonModal({ title, label: fieldLabel, confirmLabel = 'Confirm', dange
 
 /* ------------------------------ confirm a draft ------------------------------ */
 
-function ConfirmHearingModal({ hearing, onClose, onSaved }: {
+function ConfirmHearingModal({ hearing: initialHearing, onClose, onSaved }: {
   hearing: Hearing;
   onClose: () => void;
   onSaved: () => void;
 }) {
+  const [hearing, setHearing] = useState(initialHearing);
+  const [reviewChanged, setReviewChanged] = useState(false);
   const { hasPerm } = useSession();
   const [busy, setBusy] = useState(false);
   const [error, setError] = useState<unknown>(null);
@@ -84,14 +86,20 @@ function ConfirmHearingModal({ hearing, onClose, onSaved }: {
   const [reason, setReason] = useState('');
 
   const go = async (override?: string) => {
+    if (reviewChanged || hearing.status !== 'draft') return;
     setBusy(true);
     setError(null);
     setConflicts(null);
     try {
-      await api('POST', `/hearings/${hearing.id}/confirm`, { override_reason: override ?? null });
+      await api('POST', `/hearings/${hearing.id}/confirm`, { version: hearing.version, override_reason: override ?? null });
       onSaved();
       onClose();
     } catch (e) {
+      if (e instanceof ApiError && e.code === 'version_conflict') {
+        setReviewChanged(true);
+        try { setHearing(await api<Hearing>('GET', `/hearings/${hearing.id}`)); }
+        catch (reloadError) { setError(reloadError); return; }
+      }
       if (e instanceof ApiError && e.code === 'hearing_conflict') {
         const d = e.details as { conflicts?: HearingConflict[]; hidden_conflicts?: number } | null;
         setConflicts({ visible: d?.conflicts ?? [], hidden: d?.hidden_conflicts ?? 0 });
@@ -104,6 +112,8 @@ function ConfirmHearingModal({ hearing, onClose, onSaved }: {
 
   return (
     <Modal title="Confirm the hearing" open onClose={busy ? () => {} : onClose}>
+      {reviewChanged && <p role="alert">The draft hearing changed. Review the reloaded time, room and judge.</p>}
+      {reviewChanged && <Button variant="secondary" disabled={hearing.status !== 'draft'} onClick={() => { setReviewChanged(false); setError(null); }}>I have reviewed the current hearing</Button>}
       <p>
         Confirming books {hearing.room_name ?? 'the room'} and{' '}
         {hearing.judge_name ?? 'the judge'} for {hearingTimeRange(hearing)}. If they are already
@@ -127,7 +137,7 @@ function ConfirmHearingModal({ hearing, onClose, onSaved }: {
                 <Button
                   variant="danger"
                   busy={busy}
-                  disabled={!reason.trim()}
+                  disabled={reviewChanged || !reason.trim()}
                   onClick={() => void go(reason.trim())}
                 >
                   Confirm anyway
@@ -138,7 +148,7 @@ function ConfirmHearingModal({ hearing, onClose, onSaved }: {
         </>
       )}
       <div className="actions">
-        <Button busy={busy} onClick={() => void go()}>Confirm</Button>
+        <Button busy={busy} disabled={reviewChanged || hearing.status !== 'draft'} onClick={() => void go()}>Confirm</Button>
         <Button variant="secondary" disabled={busy} onClick={onClose}>Back</Button>
       </div>
     </Modal>
@@ -302,6 +312,7 @@ function OutcomeModal({ hearing, caseData, onClose, onSaved, onDemoNote }: {
   const canOverride = hasPerm('hearing.override_conflict');
   const { data: ref, error: refError, reload: reloadRef } = useRefData();
   const form = useRef<HTMLFormElement>(null);
+  const [commandKey] = useState(newKey);
   const [held, setHeld] = useState<'yes' | 'no'>('yes');
   const [attendance, setAttendance] = useState<Record<number, boolean>>(() =>
     Object.fromEntries(hearing.participants.map((p) => [p.id, true])),
@@ -374,7 +385,7 @@ function OutcomeModal({ hearing, caseData, onClose, onSaved, onDemoNote }: {
                 override_reason: nhOverride.trim() || null,
               }
             : null,
-      });
+      }, { idempotencyKey: commandKey });
       if (res.demo_note) onDemoNote(res.demo_note);
       onSaved();
       onClose();

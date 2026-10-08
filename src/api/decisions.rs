@@ -186,7 +186,7 @@ async fn detail(ctx: Ctx, Path(id): Path<i64>) -> JsonResult {
 
 // ------------------------------------------------------------------ create & edit (draft only)
 
-#[derive(Deserialize)]
+#[derive(Deserialize, Serialize)]
 struct CreateReq {
     title: String,
     decision_date: Option<String>,
@@ -197,6 +197,7 @@ struct CreateReq {
 async fn create(
     ctx: Ctx,
     Path(case_id): Path<i64>,
+    IdemKey(key): IdemKey,
     JsonBody(req): JsonBody<CreateReq>,
 ) -> JsonResult {
     let actor = ctx.actor;
@@ -205,31 +206,33 @@ async fn create(
         .write(move |tx| {
             require_judge_scope(tx, &actor, case_id)?;
             policy::require_case_perm(tx, &actor, case_id, perm::DECISION_DRAFT)?;
-            let document_id = require_case_version(tx, &actor, case_id, req.document_version_id)?;
-            check_hearing_belongs(tx, case_id, req.hearing_id)?;
-            let title = required(&req.title, "Title")?;
-            tx.execute(
-                "INSERT INTO decisions (case_id, title, decision_date, status, document_id, document_version_id,
-                                        hearing_id, author_user_id, created_at)
-                 VALUES (?1, ?2, ?3, 'draft', ?4, ?5, ?6, ?7, ?8)",
-                params![
-                    case_id,
-                    title,
-                    crate::time::parse_opt_date(req.decision_date.as_deref())?,
-                    document_id,
-                    req.document_version_id,
-                    req.hearing_id,
-                    actor.user_id,
-                    crate::time::now_utc()
-                ],
-            )?;
-            let id = tx.last_insert_rowid();
-            audit::record(
-                tx,
-                Some(&actor),
-                Event::new("decision.drafted", "decision", id, format!("Draft decision “{title}” prepared")).case(Some(case_id)),
-            )?;
-            decision_json(tx, &actor, id)
+            idempotent(tx, &actor, &key, "decision.create", &(case_id, &req), || {
+                let document_id = require_case_version(tx, &actor, case_id, req.document_version_id)?;
+                check_hearing_belongs(tx, case_id, req.hearing_id)?;
+                let title = required(&req.title, "Title")?;
+                tx.execute(
+                    "INSERT INTO decisions (case_id, title, decision_date, status, document_id, document_version_id,
+                                            hearing_id, author_user_id, created_at)
+                     VALUES (?1, ?2, ?3, 'draft', ?4, ?5, ?6, ?7, ?8)",
+                    params![
+                        case_id,
+                        title,
+                        crate::time::parse_opt_date(req.decision_date.as_deref())?,
+                        document_id,
+                        req.document_version_id,
+                        req.hearing_id,
+                        actor.user_id,
+                        crate::time::now_utc()
+                    ],
+                )?;
+                let id = tx.last_insert_rowid();
+                audit::record(
+                    tx,
+                    Some(&actor),
+                    Event::new("decision.drafted", "decision", id, format!("Draft decision “{title}” prepared")).case(Some(case_id)),
+                )?;
+                decision_json(tx, &actor, id)
+            })
         })
         .await?;
     Ok(Json(v))
@@ -298,6 +301,8 @@ async fn update(ctx: Ctx, Path(id): Path<i64>, JsonBody(req): JsonBody<UpdateReq
 
 #[derive(Deserialize, Serialize)]
 struct FinaliseReq {
+    version: i64,
+    document_version_id: i64,
     decision_date: String,
     signed_file_uploaded: Option<bool>,
 }
@@ -320,7 +325,13 @@ async fn finalise(
                 if current["status"].as_str() != Some("draft") {
                     return Err(AppError::invalid_transition("Only a draft decision can be finalised."));
                 }
-                require_case_version(tx, &actor, case_id, current["document_version_id"].as_i64().unwrap())?;
+                if current["version"].as_i64() != Some(req.version)
+                    || current["document_version_id"].as_i64() != Some(req.document_version_id)
+                {
+                    return Err(AppError::conflict("stale_review", "The draft changed. Reload and review the current file before finalising.")
+                        .with_details(json!({"version": current["version"], "document_version_id": current["document_version_id"]})));
+                }
+                require_case_version(tx, &actor, case_id, req.document_version_id)?;
                 if let Some(old_id) = current["amends_decision_id"].as_i64() {
                     let old = decision_json(tx, &actor, old_id)?;
                     if old["status"] != "finalised" {
@@ -369,7 +380,7 @@ async fn finalise(
     Ok(Json(v))
 }
 
-#[derive(Deserialize)]
+#[derive(Deserialize, Serialize)]
 struct WithdrawReq {
     reason: Option<String>,
 }
@@ -377,6 +388,7 @@ struct WithdrawReq {
 async fn withdraw(
     ctx: Ctx,
     Path(id): Path<i64>,
+    IdemKey(key): IdemKey,
     JsonBody(req): JsonBody<WithdrawReq>,
 ) -> JsonResult {
     let actor = ctx.actor;
@@ -387,28 +399,30 @@ async fn withdraw(
             require_judge_scope(tx, &actor, case_id)?;
             let current = decision_json(tx, &actor, id)?;
             actor.require(perm::DECISION_DRAFT)?;
-            if current["status"].as_str() != Some("draft") {
-                return Err(AppError::invalid_transition("Only a draft decision can be withdrawn."));
-            }
-            let why = reason(&req.reason)?;
-            tx.execute(
-                "UPDATE decisions SET status = 'withdrawn', status_reason = ?2, version = version + 1 WHERE id = ?1",
-                params![id, why],
-            )?;
-            audit::record(
-                tx,
-                Some(&actor),
-                Event::new("decision.withdrawn", "decision", id, format!("Draft decision “{}” withdrawn", current["title"].as_str().unwrap_or_default()))
-                    .case(Some(case_id))
-                    .details(json!({ "reason": why })),
-            )?;
-            decision_json(tx, &actor, id)
+            idempotent(tx, &actor, &key, "decision.withdraw", &(id, &req), || {
+                if current["status"].as_str() != Some("draft") {
+                    return Err(AppError::invalid_transition("Only a draft decision can be withdrawn."));
+                }
+                let why = reason(&req.reason)?;
+                tx.execute(
+                    "UPDATE decisions SET status = 'withdrawn', status_reason = ?2, version = version + 1 WHERE id = ?1",
+                    params![id, why],
+                )?;
+                audit::record(
+                    tx,
+                    Some(&actor),
+                    Event::new("decision.withdrawn", "decision", id, format!("Draft decision “{}” withdrawn", current["title"].as_str().unwrap_or_default()))
+                        .case(Some(case_id))
+                        .details(json!({ "reason": why })),
+                )?;
+                decision_json(tx, &actor, id)
+            })
         })
         .await?;
     Ok(Json(v))
 }
 
-#[derive(Deserialize)]
+#[derive(Deserialize, Serialize)]
 struct AmendReq {
     amendment_basis: String,
     document_version_id: i64,
@@ -418,7 +432,7 @@ struct AmendReq {
 
 /// Correct a finalised decision by drafting a linked amendment; the original stays finalised
 /// until the amendment itself is finalised (§4 "исправили ошибку").
-async fn amend(ctx: Ctx, Path(id): Path<i64>, JsonBody(req): JsonBody<AmendReq>) -> JsonResult {
+async fn amend(ctx: Ctx, Path(id): Path<i64>, IdemKey(key): IdemKey, JsonBody(req): JsonBody<AmendReq>) -> JsonResult {
     let actor = ctx.actor;
     let v = ctx
         .db
@@ -427,41 +441,43 @@ async fn amend(ctx: Ctx, Path(id): Path<i64>, JsonBody(req): JsonBody<AmendReq>)
             require_judge_scope(tx, &actor, case_id)?;
             let old = decision_json(tx, &actor, id)?;
             actor.require(perm::DECISION_FINALISE)?;
-            if old["status"].as_str() != Some("finalised") {
-                return Err(AppError::invalid_transition("Only a finalised decision can be amended."));
-            }
-            let basis = required(&req.amendment_basis, "Amendment basis")?;
-            let document_id = require_case_version(tx, &actor, case_id, req.document_version_id)?;
-            let title = match &req.title {
-                Some(t) => required(t, "Title")?,
-                None => old["title"].as_str().unwrap_or_default().to_string(),
-            };
-            tx.execute(
-                "INSERT INTO decisions (case_id, title, decision_date, status, document_id, document_version_id,
-                                        hearing_id, author_user_id, amends_decision_id, amendment_basis, created_at)
-                 VALUES (?1, ?2, ?3, 'draft', ?4, ?5, ?6, ?7, ?8, ?9, ?10)",
-                params![
-                    case_id,
-                    title,
-                    crate::time::parse_opt_date(req.decision_date.as_deref())?,
-                    document_id,
-                    req.document_version_id,
-                    old["hearing_id"].as_i64(),
-                    actor.user_id,
-                    id,
-                    basis,
-                    crate::time::now_utc()
-                ],
-            )?;
-            let new_id = tx.last_insert_rowid();
-            audit::record(
-                tx,
-                Some(&actor),
-                Event::new("decision.amended", "decision", new_id, format!("Amendment drafted for decision #{id}"))
-                    .case(Some(case_id))
-                    .details(json!({ "amends_decision_id": id, "amendment_basis": basis })),
-            )?;
-            decision_json(tx, &actor, new_id)
+            idempotent(tx, &actor, &key, "decision.amend", &(id, &req), || {
+                if old["status"].as_str() != Some("finalised") {
+                    return Err(AppError::invalid_transition("Only a finalised decision can be amended."));
+                }
+                let basis = required(&req.amendment_basis, "Amendment basis")?;
+                let document_id = require_case_version(tx, &actor, case_id, req.document_version_id)?;
+                let title = match &req.title {
+                    Some(t) => required(t, "Title")?,
+                    None => old["title"].as_str().unwrap_or_default().to_string(),
+                };
+                tx.execute(
+                    "INSERT INTO decisions (case_id, title, decision_date, status, document_id, document_version_id,
+                                            hearing_id, author_user_id, amends_decision_id, amendment_basis, created_at)
+                     VALUES (?1, ?2, ?3, 'draft', ?4, ?5, ?6, ?7, ?8, ?9, ?10)",
+                    params![
+                        case_id,
+                        title,
+                        crate::time::parse_opt_date(req.decision_date.as_deref())?,
+                        document_id,
+                        req.document_version_id,
+                        old["hearing_id"].as_i64(),
+                        actor.user_id,
+                        id,
+                        basis,
+                        crate::time::now_utc()
+                    ],
+                )?;
+                let new_id = tx.last_insert_rowid();
+                audit::record(
+                    tx,
+                    Some(&actor),
+                    Event::new("decision.amended", "decision", new_id, format!("Amendment drafted for decision #{id}"))
+                        .case(Some(case_id))
+                        .details(json!({ "amends_decision_id": id, "amendment_basis": basis })),
+                )?;
+                decision_json(tx, &actor, new_id)
+            })
         })
         .await?;
     Ok(Json(v))

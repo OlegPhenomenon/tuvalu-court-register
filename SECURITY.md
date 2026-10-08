@@ -56,6 +56,13 @@ reveals that a hidden case, document or intake exists. `403 forbidden` is
 returned only when the object is visible but the action needs a permission the
 actor lacks. Knowing a case number grants no access.
 
+Judicial finalisation checks both the reviewed decision row version and exact document version
+inside the write transaction. Draft hearing confirmation likewise checks its reviewed version.
+Unsent invitations are superseded atomically when a hearing changes. Before delivery, the worker
+rechecks the hearing binding and finalised decision-copy binding as well as current access.
+Stale material is retained as terminal `superseded` history and never delivered. Working documents,
+including drafts, carry an explicit DRAFT / working material label in the message and mailbox.
+
 ## Sessions, cookies, CSRF
 
 - Session tokens are 256-bit random values; only their SHA-256 hash is stored.

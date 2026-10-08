@@ -15,7 +15,7 @@
 
 import { useEffect, useMemo, useRef, useState } from 'react';
 import type { FormEvent } from 'react';
-import { api } from '../api';
+import { api, newKey } from '../api';
 import { fmtCourtLocal, fmtLocal } from '../time';
 import { Button } from './Button';
 import { ErrorBanner } from './ErrorBanner';
@@ -155,6 +155,8 @@ export function DispatchForm({ caseId, participants, kind, dispatch, preselectDe
   onSaved: (fresh?: DispatchRecord) => void;
 }) {
   const form = useRef<HTMLFormElement>(null);
+  const [commandKey] = useState(newKey);
+  const [materialMode, setMaterialMode] = useState(preselectDecisionId || dispatch?.items.every((i) => i.material_kind === 'decision_copy') ? 'decision_copy' : 'working_document');
   const { data: ref, error: refError, reload: reloadRef } = useRefData();
   const editing = dispatch !== undefined;
   const effectiveKind: 'notice' | 'copies' | string = editing ? dispatch.kind : (kind ?? 'notice');
@@ -205,14 +207,14 @@ export function DispatchForm({ caseId, participants, kind, dispatch, preselectDe
 
   // ?decision={id} — resolve the decision to its bound document version and
   // pre-check it once the versions list arrives (only if it is sendable here).
-  const decisions = useApi<{ items: { id: number; document_version_id: number }[] }>(
-    !editing && isCopies && preselectDecisionId != null && caseId !== undefined
-      ? `/cases/${caseId}/decisions`
+  const decisions = useApi<{ items: { id: number; document_version_id: number; status: string }[] }>(
+    isCopies && editCaseId !== null
+      ? `/cases/${editCaseId}/decisions`
       : null,
   );
   useEffect(() => {
     if (preselectDecisionId == null || !versions) return;
-    const vid = decisions.data?.items.find((d) => d.id === preselectDecisionId)?.document_version_id;
+    const vid = decisions.data?.items.find((d) => d.id === preselectDecisionId && d.status === 'finalised')?.document_version_id;
     if (vid != null && versions.some((v) => v.version_id === vid)) {
       setSelected((s) => (s.includes(vid) ? s : [vid, ...s]));
     }
@@ -231,12 +233,12 @@ export function DispatchForm({ caseId, participants, kind, dispatch, preselectDe
     setSelected((s) => (checked ? [...s, id] : s.filter((x) => x !== id)));
 
   const { restrictedOptions, openVersions } = useMemo(() => {
-    const all = versions ?? [];
+    const all = (versions ?? []).filter((v) => materialMode !== 'decision_copy' || decisions.data?.items.some((d) => d.status === 'finalised' && d.document_version_id === v.version_id));
     return {
       restrictedOptions: all.filter((v) => v.restricted),
       openVersions: all.filter((v) => !v.restricted),
     };
-  }, [versions]);
+  }, [versions, materialMode, decisions.data]);
 
   // Unticking the restricted gate drops any restricted versions from the selection.
   useEffect(() => {
@@ -291,7 +293,7 @@ export function DispatchForm({ caseId, participants, kind, dispatch, preselectDe
       return;
     }
     const payload: Record<string, unknown> = {
-      kind: effectiveKind,
+      kind: isCopies ? materialMode : effectiveKind,
       recipient_party_id: chosen.party_id,
       method,
       address: address.trim() || null,
@@ -308,7 +310,7 @@ export function DispatchForm({ caseId, participants, kind, dispatch, preselectDe
     setAttempted(payload);
     setBusy(true);
     try {
-      const fresh = await api<DispatchRecord>('POST', `/cases/${caseId}/dispatches`, payload);
+      const fresh = await api<DispatchRecord>('POST', `/cases/${caseId}/dispatches`, payload, { idempotencyKey: commandKey });
       onSaved(fresh);
     } catch (err) {
       setError(err);
@@ -435,6 +437,11 @@ export function DispatchForm({ caseId, participants, kind, dispatch, preselectDe
 
           {isCopies && (
             <div className="field">
+              {!editing && <SelectField label="Material to send" value={materialMode} onChange={(value) => { setMaterialMode(value); setSelected([]); }} options={[
+                { value: 'working_document', label: 'DRAFT / working material' },
+                { value: 'decision_copy', label: 'Copy of finalised decision' },
+              ]} />}
+              <p>{materialMode === 'decision_copy' ? 'Only the exact text of a finalised decision can be issued as a decision copy.' : 'The message and mailbox will be labelled DRAFT / working material.'}</p>
               <span className="field-label">Document versions to include</span>
               {Boolean(versionsError) && <ErrorBanner error={versionsError} onRetry={retryVersions} />}
               {!versions && !versionsError && <p className="muted">Loading documents…</p>}

@@ -33,6 +33,7 @@ export interface DispatchItem {
   filename: string;
   sha256: string;
   visibility: string;
+  material_kind: 'working_document' | 'decision_copy';
 }
 
 export interface DispatchAttempt {
@@ -173,6 +174,7 @@ export function DispatchCard({ dispatch, showContext, onChanged }: {
   const pollTimers = useRef<ReturnType<typeof setTimeout>[]>([]);
   // One idempotency key per queue attempt — a network retry replays the same
   // operation; a successful queue rotates the key for the next time.
+  const [commandKey, setCommandKey] = useState(newKey);
   const [queueKey, setQueueKey] = useState(() => newKey());
 
   // Record-sent / confirm / assess form state
@@ -191,6 +193,7 @@ export function DispatchCard({ dispatch, showContext, onChanged }: {
   const canAssess = hasPerm('dispatch.assess_service');
 
   const open = (a: NonNullable<ActionKind>) => {
+    setCommandKey(newKey());
     setAction(a);
     setError(null);
     setOccurredDate(courtToday());
@@ -271,7 +274,7 @@ export function DispatchCard({ dispatch, showContext, onChanged }: {
       api<DispatchRecord>('POST', `/dispatches/${d.id}/record-sent`, {
         occurred_date: occurredDate,
         note,
-      }),
+      }, { idempotencyKey: commandKey }),
     );
 
   const confirmHandover = () =>
@@ -280,7 +283,7 @@ export function DispatchCard({ dispatch, showContext, onChanged }: {
         kind: confirmKind,
         note,
         occurred_date: occurredDate || null,
-      }),
+      }, { idempotencyKey: commandKey }),
     );
 
   const assessService = () =>
@@ -413,7 +416,7 @@ export function DispatchCard({ dispatch, showContext, onChanged }: {
           <ul className="dispatch-items">
             {d.items.map((it) => (
               <li key={it.document_version_id}>
-                <strong>{it.document_title}</strong> — version {it.version_no},{' '}
+                <strong>{it.document_title}</strong> <span className="muted">{it.material_kind === 'decision_copy' ? 'Copy of finalised decision' : 'DRAFT / working material'}</span> — version {it.version_no},{' '}
                 <a href={downloadUrl(`/document-versions/${it.document_version_id}/download`)} download>
                   {it.filename}
                 </a>{' '}
@@ -542,7 +545,7 @@ export function DispatchCard({ dispatch, showContext, onChanged }: {
             <ul className="dispatch-items">
               {d.items.map((it) => (
                 <li key={it.document_version_id}>
-                  {it.document_title} — version {it.version_no} ({it.filename})
+                  {it.document_title} — {it.material_kind === 'decision_copy' ? 'Copy of finalised decision' : 'DRAFT / working material'} — version {it.version_no} ({it.filename})
                 </li>
               ))}
             </ul>
