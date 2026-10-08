@@ -92,8 +92,10 @@ including drafts, carry an explicit DRAFT / working material label in the messag
   `TCR_COOKIE_SECURE=true` (always set it behind HTTPS).
 - Sessions expire after `TCR_SESSION_HOURS` (default 12), are revoked on
   password change and user deactivation, and can be revoked by an administrator
-  (`revoke-sessions`). The session token is rotated after the second factor is
-  completed (session-fixation defence).
+  (`revoke-sessions`). Restore revokes every session in the verified snapshot before
+  publication; source cookies cannot authenticate to the restored installation.
+  Passwords and enrolled TOTP secrets are preserved for a new login. The session
+  token is rotated after the second factor is completed (session-fixation defence).
 - CSRF: every non-GET request must send the header `X-TCR: 1`, and when a
   browser sends `Origin` its host must equal `Host`. Either failure → `403
   csrf`. Combined with `SameSite=Strict` this blocks cross-site form posts.
@@ -166,7 +168,8 @@ including drafts, carry an explicit DRAFT / working material label in the messag
   and out of the repository.**
 - `restore` only accepts a new or empty directory, verifies authentication,
   manifest, row counts, foreign keys, file checksums and the audit head, and
-  publishes files only after every check passes.
+  revokes all restored sessions before publication, and publishes files only after
+  every check passes. Users must log in again with password and TOTP.
 
 ## Known limitations
 
@@ -216,13 +219,22 @@ Uploads are pending until a verdict; only explicit OK allows clean. Startup
 quarantines interrupted pending checks. Download, inline preview, export, dispatch,
 SMTP attachments and mailbox links cannot retrieve pending/quarantined bytes.
 Imports commit pending versions before contacting clamd outside the writer
-transaction; full backups retain verdicts. Built-in checks include PDF dictionary
+transaction; their detached scan task continues through every imported version
+even if the request disconnects; full backups retain verdicts. Built-in checks
+include PDF dictionary
 tokenisation (comments, escaped/nested strings, hex strings, nested dictionaries,
-escaped names) and bounded inflation of every FlateDecode stream, PNG CRC/structure, JPEG
-segments/EOI and DOCX macros/ActiveX/OLE. Neither these checks nor antivirus prove
-absolute file safety; unsupported PDF stream encodings are quarantined when they
-prevent object-stream inspection or leave no inspectable document structure.
-Unparsable dictionaries are quarantined.
+escaped names) at the document level and inside `/Type /ObjStm` streams. Other
+stream payloads (content, fonts, images, xref and functions) receive an active-name
+scan of complete names at PDF lexical boundaries, including `#xx` decoding,
+without object tokenisation. Flate-only streams have bounded inflation (8 MiB per stage, 32 MiB total); work on ordinary
+object syntax is bounded by the upload byte limit and nesting limits, without a
+token-count cap. Common 8-bit TIFF/PNG predictors are reversed before inspecting
+non-image data. Unsupported predictors and decode parameters fail closed for
+non-image streams, as do non-Flate filters unless the stream is clearly image
+data (`/Subtype /Image` or a recognised image codec). Object streams cannot use
+the image exception. Unparsable dictionaries are quarantined. Built-in checks
+also cover PNG CRC/structure, JPEG segments/EOI and DOCX macros/ActiveX/OLE. Neither
+these checks nor antivirus prove absolute file safety.
 
 SMTP requires STARTTLS or implicit TLS with rustls/ring and bundled webpki roots;
 credentials never appear in Settings. Demo ignores SMTP configuration. Production

@@ -107,7 +107,8 @@ timeout or interrupted scan produces `quarantined`. Pending/quarantined files
 cannot be downloaded, previewed, exported or attached to outgoing mail. A server
 restart quarantines interrupted scans; submit a new version when the scanner is
 healthy. File imports commit pending versions, then use the same scanner path
-outside the import transaction. Format checks and
+outside the import transaction. A detached task completes scans for every imported
+version even if the request disconnects. Format checks and
 antivirus reduce risk; neither proves a file absolutely safe.
 
 ## Backup, restore, upgrade and audit
@@ -125,6 +126,18 @@ sudo -u tuvalu /opt/tuvalu-court/tuvalu-court --env-file /etc/tuvalu-court.env v
 `TCRB1` contains the consistent SQLite snapshot, all immutable document versions
 and blobs, grants and audit chain, encrypted with chunked XChaCha20-Poly1305.
 User-facing case exports are not backups and cannot restore a court installation.
+After a successful backup, copy the key to a separate, access-controlled key
+vault off this host, verify that the copy is usable, then delete the local key.
+Replace the example vault destination with the court's approved location, whose
+directory is private to the backup custodian. Transfer the encrypted archive to
+separate backup storage as well. Do not retain the key on the data volume.
+
+```sh
+sudo scp /var/lib/tuvalu-court/backup.key backup-custodian@key-vault:/secure/tuvalu/backup.key
+# Verify the vault copy before deleting the on-host key.
+sudo -u tuvalu rm /var/lib/tuvalu-court/backup.key
+```
+
 Full backups intentionally include quarantined records; restoring them preserves
 the verdict and does not make their bytes available through application channels.
 
@@ -134,7 +147,10 @@ The destination must be an explicitly supplied new or empty directory. Before
 writing it, the CLI prints the destination and backup installation id and requires
 interactive entry of that id or `--yes`. It refuses noninteractive execution
 without `--yes`. Authentication, counts, foreign keys, blob checksums and audit
-head are verified before publication. The restored installation keeps its id.
+head are verified before publication. All sessions in the verified snapshot are
+revoked before publishing it: cookies from the source installation return 401.
+Users must log in again with their password and enrolled TOTP; account credentials
+and TOTP replay protection are preserved. The restored installation keeps its id.
 For backups predating installation ids, confirmation uses a `legacy-…` fingerprint
 of the authenticated database; startup migration then creates its persistent
 random installation id. No older backup format is discarded.
@@ -146,7 +162,12 @@ and verified database/files. If the process is killed, remove the destination's
 unpublished `.restore-tmp` before retrying into an empty destination.
 
 ```sh
+# Temporarily retrieve the key for restore (the directory remains private).
+sudo scp backup-custodian@key-vault:/secure/tuvalu/backup.key /var/lib/tuvalu-court/backup.key
+sudo chown tuvalu:tuvalu /var/lib/tuvalu-court/backup.key
+sudo chmod 0600 /var/lib/tuvalu-court/backup.key
 sudo -u tuvalu /opt/tuvalu-court/tuvalu-court --env-file /etc/tuvalu-court.env restore /var/lib/tuvalu-court/pre-upgrade.tcrb /var/lib/tuvalu-court/backup.key /var/lib/tuvalu-court/restored --yes
+sudo -u tuvalu rm /var/lib/tuvalu-court/backup.key
 # Set TCR_DATA_DIR=/var/lib/tuvalu-court/restored in /etc/tuvalu-court.env before switching the service.
 sudo -u tuvalu /opt/tuvalu-court/tuvalu-court --env-file /etc/tuvalu-court.env verify-audit
 sudo systemctl restart tuvalu-court
@@ -176,15 +197,36 @@ docker compose exec court /usr/local/bin/tuvalu-court revoke democlerk case.view
 docker compose exec court /usr/local/bin/tuvalu-court gen-key /data/backup.key
 docker compose exec court /usr/local/bin/tuvalu-court backup /data/court.tcrb /data/backup.key
 docker compose exec court /usr/local/bin/tuvalu-court verify-audit
+# Export the key off the host and remove it from both the volume and local staging.
+(umask 077; docker compose cp court:/data/backup.key ./backup.key)
+scp ./backup.key backup-custodian@key-vault:/secure/tuvalu/backup.key
+# Verify the vault copy before deleting either local copy.
+docker compose exec court /bin/rm /data/backup.key
+rm ./backup.key
+# For restore, temporarily retrieve the key into the running container's volume.
+(umask 077; scp backup-custodian@key-vault:/secure/tuvalu/backup.key ./backup.key)
+docker compose cp ./backup.key court:/data/backup.key
+docker compose exec --user root court /bin/chown court:court /data/backup.key
+docker compose exec court /bin/chmod 0600 /data/backup.key
+rm ./backup.key
 docker compose stop court
 docker compose run --rm court restore /data/court.tcrb /data/backup.key /data/restored --yes
+docker compose run --rm --entrypoint /bin/rm court /data/backup.key
 # Change TCR_DATA_DIR=/data/restored in .env, then start the service.
 docker compose up -d
 docker compose exec court /usr/local/bin/tuvalu-court verify-audit
 ```
 
 `exec` inherits the running service's env; `run` loads the same `.env`. Files live
-in the `court-data` named volume. For off-host archives, `docker compose cp` copies
+in the `court-data` named volume. `docker compose exec -it` is for interactive
+password typing; scripted stdin uses `docker compose exec -i` without `-t`:
+
+```sh
+# Feed a password from a private file; it is never a command argument.
+docker compose exec -i court /usr/local/bin/tuvalu-court create-user democlerk "DEMO Clerk" < /secure/temporary-password
+```
+
+For off-host archives, `docker compose cp` copies
 them out; keep encryption keys separately. The root filesystem is read-only,
 `/tmp` is tmpfs, memory is capped at 256 MB and CPU at 0.5. Clamd must be reachable
 from inside the container; `127.0.0.1` refers to that container, not its host.
@@ -204,7 +246,17 @@ kamal app exec -i 'grant democlerk case.view_all'
 kamal app exec -i 'revoke democlerk case.view_all'
 kamal app exec -i 'gen-key /data/backup.key'
 kamal app exec -i 'backup /data/court.tcrb /data/backup.key'
+# Export the key from the deployed host/container to the separate key vault.
+# Replace court-host and COURT_CONTAINER with the deployed host and container name.
+(umask 077; ssh deploy@court-host 'docker exec COURT_CONTAINER cat /data/backup.key' > ./backup.key)
+scp ./backup.key backup-custodian@key-vault:/secure/tuvalu/backup.key
+# Verify the vault copy before deleting the volume and workstation copies.
+ssh deploy@court-host 'docker exec COURT_CONTAINER rm /data/backup.key'
+rm ./backup.key
+# Retrieve the key temporarily when restoring.
+ssh backup-custodian@key-vault 'cat /secure/tuvalu/backup.key' | ssh deploy@court-host 'docker exec -i COURT_CONTAINER sh -c "umask 077; cat > /data/backup.key"'
 kamal app exec -i 'restore /data/court.tcrb /data/backup.key /data/restored --yes'
+ssh deploy@court-host 'docker exec COURT_CONTAINER rm /data/backup.key'
 # Set TCR_DATA_DIR=/data/restored in the deployment env and redeploy.
 kamal deploy
 kamal app exec -i 'verify-audit'
@@ -217,7 +269,9 @@ Kamal uses `docker exec` instead and requires the full binary path. See
 
 Kamal exec inherits deployed env and runs as the image's unprivileged `court`
 user, with the same `/data` volume. These maintenance commands require production;
-they intentionally refuse to operate on demo sandboxes.
+they intentionally refuse to operate on demo sandboxes. Copy the encrypted archive
+off-host too, to storage separate from the key vault; the key must not remain on
+the deployment host or `/data` volume after backup or restore.
 
 ## Logs and demo housekeeping
 

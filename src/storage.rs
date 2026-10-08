@@ -77,22 +77,72 @@ fn decode_pdf_names(bytes: &[u8]) -> Vec<u8> {
     out
 }
 
+fn pdf_active_name(name: &[u8]) -> bool {
+    [
+        b"JavaScript".as_slice(),
+        b"JS",
+        b"OpenAction",
+        b"AA",
+        b"Launch",
+        b"EmbeddedFile",
+        b"EmbeddedFiles",
+        b"RichMedia",
+        b"XFA",
+        b"SubmitForm",
+        b"ImportData",
+    ]
+    .contains(&name)
+}
+
 fn pdf_risky(bytes: &[u8]) -> bool {
     let names = decode_pdf_names(bytes);
-    [
-        "/JavaScript",
-        "/JS",
-        "/OpenAction",
-        "/AA",
-        "/Launch",
-        "/EmbeddedFile",
-        "/RichMedia",
-        "/XFA",
-        "/SubmitForm",
-        "/ImportData",
-    ]
-    .iter()
-    .any(|key| contains(&names, key.as_bytes()))
+    let mut at = 0;
+    let mut atom_start = 0;
+    let mut name_chain = None;
+    while at < names.len() {
+        if names[at] == b'/' {
+            // A name starts after a delimiter, a preceding name, or a PDF scalar.
+            // Arbitrary binary/text substrings such as DEMO-profile/AA are not names.
+            let atom = &names[atom_start..at];
+            let boundary = name_chain.unwrap_or_else(|| {
+                atom.is_empty()
+                    || [
+                        b"true".as_slice(),
+                        b"false",
+                        b"null",
+                        b"R",
+                        b"obj",
+                        b"endobj",
+                    ]
+                    .contains(&atom)
+                    || (atom.iter().any(u8::is_ascii_digit)
+                        && atom
+                            .iter()
+                            .all(|b| b.is_ascii_digit() || b"+-.".contains(b)))
+            });
+            let start = at + 1;
+            at = start;
+            while at < names.len() && !pdf_delimiter(names[at]) {
+                at += 1;
+            }
+            // AA requires an action dictionary/reference; JS requires a string/stream.
+            // Neither accepts a name value. Slash chains in XML thumbnails can contain
+            // these short byte sequences without representing either action key.
+            let name_value = names.get(at) == Some(&b'/')
+                && [b"AA".as_slice(), b"JS"].contains(&&names[start..at]);
+            if boundary && !name_value && pdf_active_name(&names[start..at]) {
+                return true;
+            }
+            name_chain = Some(boundary);
+        } else {
+            if pdf_delimiter(names[at]) {
+                atom_start = at + 1;
+            }
+            name_chain = None;
+            at += 1;
+        }
+    }
+    false
 }
 
 // PDF syntax must be tokenised before locating stream dictionaries: comments and
@@ -109,7 +159,6 @@ enum PdfValue {
 struct PdfTokens<'a> {
     bytes: &'a [u8],
     at: usize,
-    tokens: usize,
     risky: bool,
 }
 
@@ -124,7 +173,6 @@ impl<'a> PdfTokens<'a> {
         Self {
             bytes,
             at: 0,
-            tokens: 0,
             risky: false,
         }
     }
@@ -150,8 +198,7 @@ impl<'a> PdfTokens<'a> {
     }
     fn value(&mut self, depth: usize) -> Result<PdfValue, &'static str> {
         self.space();
-        self.tokens += 1;
-        if depth > 64 || self.tokens > 250_000 {
+        if depth > 64 {
             return Err("PDF syntax limit exceeded");
         }
         let Some(&first) = self.bytes.get(self.at) else {
@@ -225,20 +272,7 @@ impl<'a> PdfTokens<'a> {
                         self.at += 1;
                     }
                 }
-                self.risky |= [
-                    b"JavaScript".as_slice(),
-                    b"JS",
-                    b"OpenAction",
-                    b"AA",
-                    b"Launch",
-                    b"EmbeddedFile",
-                    b"EmbeddedFiles",
-                    b"RichMedia",
-                    b"XFA",
-                    b"SubmitForm",
-                    b"ImportData",
-                ]
-                .contains(&name.as_slice());
+                self.risky |= pdf_active_name(&name);
                 Ok(PdfValue::Name(name))
             }
             b'(' => {
@@ -318,29 +352,117 @@ fn pdf_name_is(value: Option<&PdfValue>, expected: &[u8]) -> bool {
     matches!(value, Some(PdfValue::Name(name)) if name == expected)
 }
 
-fn check_pdf(
-    bytes: &[u8],
-    expanded: &mut usize,
-    streams: &mut usize,
-    depth: usize,
-) -> Result<(), &'static str> {
-    if pdf_risky(bytes) {
-        return Err("PDF contains active content");
+// Predictors transform inflated bytes before inspection. Only the bounded, common
+// 8-bit TIFF and PNG layouts are supported for non-image streams; others fail closed.
+fn pdf_predictor(bytes: Vec<u8>, params: Option<&PdfValue>) -> Result<Vec<u8>, &'static str> {
+    let dict = match params {
+        None => return Ok(bytes),
+        Some(PdfValue::Atom(a)) if a == b"null" => return Ok(bytes),
+        Some(PdfValue::Dict(dict)) => dict,
+        _ => return Err("PDF decode parameters cannot be inspected"),
+    };
+    let integer = |key: &[u8], default: usize| -> Result<usize, &'static str> {
+        match pdf_field(dict, key) {
+            None => Ok(default),
+            Some(PdfValue::Atom(n)) => std::str::from_utf8(n)
+                .ok()
+                .and_then(|n| n.parse().ok())
+                .ok_or("Invalid PDF predictor parameter"),
+            _ => Err("PDF predictor parameter cannot be inspected"),
+        }
+    };
+    let predictor = integer(b"Predictor", 1)?;
+    if predictor == 1 {
+        return Ok(bytes);
     }
+    let colors = integer(b"Colors", 1)?;
+    let columns = integer(b"Columns", 1)?;
+    if integer(b"BitsPerComponent", 8)? != 8 || colors == 0 || columns == 0 {
+        return Err("PDF predictor layout cannot be inspected");
+    }
+    let row = colors
+        .checked_mul(columns)
+        .filter(|n| *n <= 8 * 1024 * 1024)
+        .ok_or("PDF predictor row exceeds limits")?;
+    if predictor == 2 {
+        if !bytes.len().is_multiple_of(row) {
+            return Err("Invalid TIFF predictor data");
+        }
+        let mut decoded = bytes;
+        for line in decoded.chunks_mut(row) {
+            for i in colors..row {
+                line[i] = line[i].wrapping_add(line[i - colors]);
+            }
+        }
+        return Ok(decoded);
+    }
+    if !(10..=15).contains(&predictor) || !bytes.len().is_multiple_of(row + 1) {
+        return Err("PDF predictor cannot be inspected");
+    }
+    let mut decoded = Vec::<u8>::with_capacity(bytes.len());
+    for line in bytes.chunks_exact(row + 1) {
+        let filter = line[0];
+        if filter > 4 {
+            return Err("Invalid PNG predictor data");
+        }
+        let start = decoded.len();
+        for (i, byte) in line[1..].iter().enumerate() {
+            let left = if i >= colors {
+                decoded[start + i - colors]
+            } else {
+                0
+            };
+            let up = if start >= row {
+                decoded[start - row + i]
+            } else {
+                0
+            };
+            let upper_left = if start >= row && i >= colors {
+                decoded[start - row + i - colors]
+            } else {
+                0
+            };
+            let prediction = match filter {
+                0 => 0,
+                1 => left,
+                2 => up,
+                3 => ((left as u16 + up as u16) / 2) as u8,
+                4 => {
+                    let p = left as i16 + up as i16 - upper_left as i16;
+                    let a = (p - left as i16).abs();
+                    let b = (p - up as i16).abs();
+                    let c = (p - upper_left as i16).abs();
+                    if a <= b && a <= c {
+                        left
+                    } else if b <= c {
+                        up
+                    } else {
+                        upper_left
+                    }
+                }
+                _ => unreachable!(),
+            };
+            decoded.push(byte.wrapping_add(prediction));
+        }
+    }
+    Ok(decoded)
+}
+
+fn check_pdf(bytes: &[u8], expanded: &mut usize, depth: usize) -> Result<(), &'static str> {
     if depth > 8 {
         return Err("PDF compressed nesting limit exceeded");
     }
     let mut tokens = PdfTokens::new(bytes);
     let mut previous = None;
-    let mut inspected = false;
-    let mut unsupported = false;
     loop {
         tokens.space();
         if tokens.at == bytes.len() {
             break;
         }
+        let start_value = tokens.at;
         let value = tokens.value(0)?;
-        if tokens.risky {
+        // Inspect object syntax, including displayed strings, but never compressed bytes.
+        if tokens.risky || pdf_risky(&bytes[start_value..tokens.at]) {
             return Err("PDF contains active content");
         }
         if matches!(&value, PdfValue::Atom(word) if word == b"stream") {
@@ -355,8 +477,7 @@ fn check_pdf(
                 return Err("PDF stream requires a line ending");
             }
             let start = tokens.at;
-            // Prefer the direct byte length, so literal endstream bytes in compressed data
-            // cannot truncate inspection. Indirect lengths use a delimited endstream fallback.
+            // Direct lengths prevent literal endstream bytes truncating compressed data.
             let length = match pdf_field(&dict, b"Length") {
                 Some(PdfValue::Atom(n)) => Some(
                     std::str::from_utf8(n)
@@ -382,20 +503,14 @@ fn check_pdf(
                     })
                     .map(|(i, _)| i)
                     .ok_or("PDF stream cannot be checked")?;
-                let mut end = start + offset;
-                while end > start && matches!(bytes[end - 1], b'\r' | b'\n') {
-                    end -= 1;
-                }
-                end
+                // The zlib decoder stops at its end marker. Retain separator bytes:
+                // trimming CR/LF can remove checksum bytes from an indirect-length stream.
+                start + offset
             };
             tokens.at = end;
             tokens.space();
             if !matches!(tokens.value(0)?, PdfValue::Atom(word) if word == b"endstream") {
                 return Err("PDF stream terminator missing");
-            }
-            *streams += 1;
-            if *streams > 256 {
-                return Err("PDF stream limit exceeded");
             }
             let filters = match pdf_field(&dict, b"Filter") {
                 None => Vec::new(),
@@ -409,23 +524,28 @@ fn check_pdf(
                     .collect::<Result<Vec<_>, _>>()?,
                 _ => return Err("Invalid PDF stream filter"),
             };
-            if filters
-                .iter()
-                .any(|filter| *filter != b"FlateDecode" && *filter != b"Fl")
-            {
-                // Mixed filter chains cannot be inflated safely. Unsupported object streams
-                // always fail closed; opaque image streams need an inspectable document.
-                if pdf_name_is(pdf_field(&dict, b"Type"), b"ObjStm")
-                    || filters
-                        .iter()
-                        .any(|filter| *filter == b"FlateDecode" || *filter == b"Fl")
-                {
-                    return Err("PDF object stream has an unsupported filter");
+            let object = pdf_name_is(pdf_field(&dict, b"Type"), b"ObjStm");
+            let image = !object
+                && (pdf_name_is(pdf_field(&dict, b"Subtype"), b"Image")
+                    || filters.iter().any(|f| {
+                        [
+                            b"DCTDecode".as_slice(),
+                            b"DCT",
+                            b"JPXDecode",
+                            b"CCITTFaxDecode",
+                            b"CCF",
+                            b"JBIG2Decode",
+                        ]
+                        .contains(f)
+                    }));
+            let params = pdf_field(&dict, b"DecodeParms");
+            if filters.iter().any(|f| *f != b"FlateDecode" && *f != b"Fl") {
+                if !image {
+                    return Err("PDF non-image stream has an unsupported filter");
                 }
-                unsupported = true;
-            } else if !filters.is_empty() {
+            } else {
                 let mut decoded = bytes[start..end].to_vec();
-                for _ in filters {
+                for (i, _) in filters.iter().enumerate() {
                     let limit = (32 * 1024 * 1024_usize)
                         .saturating_sub(*expanded)
                         .min(8 * 1024 * 1024);
@@ -435,34 +555,39 @@ fn check_pdf(
                                 |_| "PDF compressed stream could not be checked within limits",
                             )?;
                     *expanded += decoded.len();
+                    if !image {
+                        let params = match params {
+                            Some(PdfValue::Array(values)) => {
+                                if values.len() != filters.len() {
+                                    return Err("PDF decode parameters do not match filters");
+                                }
+                                values.get(i)
+                            }
+                            other => other,
+                        };
+                        decoded = pdf_predictor(decoded, params)?;
+                    }
                 }
-                check_pdf(&decoded, expanded, streams, depth + 1)?;
-                inspected = true;
-            } else {
-                check_pdf(&bytes[start..end], expanded, streams, depth + 1)?;
-                inspected = true;
+                // DecodeParms on an unfiltered non-image stream is ambiguous.
+                if filters.is_empty() && !image && params.is_some() {
+                    decoded = pdf_predictor(decoded, params)?;
+                }
+                if object {
+                    check_pdf(&decoded, expanded, depth + 1)?;
+                } else if pdf_risky(&decoded) {
+                    return Err("PDF contains active content");
+                }
             }
             previous = None;
         } else {
-            if let PdfValue::Dict(dict) = &value {
-                inspected |= pdf_name_is(pdf_field(dict, b"Type"), b"Catalog")
-                    || pdf_name_is(pdf_field(dict, b"Type"), b"Page")
-                    || pdf_name_is(pdf_field(dict, b"Type"), b"Pages");
-            }
             previous = Some(value);
         }
-    }
-    if unsupported && !inspected {
-        return Err("PDF streams have unsupported filters and cannot be inspected");
     }
     Ok(())
 }
 fn pdf_note(bytes: &[u8]) -> Option<String> {
-    check_pdf(bytes, &mut 0, &mut 0, 0)
-        .err()
-        .map(str::to_string)
+    check_pdf(bytes, &mut 0, 0).err().map(str::to_string)
 }
-
 fn crc32(bytes: &[u8]) -> u32 {
     let mut crc = !0u32;
     for b in bytes {
