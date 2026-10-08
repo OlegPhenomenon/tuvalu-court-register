@@ -107,7 +107,7 @@ async fn admin_user_management_in_demo() {
     .await;
     err(s, &b, StatusCode::FORBIDDEN, "forbidden");
 
-    // Grantable permissions are replaced; non-grantable ones a user already holds are kept.
+    // Grantable permissions are replaced; unchanged rows keep their provenance.
     let (s, b) = put(
         &pavel,
         &format!("/api/admin/users/{kioa}/permissions"),
@@ -132,30 +132,57 @@ async fn admin_user_management_in_demo() {
         json!({ "permissions": ["report.view"] }),
     )
     .await;
-    ok(s, &b);
-    let perms: Vec<&str> = b["permissions"]
-        .as_array()
+    err(s, &b, StatusCode::FORBIDDEN, "forbidden");
+    assert!(
+        b["error"]["message"]
+            .as_str()
+            .unwrap()
+            .contains("tuvalu-court grant")
+    );
+
+    let db = pavel.db(&app);
+    let conn = db.open().unwrap();
+    let provenance = |id| {
+        let mut st = conn.prepare("SELECT permission, granted_by, granted_at FROM user_permissions WHERE user_id = ?1 ORDER BY permission").unwrap();
+        st.query_map([id], |r| {
+            Ok((
+                r.get::<_, String>(0)?,
+                r.get::<_, Option<i64>>(1)?,
+                r.get::<_, String>(2)?,
+            ))
+        })
         .unwrap()
-        .iter()
-        .map(|p| p.as_str().unwrap())
-        .collect();
-    for kept in [
-        "case.view_all",
-        "case.assign_judge",
-        "audit.view",
-        "report.view",
-    ] {
-        assert!(
-            perms.contains(&kept),
-            "{kept} should be preserved in {perms:?}"
-        );
-    }
-    for gone in ["export.case", "case.close", "task.manage"] {
-        assert!(
-            !perms.contains(&gone),
-            "{gone} is admin-grantable and was removed: {perms:?}"
-        );
-    }
+        .collect::<Result<Vec<_>, _>>()
+        .unwrap()
+    };
+    let elena_before = provenance(elena);
+    let kioa_before = provenance(kioa);
+    let (s, b) = put(
+        &pavel,
+        &format!("/api/admin/users/{kioa}/permissions"),
+        json!({ "permissions": ["report.view", "task.manage"] }),
+    )
+    .await;
+    ok(s, &b);
+    assert_eq!(
+        provenance(kioa).iter().find(|p| p.0 == "report.view"),
+        kioa_before.first()
+    );
+    assert_eq!(provenance(elena), elena_before);
+    let (s, b) = put(
+        &pavel,
+        &format!("/api/admin/users/{kioa}/permissions"),
+        json!({ "permissions": ["task.manage"] }),
+    )
+    .await;
+    ok(s, &b);
+    assert_eq!(
+        provenance(kioa)
+            .iter()
+            .map(|p| p.0.as_str())
+            .collect::<Vec<_>>(),
+        ["task.manage"]
+    );
 
     // Profile update with audit.
     let (s, b) = pavel
@@ -228,6 +255,18 @@ async fn deactivate_ends_sessions_and_assignments() {
         )
         .unwrap();
     assert!(ended >= 2, "seeded assignments should have ended: {ended}");
+
+    let unaudited: i64 = conn.query_row(
+        "SELECT COUNT(*) FROM case_assignments a WHERE a.user_id = ?1 AND a.end_reason LIKE 'Account deactivated%'
+         AND NOT EXISTS (SELECT 1 FROM audit_events e WHERE e.action = 'case.unassigned' AND e.case_id = a.case_id
+             AND json_extract(e.details, '$.assignment_id') = a.id
+             AND json_extract(e.details, '$.user_id') = a.user_id
+             AND json_extract(e.details, '$.role') = a.role
+             AND json_extract(e.details, '$.reason') = a.end_reason)", [sergei_id], |r| r.get(0)).unwrap();
+    assert_eq!(unaudited, 0);
+    let events: i64 = conn.query_row("SELECT COUNT(*) FROM audit_events WHERE action = 'case.unassigned' AND json_extract(details, '$.user_id') = ?1",
+        [sergei_id], |r| r.get(0)).unwrap();
+    assert_eq!(events, ended);
 
     // Reactivation restores the account but not the assignments.
     let (s, b) = pavel
@@ -559,6 +598,66 @@ async fn production_admin_account_lifecycle() {
     assert_eq!(b["enroll_required"], true); // no second factor yet
     login_and_enrol(&mut admin, "root", "root-password-99").await;
 
+    // Judges, administrators and holders of court-authority powers require CLI management.
+    for (name, judge, perms) in [
+        ("judge", true, vec!["document.manage"]),
+        ("authority", false, vec!["case.view_all"]),
+        ("administrator", false, vec!["admin.users"]),
+    ] {
+        let id = tuvalu_court::seed::create_user(
+            &db,
+            name,
+            name,
+            "protected-password-99",
+            judge,
+            &perms.into_iter().map(str::to_string).collect::<Vec<_>>(),
+        )
+        .unwrap();
+        let conn = db.open().unwrap();
+        conn.execute(
+            "UPDATE users SET totp_secret = 'UNCHANGED' WHERE id = ?1",
+            [id],
+        )
+        .unwrap();
+        let before: (String, String, i64) = conn
+            .query_row(
+                "SELECT password_hash, totp_secret, active FROM users WHERE id = ?1",
+                [id],
+                |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?)),
+            )
+            .unwrap();
+        for action in ["reset-password", "reset-mfa", "deactivate"] {
+            let (s, b) = admin
+                .post(
+                    &format!("/api/admin/users/{id}/{action}"),
+                    json!({ "reason": "Recovery" }),
+                )
+                .await;
+            err(s, &b, StatusCode::FORBIDDEN, "forbidden");
+            assert!(
+                b["error"]["message"]
+                    .as_str()
+                    .unwrap()
+                    .contains("tuvalu-court grant")
+            );
+        }
+        let (s, b) = put(
+            &admin,
+            &format!("/api/admin/users/{id}/permissions"),
+            json!({ "permissions": [] }),
+        )
+        .await;
+        err(s, &b, StatusCode::FORBIDDEN, "forbidden");
+        let after: (String, String, i64) = conn
+            .query_row(
+                "SELECT password_hash, totp_secret, active FROM users WHERE id = ?1",
+                [id],
+                |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?)),
+            )
+            .unwrap();
+        assert_eq!(before, after);
+    }
+
     // Creating a user returns a one-time temporary password.
     let (s, b) = admin
         .post("/api/admin/users", json!({ "username": "kioa", "display_name": "Kioa Temoa", "permissions": ["task.manage"] }))
@@ -734,6 +833,14 @@ async fn demo_seed_dataset_is_complete_and_consistent() {
     assert_eq!(rows[1].0, "scheduled");
     assert_eq!(rows[0].2, Some(hearing_id(&conn, case3, "scheduled"))); // adjourned_to → new
     assert_eq!(rows[1].1, Some(hearing_id(&conn, case3, "adjourned"))); // previous → old
+    let local_starts: Vec<String> = conn
+        .prepare("SELECT starts_at FROM hearings WHERE case_id = ?1 ORDER BY id")
+        .unwrap()
+        .query_map([case3], |r| r.get::<_, String>(0))
+        .unwrap()
+        .map(|r| tuvalu_court::time::utc_to_local(&r.unwrap()))
+        .collect();
+    assert_eq!(local_starts, ["2026-11-17T09:00", "2026-11-19T09:00"]);
     let renotify: i64 = conn
         .query_row("SELECT COUNT(*) FROM tasks WHERE case_id = ?1 AND kind = 'renotify' AND status = 'open'", [case3], |r| r.get(0))
         .unwrap();
@@ -774,7 +881,7 @@ async fn demo_seed_dataset_is_complete_and_consistent() {
         "expected notices, an info request and copy packages in the mailbox"
     );
 
-    // Restricted case: Sergei (unassigned) and Elena (view_all) cannot see it.
+    // Restricted case: Sergei is initially unassigned; Elena is assigned to manage grants.
     let case6 = by_title("DEMO — Guardianship assessment")["id"]
         .as_i64()
         .unwrap();
@@ -791,21 +898,59 @@ async fn demo_seed_dataset_is_complete_and_consistent() {
     );
     let elena = olga.switch("elena").await;
     let (s, _) = elena.get(&format!("/api/cases/{case6}")).await;
-    assert_eq!(s, StatusCode::NOT_FOUND);
-
-    // …nor can Sergei see its files — the policy SQL hides every document on the case.
-    let s_actor = tuvalu_court::auth::load_actor(&conn, uid_by_persona(&conn, "sergei"), None)
-        .unwrap()
-        .unwrap();
-    let vis = tuvalu_court::policy::document_visible_sql(&s_actor, "d");
-    let seen: i64 = conn
-        .query_row(
-            &format!("SELECT COUNT(*) FROM documents d WHERE d.case_id = {case6} AND {vis}"),
-            [],
-            |r| r.get(0),
-        )
-        .unwrap();
-    assert_eq!(seen, 0);
+    assert_eq!(s, StatusCode::OK);
+    let elena_assignment: String = conn.query_row(
+        "SELECT reason FROM case_assignments WHERE case_id = ?1 AND user_id = ?2 AND role = 'registry_head' AND end_at IS NULL",
+        rusqlite::params![case6, uid_by_persona(&conn, "elena")], |r| r.get(0)).unwrap();
+    assert!(!elena_assignment.is_empty());
+    let (s, b) = elena.post(&format!("/api/cases/{case6}/assignments"),
+        json!({ "user_id": uid_by_persona(&conn, "sergei"), "role": "service_officer", "reason": "Visibility check" })).await;
+    ok(s, &b);
+    for (persona, expected) in [
+        ("olga", vec!["restricted", "party_material"]),
+        (
+            "viktor",
+            vec!["restricted", "party_material", "judicial_note"],
+        ),
+        ("sergei", vec!["party_material"]),
+        ("elena", vec!["party_material"]),
+    ] {
+        let actor = tuvalu_court::auth::load_actor(&conn, uid_by_persona(&conn, persona), None)
+            .unwrap()
+            .unwrap();
+        let docs: Vec<(i64, String)> = conn
+            .prepare("SELECT id, visibility FROM documents WHERE case_id = ?1")
+            .unwrap()
+            .query_map([case6], |r| Ok((r.get(0)?, r.get(1)?)))
+            .unwrap()
+            .collect::<Result<_, _>>()
+            .unwrap();
+        assert_eq!(docs.len(), 3);
+        let sql = tuvalu_court::policy::document_visible_sql(&actor, "d");
+        for (id, visibility) in docs {
+            let visible: bool = conn
+                .query_row(
+                    &format!("SELECT EXISTS(SELECT 1 FROM documents d WHERE d.id = ?1 AND {sql})"),
+                    [id],
+                    |r| r.get(0),
+                )
+                .unwrap();
+            assert_eq!(
+                visible,
+                expected.contains(&visibility.as_str()),
+                "{persona}: {visibility}"
+            );
+            assert_eq!(
+                tuvalu_court::policy::require_document(&conn, &actor, id).is_ok(),
+                visible
+            );
+        }
+    }
+    let missing_status_audits: i64 = conn.query_row(
+        "SELECT COUNT(*) FROM case_status_history h WHERE h.to_status NOT IN ('closed', 'reopened') AND h.from_status IS NOT NULL
+         AND NOT EXISTS (SELECT 1 FROM audit_events e WHERE e.case_id = h.case_id AND e.action = 'case.status_changed'
+             AND json_extract(e.details, '$.from') = h.from_status AND json_extract(e.details, '$.to') = h.to_status)", [], |r| r.get(0)).unwrap();
+    assert_eq!(missing_status_audits, 0);
 
     // The audit chain is intact and every stored file's checksum matches its bytes.
     let (n_events, broken) = tuvalu_court::audit::verify_chain(&conn).unwrap();

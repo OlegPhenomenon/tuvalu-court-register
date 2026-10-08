@@ -152,6 +152,13 @@ fn path_for(db: &Db, storage_key: &str) -> AppResult<PathBuf> {
     Ok(db.files_dir().join(storage_key))
 }
 
+/// Remove an unreferenced blob after a failed write or an idempotent replay.
+pub fn discard(db: &Db, storage_key: &str) {
+    if let Ok(path) = path_for(db, storage_key) {
+        let _ = std::fs::remove_file(path);
+    }
+}
+
 /// Validate and store bytes. Does not insert DB rows; caller records the returned metadata.
 pub fn store(db: &Db, bytes: &[u8], filename: &str, max_bytes: u64) -> AppResult<StoredFile> {
     if bytes.is_empty() {

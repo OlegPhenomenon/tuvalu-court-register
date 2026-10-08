@@ -174,6 +174,20 @@ fn set_status(
          VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8)",
         params![case_id, from, to, why, basis, a.user_id, ts(-days_ago), ldate(-days_ago)],
     )?;
+    if !matches!(to, "closed" | "reopened") {
+        audit::record(
+            tx,
+            Some(a),
+            Event::new(
+                "case.status_changed",
+                "case",
+                case_id,
+                format!("Case status changed from {from} to {to}"),
+            )
+            .case(Some(case_id))
+            .details(json!({ "from": from, "to": to, "reason": why })),
+        )?;
+    }
     Ok(())
 }
 
@@ -288,7 +302,11 @@ fn document(
             "document.uploaded",
             "document",
             document_id,
-            format!("Document '{title}' filed"),
+            match visibility {
+                "restricted" => format!("Restricted document #{document_id} filed"),
+                "judicial_note" => format!("Judicial note #{document_id} filed"),
+                _ => format!("Document '{title}' filed"),
+            },
         )
         .case(Some(case_id))
         .details(json!({ "visibility": visibility, "doc_type": doc_type })),
@@ -1259,6 +1277,15 @@ pub fn seed_cases(tx: &Transaction, db: &Db) -> AppResult<()> {
         "judge",
         "Allocated by the registry head",
         23,
+    )?;
+    assign(
+        tx,
+        &a_elena,
+        case6,
+        elena,
+        "registry_head",
+        "Oversees restricted document access",
+        21,
     )?;
     let (med, _med_v) = document(
         tx,

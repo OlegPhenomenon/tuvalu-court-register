@@ -26,7 +26,14 @@ async fn upload_idem(c: &Client, path: &str, key: &str, fields: &[(&str, &str)],
         .method(Method::POST)
         .uri(path)
         .header(header::HOST, "localhost")
-        .header(header::COOKIE, format!("tcr_sandbox={}; tcr_session={}", c.sandbox.clone().unwrap(), c.session.clone().unwrap()))
+        .header(
+            header::COOKIE,
+            format!(
+                "tcr_sandbox={}; tcr_session={}",
+                c.sandbox.clone().unwrap(),
+                c.session.clone().unwrap()
+            ),
+        )
         .header("x-tcr", "1")
         .header("idempotency-key", key)
         .header(header::CONTENT_TYPE, format!("multipart/form-data; boundary={boundary}"))
@@ -42,7 +49,14 @@ async fn delete_json(c: &Client, path: &str, body: Value) -> (StatusCode, Value)
         .method(Method::DELETE)
         .uri(path)
         .header(header::HOST, "localhost")
-        .header(header::COOKIE, format!("tcr_sandbox={}; tcr_session={}", c.sandbox.clone().unwrap(), c.session.clone().unwrap()))
+        .header(
+            header::COOKIE,
+            format!(
+                "tcr_sandbox={}; tcr_session={}",
+                c.sandbox.clone().unwrap(),
+                c.session.clone().unwrap()
+            ),
+        )
         .header("x-tcr", "1")
         .header(header::CONTENT_TYPE, "application/json")
         .body(Body::from(body.to_string()))
@@ -62,12 +76,18 @@ fn doc_fields<'a>(title: &'a str, doc_type: &'a str, visibility: &'a str) -> Vec
 }
 
 async fn upload_to_case(c: &Client, case_id: i64, title: &str, visibility: &str, filename: &str, bytes: &[u8]) -> (StatusCode, Value) {
-    c.upload(&format!("/api/cases/{case_id}/documents"), &doc_fields(title, "evidence", visibility), filename, bytes)
-        .await
+    c.upload(
+        &format!("/api/cases/{case_id}/documents"),
+        &doc_fields(title, "evidence", visibility),
+        filename,
+        bytes,
+    )
+    .await
 }
 
 async fn new_version(c: &Client, doc_id: i64, note: &str, filename: &str, bytes: &[u8]) -> (StatusCode, Value) {
-    c.upload(&format!("/api/documents/{doc_id}/versions"), &[("note", note)], filename, bytes).await
+    c.upload(&format!("/api/documents/{doc_id}/versions"), &[("note", note)], filename, bytes)
+        .await
 }
 
 /// Assign a persona to a case through Elena's permissions.
@@ -107,7 +127,13 @@ async fn upload_list_detail_and_download() {
     let (_, list) = olga.get(&format!("/api/cases/{case_id}/documents")).await;
     assert!(list["items"].as_array().unwrap().iter().any(|d| d["id"] == doc_id));
     let (_, all) = olga.get("/api/documents?q=Statement").await;
-    assert!(all["items"].as_array().unwrap().iter().any(|d| d["id"] == doc_id && d["case_number"] == number));
+    assert!(
+        all["items"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|d| d["id"] == doc_id && d["case_number"] == number)
+    );
 
     // Detail shows the same data.
     let (s, d) = olga.get(&format!("/api/documents/{doc_id}")).await;
@@ -119,7 +145,13 @@ async fn upload_list_detail_and_download() {
     assert_eq!(s, StatusCode::OK);
     assert_eq!(h.get("x-content-type-options").unwrap(), "nosniff");
     assert!(h.get(header::CACHE_CONTROL).unwrap().to_str().unwrap().contains("no-store"));
-    assert!(h.get(header::CONTENT_DISPOSITION).unwrap().to_str().unwrap().starts_with("attachment"));
+    assert!(
+        h.get(header::CONTENT_DISPOSITION)
+            .unwrap()
+            .to_str()
+            .unwrap()
+            .starts_with("attachment")
+    );
     assert_eq!(body, bytes);
     assert_eq!(h.get(header::CONTENT_TYPE).unwrap(), "application/pdf");
 
@@ -195,6 +227,17 @@ async fn versions_accumulate_and_stay_downloadable() {
     let sha2 = b["versions"][1]["sha256"].as_str().unwrap().to_string();
     assert_ne!(sha1, sha2);
 
+    let db = olga.db(&app);
+    let conn = db.open().unwrap();
+    let audit_case: i64 = conn
+        .query_row(
+            "SELECT case_id FROM audit_events WHERE action = 'document.version_added' AND entity_id = ?1",
+            [doc_id],
+            |r| r.get(0),
+        )
+        .unwrap();
+    assert_eq!(audit_case, case_id);
+
     // Both versions remain downloadable, with their own bytes.
     let (s, _, body) = olga.get_bytes(&format!("/api/document-versions/{v1}/download")).await;
     assert_eq!(s, StatusCode::OK);
@@ -215,7 +258,15 @@ async fn restricted_document_grant_revoke_and_view_audit() {
     let pavel_id = user_id(&elena, "Pavel").await;
     assign(&elena, case_id, sergei_id, "service_officer").await;
 
-    let (s, b) = upload_to_case(&olga, case_id, "Medical report", "restricted", "medical.pdf", &pdf("medical findings")).await;
+    let (s, b) = upload_to_case(
+        &olga,
+        case_id,
+        "Medical report",
+        "restricted",
+        "medical.pdf",
+        &pdf("medical findings"),
+    )
+    .await;
     ok(s, &b);
     let doc_id = b["id"].as_i64().unwrap();
     let v1 = b["versions"][0]["id"].as_i64().unwrap();
@@ -228,17 +279,76 @@ async fn restricted_document_grant_revoke_and_view_audit() {
     let (s, _, _) = sergei.get_bytes(&format!("/api/document-versions/{v1}/download")).await;
     assert_eq!(s, StatusCode::NOT_FOUND);
 
+    let pavel = olga.switch("pavel").await;
+    let elena_id = user_id(&elena, "Elena").await;
+    let (s, b) = elena.get(&format!("/api/documents/{doc_id}")).await;
+    err(s, &b, StatusCode::NOT_FOUND, "not_found");
+    let db = olga.db(&app);
+    let conn = db.open().unwrap();
+    let audit_count = || {
+        conn.query_row("SELECT COUNT(*) FROM audit_events", [], |r| r.get::<_, i64>(0))
+            .unwrap()
+    };
+    let before = audit_count();
+    let (s, list) = elena.get(&format!("/api/cases/{case_id}/restricted-documents")).await;
+    ok(s, &list);
+    assert_eq!(audit_count(), before, "grant management list must not audit a view");
+    let item = list["items"].as_array().unwrap().iter().find(|d| d["id"] == doc_id).unwrap();
+    assert_eq!(item["title"], "Medical report");
+    let mut keys = item.as_object().unwrap().keys().map(String::as_str).collect::<Vec<_>>();
+    keys.sort();
+    assert_eq!(keys, ["created_at", "created_by_name", "doc_type", "grants", "id", "title"]);
+    assert!(item["grants"].as_array().unwrap().is_empty());
+    let (s, b) = elena
+        .post(
+            &format!("/api/documents/{doc_id}/grants"),
+            json!({ "user_id": elena_id, "reason": "Self grant" }),
+        )
+        .await;
+    err(s, &b, StatusCode::FORBIDDEN, "forbidden");
+    for c in [&olga, &sergei, &pavel] {
+        let (s, b) = c
+            .post(
+                &format!("/api/documents/{doc_id}/grants"),
+                json!({ "user_id": sergei_id, "reason": "Denied" }),
+            )
+            .await;
+        err(s, &b, StatusCode::NOT_FOUND, "not_found");
+    }
+    let (s, b) = olga.get(&format!("/api/cases/{case_id}/restricted-documents")).await;
+    err(s, &b, StatusCode::FORBIDDEN, "forbidden");
+    let (s, b) = pavel.get(&format!("/api/cases/{case_id}/restricted-documents")).await;
+    err(s, &b, StatusCode::NOT_FOUND, "not_found");
+
     // A grant cannot help someone with no case access at all.
-    let (s, b) = elena.post(&format!("/api/documents/{doc_id}/grants"), json!({"user_id": pavel_id, "reason": "Try"})).await;
+    let (s, b) = elena
+        .post(
+            &format!("/api/documents/{doc_id}/grants"),
+            json!({"user_id": pavel_id, "reason": "Try"}),
+        )
+        .await;
     err(s, &b, StatusCode::BAD_REQUEST, "validation");
 
     // Elena grants Sergei access with a reason.
     let (s, b) = elena
-        .post(&format!("/api/documents/{doc_id}/grants"), json!({"user_id": sergei_id, "reason": "Handles service on this case"}))
+        .post(
+            &format!("/api/documents/{doc_id}/grants"),
+            json!({"user_id": sergei_id, "reason": "Handles service on this case"}),
+        )
         .await;
     ok(s, &b);
     let gid = b["grant"]["id"].as_i64().unwrap();
     assert_eq!(b["grant"]["user_name"], "Sergei Novak");
+
+    let (_, managed) = elena.get(&format!("/api/cases/{case_id}/restricted-documents")).await;
+    assert_eq!(
+        managed["items"].as_array().unwrap().iter().find(|d| d["id"] == doc_id).unwrap()["grants"][0]["id"],
+        gid
+    );
+    for c in [&olga, &sergei, &pavel] {
+        let (s, b) = delete_json(c, &format!("/api/documents/{doc_id}/grants/{gid}"), json!({ "reason": "Denied" })).await;
+        err(s, &b, StatusCode::NOT_FOUND, "not_found");
+    }
 
     // Sergei can now see and download it; the view is audited.
     let (s, d) = sergei.get(&format!("/api/documents/{doc_id}")).await;
@@ -256,10 +366,17 @@ async fn restricted_document_grant_revoke_and_view_audit() {
             |r| r.get(0),
         )
         .unwrap();
-    assert!(views >= 1, "restricted view must be audited");
+    assert_eq!(views, 2, "detail and download must both be audited");
+    let detail_views: i64 = conn.query_row("SELECT COUNT(*) FROM audit_events WHERE action = 'document.viewed_restricted' AND entity_id = ?1 AND json_extract(details, '$.via') = 'detail'", [doc_id], |r| r.get(0)).unwrap();
+    assert_eq!(detail_views, 1);
 
     // Revoking (with a reason) removes access again; the row is kept.
-    let (s, b) = delete_json(&elena, &format!("/api/documents/{doc_id}/grants/{gid}"), json!({"reason": "No longer needed"})).await;
+    let (s, b) = delete_json(
+        &elena,
+        &format!("/api/documents/{doc_id}/grants/{gid}"),
+        json!({"reason": "No longer needed"}),
+    )
+    .await;
     ok(s, &b);
     assert!(b["grant"]["revoked_at"].is_string());
     let (s, _) = sergei.get(&format!("/api/documents/{doc_id}")).await;
@@ -285,7 +402,15 @@ async fn judicial_note_is_private_to_the_author_until_shared() {
     err(s, &b, StatusCode::FORBIDDEN, "forbidden");
 
     // Viktor uploads his working note; doc_type is forced to judicial_note.
-    let (s, b) = upload_to_case(&viktor, case_id, "Working note", "judicial_note", "note.pdf", &pdf("private reasoning")).await;
+    let (s, b) = upload_to_case(
+        &viktor,
+        case_id,
+        "Working note",
+        "judicial_note",
+        "note.pdf",
+        &pdf("private reasoning"),
+    )
+    .await;
     ok(s, &b);
     let doc_id = b["id"].as_i64().unwrap();
     let v1 = b["versions"][0]["id"].as_i64().unwrap();
@@ -304,19 +429,90 @@ async fn judicial_note_is_private_to_the_author_until_shared() {
 
     // Elena cannot grant access to a note — only the author can share it.
     let (s, _) = elena
-        .post(&format!("/api/documents/{doc_id}/grants"), json!({"user_id": olga_id, "reason": "She asked"}))
+        .post(
+            &format!("/api/documents/{doc_id}/grants"),
+            json!({"user_id": olga_id, "reason": "She asked"}),
+        )
         .await;
-    assert!(matches!(s, StatusCode::FORBIDDEN | StatusCode::NOT_FOUND));
+    assert_eq!(s, StatusCode::NOT_FOUND);
+
+    let (s, b) = delete_json(
+        &elena,
+        &format!("/api/documents/{doc_id}/grants/999999"),
+        json!({"reason": "Denied"}),
+    )
+    .await;
+    err(s, &b, StatusCode::NOT_FOUND, "not_found");
 
     // Viktor shares the note with Olga explicitly.
     let (s, b) = viktor
-        .post(&format!("/api/documents/{doc_id}/grants"), json!({"user_id": olga_id, "reason": "Clerk needs the context"}))
+        .post(
+            &format!("/api/documents/{doc_id}/grants"),
+            json!({"user_id": olga_id, "reason": "Clerk needs the context"}),
+        )
         .await;
     ok(s, &b);
     let (s, d) = olga.get(&format!("/api/documents/{doc_id}")).await;
     ok(s, &d);
     let (s, _, _) = olga.get_bytes(&format!("/api/document-versions/{v1}/download")).await;
     assert_eq!(s, StatusCode::OK);
+
+    // Sharing gives read-only access, including for a clerk with document.manage.
+    let (s, b) = new_version(&olga, doc_id, "Changed", "note2.pdf", &pdf("changed")).await;
+    err(s, &b, StatusCode::FORBIDDEN, "forbidden");
+    for change in [
+        json!({"title": "Renamed"}),
+        json!({"legal_hold": true}),
+        json!({"visibility": "administrative"}),
+    ] {
+        let mut change = change;
+        change["version"] = d["version"].clone();
+        let (s, b) = olga.patch(&format!("/api/documents/{doc_id}"), change).await;
+        err(s, &b, StatusCode::FORBIDDEN, "forbidden");
+    }
+    let (s, b) = olga
+        .post(
+            &format!("/api/documents/{doc_id}/grants"),
+            json!({ "user_id": olga_id, "reason": "Denied" }),
+        )
+        .await;
+    err(s, &b, StatusCode::NOT_FOUND, "not_found");
+    let (s, b) = delete_json(
+        &olga,
+        &format!("/api/documents/{doc_id}/grants/{}", b_grant_id(&viktor, doc_id).await),
+        json!({ "reason": "Denied" }),
+    )
+    .await;
+    err(s, &b, StatusCode::NOT_FOUND, "not_found");
+    let (_, list) = elena.get(&format!("/api/cases/{case_id}/restricted-documents")).await;
+    assert!(list["items"].as_array().unwrap().iter().all(|d| d["id"] != doc_id));
+    let db = olga.db(&app);
+    let conn = db.open().unwrap();
+    let summaries: Vec<String> = conn
+        .prepare("SELECT summary FROM audit_events WHERE entity_type = 'document' AND entity_id = ?1")
+        .unwrap()
+        .query_map([doc_id], |r| r.get(0))
+        .unwrap()
+        .collect::<Result<_, _>>()
+        .unwrap();
+    assert!(summaries.iter().all(|s| !s.contains("Working note")));
+    assert!(
+        summaries
+            .iter()
+            .any(|s| s == &format!("Judicial note #{doc_id} shared with Olga Marsh"))
+    );
+
+    // The author retains editing and version access.
+    let (s, b) = viktor
+        .patch(
+            &format!("/api/documents/{doc_id}"),
+            json!({"version": d["version"], "legal_hold": true}),
+        )
+        .await;
+    ok(s, &b);
+    let (s, b) = new_version(&viktor, doc_id, "Clarified reasoning", "note2.pdf", &pdf("clarified reasoning")).await;
+    ok(s, &b);
+    assert_eq!(b["versions"].as_array().unwrap().len(), 2);
 
     // The author sees the grant list in the detail.
     let (_, d) = viktor.get(&format!("/api/documents/{doc_id}")).await;
@@ -354,7 +550,12 @@ async fn ended_assignment_breaks_old_download_urls() {
         .unwrap()["id"]
         .as_i64()
         .unwrap();
-    let (s, _) = elena.post(&format!("/api/cases/{case_id}/assignments/{aid}/end"), json!({"reason": "Moved to another island"})).await;
+    let (s, _) = elena
+        .post(
+            &format!("/api/cases/{case_id}/assignments/{aid}/end"),
+            json!({"reason": "Moved to another island"}),
+        )
+        .await;
     assert_eq!(s, StatusCode::OK);
     let (s, _, _) = sergei.get_bytes(&format!("/api/document-versions/{v1}/download")).await;
     assert_eq!(s, StatusCode::NOT_FOUND);
@@ -373,10 +574,7 @@ async fn tech_admin_sees_nothing() {
     let v1 = b["versions"][0]["id"].as_i64().unwrap();
 
     let pavel = olga.switch("pavel").await;
-    for path in [
-        format!("/api/documents/{doc_id}"),
-        format!("/api/cases/{case_id}/documents"),
-    ] {
+    for path in [format!("/api/documents/{doc_id}"), format!("/api/cases/{case_id}/documents")] {
         let (s, _) = pavel.get(&path).await;
         assert_eq!(s, StatusCode::NOT_FOUND, "{path}");
     }
@@ -385,7 +583,12 @@ async fn tech_admin_sees_nothing() {
     let (_, all) = pavel.get("/api/documents").await;
     assert!(all["items"].as_array().unwrap().iter().all(|d| d["id"] != doc_id));
     let (s, _) = pavel
-        .upload(&format!("/api/cases/{case_id}/documents"), &doc_fields("x", "evidence", "party_material"), "x.pdf", &pdf("x"))
+        .upload(
+            &format!("/api/cases/{case_id}/documents"),
+            &doc_fields("x", "evidence", "party_material"),
+            "x.pdf",
+            &pdf("x"),
+        )
         .await;
     assert_eq!(s, StatusCode::NOT_FOUND);
 }
@@ -399,11 +602,15 @@ async fn intake_upload_and_checksum_warning() {
 
     let bytes = pdf("identical attachment");
     let fields = doc_fields("Attachment", "claim", "administrative");
-    let (s, b) = olga.upload(&format!("/api/intakes/{i1}/documents"), &fields, "att.pdf", &bytes).await;
+    let (s, b) = olga
+        .upload(&format!("/api/intakes/{i1}/documents"), &fields, "att.pdf", &bytes)
+        .await;
     ok(s, &b);
     assert_eq!(b["intake_id"], i1);
     assert!(b["case_id"].is_null());
-    let (s, b) = olga.upload(&format!("/api/intakes/{i2}/documents"), &fields, "att.pdf", &bytes).await;
+    let (s, b) = olga
+        .upload(&format!("/api/intakes/{i2}/documents"), &fields, "att.pdf", &bytes)
+        .await;
     ok(s, &b);
     let doc2 = b["id"].as_i64().unwrap();
 
@@ -463,9 +670,11 @@ async fn idempotent_upload_replay() {
     let bytes = pdf("same bytes");
     let (s, first) = upload_idem(&olga, &format!("/api/cases/{case_id}/documents"), "up-1", &fields, "r.pdf", &bytes).await;
     ok(s, &first);
+    let before_replay = stored_blobs(&olga.db(&app));
     let (s, again) = upload_idem(&olga, &format!("/api/cases/{case_id}/documents"), "up-1", &fields, "r.pdf", &bytes).await;
     ok(s, &again);
     assert_eq!(first["id"], again["id"]);
+    assert_eq!(stored_blobs(&olga.db(&app)), before_replay);
 
     let (_, d) = olga.get(&format!("/api/documents/{}", first["id"].as_i64().unwrap())).await;
     assert_eq!(d["versions"].as_array().unwrap().len(), 1);
@@ -474,6 +683,7 @@ async fn idempotent_upload_replay() {
     let other = pdf("different bytes");
     let (s, b) = upload_idem(&olga, &format!("/api/cases/{case_id}/documents"), "up-1", &fields, "r.pdf", &other).await;
     err(s, &b, StatusCode::CONFLICT, "idempotency_mismatch");
+    assert_eq!(stored_blobs(&olga.db(&app)), before_replay);
 }
 
 #[tokio::test]
@@ -495,35 +705,234 @@ async fn patch_rules_and_version_locking() {
     let ver = b["version"].as_i64().unwrap();
 
     // Optimistic locking.
-    let (s, b) = olga.patch(&format!("/api/documents/{doc_id}"), json!({"version": ver + 9, "title": "No"})).await;
+    let (s, b) = olga
+        .patch(&format!("/api/documents/{doc_id}"), json!({"version": ver + 9, "title": "No"}))
+        .await;
     err(s, &b, StatusCode::CONFLICT, "version_conflict");
 
     // Sergei can see the document but lacks document.manage.
-    let (s, b) = sergei.patch(&format!("/api/documents/{doc_id}"), json!({"version": ver, "title": "No"})).await;
+    let (s, b) = sergei
+        .patch(&format!("/api/documents/{doc_id}"), json!({"version": ver, "title": "No"}))
+        .await;
     err(s, &b, StatusCode::FORBIDDEN, "forbidden");
 
     // The uploader may restrict and un-restrict it.
-    let (s, b) = olga.patch(&format!("/api/documents/{doc_id}"), json!({"version": ver, "title": "Editable (restricted)", "visibility": "restricted"})).await;
+    let (s, b) = olga
+        .patch(
+            &format!("/api/documents/{doc_id}"),
+            json!({"version": ver, "title": "Editable (restricted)", "visibility": "restricted"}),
+        )
+        .await;
     ok(s, &b);
     let ver = b["version"].as_i64().unwrap();
     assert_eq!(b["visibility"], "restricted");
-    let (s, b) = olga.patch(&format!("/api/documents/{doc_id}"), json!({"version": ver, "visibility": "party_material", "legal_hold": true})).await;
+    let (s, b) = olga
+        .patch(
+            &format!("/api/documents/{doc_id}"),
+            json!({"version": ver, "visibility": "party_material", "legal_hold": true}),
+        )
+        .await;
     ok(s, &b);
     assert_eq!(b["visibility"], "party_material");
     assert_eq!(b["legal_hold"], 1);
+
+    let db = olga.db(&app);
+    let conn = db.open().unwrap();
+    let summaries: Vec<String> = conn
+        .prepare("SELECT summary FROM audit_events WHERE action = 'document.updated' AND entity_id = ?1")
+        .unwrap()
+        .query_map([doc_id], |r| r.get(0))
+        .unwrap()
+        .collect::<Result<_, _>>()
+        .unwrap();
+    assert_eq!(summaries, vec![format!("Restricted document #{doc_id} details changed"); 2]);
 
     // A judicial note's visibility never changes, in either direction.
     let (s, b) = upload_to_case(&viktor, case_id, "Note", "judicial_note", "n.pdf", &pdf("n")).await;
     ok(s, &b);
     let note_id = b["id"].as_i64().unwrap();
     let note_ver = b["version"].as_i64().unwrap();
-    let (s, b) = viktor.patch(&format!("/api/documents/{note_id}"), json!({"version": note_ver, "visibility": "administrative"})).await;
+    let (s, b) = viktor
+        .patch(
+            &format!("/api/documents/{note_id}"),
+            json!({"version": note_ver, "visibility": "administrative"}),
+        )
+        .await;
     err(s, &b, StatusCode::BAD_REQUEST, "validation");
-    let (s, b) = olga.patch(&format!("/api/documents/{doc_id}"), json!({"version": b_version(&olga, doc_id).await, "visibility": "judicial_note"})).await;
+    let (s, b) = olga
+        .patch(
+            &format!("/api/documents/{doc_id}"),
+            json!({"version": b_version(&olga, doc_id).await, "visibility": "judicial_note"}),
+        )
+        .await;
     err(s, &b, StatusCode::BAD_REQUEST, "validation");
 }
 
 async fn b_version(c: &Client, doc_id: i64) -> i64 {
     let (_, d) = c.get(&format!("/api/documents/{doc_id}")).await;
     d["version"].as_i64().unwrap()
+}
+
+async fn b_grant_id(c: &Client, doc_id: i64) -> i64 {
+    let (_, d) = c.get(&format!("/api/documents/{doc_id}")).await;
+    d["grants"][0]["id"].as_i64().unwrap()
+}
+
+fn stored_blobs(db: &tuvalu_court::db::Db) -> Vec<std::path::PathBuf> {
+    fn collect(dir: &std::path::Path, out: &mut Vec<std::path::PathBuf>) {
+        for entry in std::fs::read_dir(dir).unwrap() {
+            let path = entry.unwrap().path();
+            if path.is_dir() {
+                collect(&path, out);
+            } else {
+                out.push(path);
+            }
+        }
+    }
+    let mut paths = Vec::new();
+    collect(db.files_dir(), &mut paths);
+    paths.sort();
+    paths
+}
+
+#[tokio::test]
+async fn uploads_validate_before_storage_and_discard_after_failed_writes() {
+    let app = TestApp::demo();
+    let olga = app.persona("olga").await;
+    let (case_id, _) = register_case(&olga, "Upload cleanup").await;
+    let intake = new_intake(&olga, "Cleanup intake").await;
+    let db = olga.db(&app);
+    let baseline = stored_blobs(&db);
+    for (field, value, status) in [
+        ("title", "", StatusCode::BAD_REQUEST),
+        ("doc_type", "missing", StatusCode::BAD_REQUEST),
+        ("visibility", "missing", StatusCode::BAD_REQUEST),
+        ("source", "missing", StatusCode::BAD_REQUEST),
+        ("source_party_id", "999999", StatusCode::BAD_REQUEST),
+        ("document_date", "2026-02-30", StatusCode::BAD_REQUEST),
+        ("received_date", "invalid", StatusCode::BAD_REQUEST),
+        ("is_paper_original", "true", StatusCode::BAD_REQUEST),
+        ("visibility", "judicial_note", StatusCode::FORBIDDEN),
+    ] {
+        let mut fields = doc_fields("Valid", "evidence", "party_material");
+        if let Some(entry) = fields.iter_mut().find(|(name, _)| *name == field) {
+            entry.1 = value;
+        } else {
+            fields.push((field, value));
+        }
+        for path in [
+            format!("/api/cases/{case_id}/documents"),
+            format!("/api/intakes/{intake}/documents"),
+        ] {
+            let (s, b) = olga.upload(&path, &fields, "valid.pdf", &pdf("valid")).await;
+            err(
+                s,
+                &b,
+                status,
+                if status == StatusCode::FORBIDDEN {
+                    "forbidden"
+                } else {
+                    "validation"
+                },
+            );
+            assert_eq!(stored_blobs(&db), baseline, "{field} on {path}");
+        }
+    }
+    let conn = db.open().unwrap();
+    conn.execute_batch(
+        "CREATE TRIGGER reject_upload BEFORE INSERT ON document_versions BEGIN SELECT RAISE(ABORT, 'forced write failure'); END;",
+    )
+    .unwrap();
+    let (s, _) = upload_to_case(&olga, case_id, "Fails write", "administrative", "valid.pdf", &pdf("valid")).await;
+    assert_eq!(s, StatusCode::INTERNAL_SERVER_ERROR);
+    assert_eq!(stored_blobs(&db), baseline);
+    conn.execute_batch("DROP TRIGGER reject_upload").unwrap();
+    let (s, d) = upload_to_case(&olga, case_id, "Versioned", "administrative", "valid.pdf", &pdf("valid")).await;
+    ok(s, &d);
+    let doc_id = d["id"].as_i64().unwrap();
+    let baseline = stored_blobs(&db);
+    let (s, b) = new_version(&olga, doc_id, "", "valid.pdf", &pdf("valid")).await;
+    err(s, &b, StatusCode::BAD_REQUEST, "validation");
+    assert_eq!(stored_blobs(&db), baseline);
+    conn.execute_batch(
+        "CREATE TRIGGER reject_upload BEFORE INSERT ON document_versions BEGIN SELECT RAISE(ABORT, 'forced write failure'); END;",
+    )
+    .unwrap();
+    let (s, _) = new_version(&olga, doc_id, "New version", "v2.pdf", &pdf("v2")).await;
+    assert_eq!(s, StatusCode::INTERNAL_SERVER_ERROR);
+    assert_eq!(stored_blobs(&db), baseline);
+}
+
+#[tokio::test]
+async fn intake_and_version_replays_and_concurrent_uploads_leave_no_orphans() {
+    let app = TestApp::demo();
+    let olga = app.persona("olga").await;
+    let intake = new_intake(&olga, "Replay intake").await;
+    let path = format!("/api/intakes/{intake}/documents");
+    let fields = doc_fields("Repeatable", "evidence", "administrative");
+    let bytes = pdf("same bytes");
+    let before = stored_blobs(&olga.db(&app)).len();
+    let (first, second) = tokio::join!(
+        upload_idem(&olga, &path, "intake-replay", &fields, "r.pdf", &bytes),
+        upload_idem(&olga, &path, "intake-replay", &fields, "r.pdf", &bytes)
+    );
+    ok(first.0, &first.1);
+    ok(second.0, &second.1);
+    assert_eq!(first.1, second.1);
+    assert_eq!(stored_blobs(&olga.db(&app)).len(), before + 1);
+    let version_path = format!("/api/documents/{}/versions", first.1["id"].as_i64().unwrap());
+    for path in [&path, &version_path] {
+        let (fields, key) = if path == &version_path {
+            (vec![("note", "Update")], "version-replay")
+        } else {
+            (fields.clone(), "intake-replay")
+        };
+        let (s, first) = upload_idem(&olga, path, key, &fields, "r.pdf", &bytes).await;
+        ok(s, &first);
+        let baseline = stored_blobs(&olga.db(&app));
+        let (s, replay) = upload_idem(&olga, path, key, &fields, "r.pdf", &bytes).await;
+        ok(s, &replay);
+        assert_eq!(first, replay);
+        assert_eq!(stored_blobs(&olga.db(&app)), baseline);
+        let (s, b) = upload_idem(&olga, path, key, &fields, "r.pdf", &pdf("changed")).await;
+        err(s, &b, StatusCode::CONFLICT, "idempotency_mismatch");
+        assert_eq!(stored_blobs(&olga.db(&app)), baseline);
+    }
+}
+
+#[tokio::test]
+async fn oversized_and_closed_case_uploads_are_rejected() {
+    let app = TestApp::demo();
+    let olga = app.persona("olga").await;
+    let (case_id, _) = register_case(&olga, "Closed uploads").await;
+    let db = olga.db(&app);
+    let baseline = stored_blobs(&db);
+    let large = vec![b'x'; app.state.cfg.upload_max_bytes as usize + 1];
+    let (s, b) = upload_to_case(&olga, case_id, "Large", "party_material", "large.pdf", &large).await;
+    err(s, &b, StatusCode::PAYLOAD_TOO_LARGE, "too_large");
+    assert_eq!(stored_blobs(&db), baseline);
+    let (s, d) = upload_to_case(&olga, case_id, "Old", "administrative", "old.pdf", &pdf("old")).await;
+    ok(s, &d);
+    let doc_id = d["id"].as_i64().unwrap();
+    let conn = db.open().unwrap();
+    let intake: i64 = conn
+        .query_row("SELECT id FROM intakes WHERE case_id = ?1", [case_id], |r| r.get(0))
+        .unwrap();
+    let (s, b) = olga
+        .post(&format!("/api/cases/{case_id}/close"), json!({ "basis": "settled" }))
+        .await;
+    ok(s, &b);
+    let baseline = stored_blobs(&db);
+    for path in [
+        format!("/api/cases/{case_id}/documents"),
+        format!("/api/intakes/{intake}/documents"),
+    ] {
+        let (s, b) = olga
+            .upload(&path, &doc_fields("New", "evidence", "party_material"), "new.pdf", &pdf("new"))
+            .await;
+        err(s, &b, StatusCode::CONFLICT, "invalid_transition");
+    }
+    let (s, b) = new_version(&olga, doc_id, "New version", "new.pdf", &pdf("new")).await;
+    err(s, &b, StatusCode::CONFLICT, "invalid_transition");
+    assert_eq!(stored_blobs(&db), baseline);
 }

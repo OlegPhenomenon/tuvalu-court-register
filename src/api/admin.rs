@@ -161,6 +161,23 @@ fn user_exists(conn: &Connection, id: i64) -> AppResult<()> {
     .ok_or_else(AppError::not_found)
 }
 
+/// Accounts with court-authority powers must be managed through the CLI.
+fn require_manageable_user(conn: &Connection, id: i64) -> AppResult<()> {
+    user_exists(conn, id)?;
+    let judge: bool = conn.query_row("SELECT is_judge FROM users WHERE id = ?1", [id], |r| {
+        r.get(0)
+    })?;
+    let permissions = user_permissions_of(conn, id)?;
+    if judge
+        || permissions
+            .iter()
+            .any(|p| p == perm::ADMIN_USERS || !perm::ADMIN_GRANTABLE.contains(&p.as_str()))
+    {
+        return Err(AppError::forbidden(GRANT_MESSAGE));
+    }
+    Ok(())
+}
+
 fn user_json(conn: &Connection, id: i64) -> AppResult<Value> {
     let mut u = query_one_json(
         conn,
@@ -357,8 +374,7 @@ struct PermissionsReq {
     permissions: Vec<String>,
 }
 
-/// Replace the admin-grantable slice of a user's permissions. Permissions outside
-/// ADMIN_GRANTABLE that the user already holds are preserved untouched.
+/// Replace the grantable permissions of a manageable account, preserving unchanged rows.
 async fn user_permissions(
     ctx: Ctx,
     Path(id): Path<i64>,
@@ -366,15 +382,13 @@ async fn user_permissions(
 ) -> JsonResult {
     ctx.actor.require(perm::ADMIN_USERS)?;
     if ctx.actor.user_id == id {
-        return Err(AppError::forbidden(
-            "You cannot change your own permissions.",
-        ));
+        return Err(AppError::forbidden(GRANT_MESSAGE));
     }
     let actor = ctx.actor;
     let v = ctx
         .db
         .write(move |tx| {
-            user_exists(tx, id)?;
+            require_manageable_user(tx, id)?;
             for p in &req.permissions {
                 if !permission_known(p) {
                     return Err(AppError::validation(format!("Unknown permission '{p}'.")));
@@ -398,8 +412,10 @@ async fn user_permissions(
             }
             next.sort();
             let now = crate::time::now_utc();
-            tx.execute("DELETE FROM user_permissions WHERE user_id = ?1", [id])?;
-            for p in &next {
+            for p in existing.iter().filter(|p| perm::ADMIN_GRANTABLE.contains(&p.as_str()) && !next.contains(p)) {
+                tx.execute("DELETE FROM user_permissions WHERE user_id = ?1 AND permission = ?2", params![id, p])?;
+            }
+            for p in next.iter().filter(|p| perm::ADMIN_GRANTABLE.contains(&p.as_str()) && !existing.contains(p)) {
                 tx.execute(
                     "INSERT INTO user_permissions (user_id, permission, granted_by, granted_at) VALUES (?1, ?2, ?3, ?4)",
                     params![id, p, actor.user_id, now],
@@ -433,14 +449,13 @@ async fn user_deactivate(
 ) -> JsonResult {
     ctx.actor.require(perm::ADMIN_USERS)?;
     if ctx.actor.user_id == id {
-        return Err(AppError::forbidden(
-            "You cannot deactivate your own account.",
-        ));
+        return Err(AppError::forbidden(GRANT_MESSAGE));
     }
     let actor = ctx.actor;
     let v = ctx
         .db
         .write(move |tx| {
+            require_manageable_user(tx, id)?;
             let before = user_json(tx, id)?;
             if before["active"].as_i64() == Some(0) {
                 return Err(AppError::invalid_transition("This account is already deactivated."));
@@ -449,10 +464,20 @@ async fn user_deactivate(
             let now = crate::time::now_utc();
             tx.execute("UPDATE users SET active = 0, deactivated_at = ?2 WHERE id = ?1", params![id, now])?;
             let revoked = auth::revoke_user_sessions(tx, id)?;
+            let assignments = query_json(tx,
+                "SELECT id, case_id, role FROM case_assignments WHERE user_id = ?1 AND end_at IS NULL", [id])?;
             let ended = tx.execute(
                 "UPDATE case_assignments SET end_at = ?2, ended_by = ?3, end_reason = ?4 WHERE user_id = ?1 AND end_at IS NULL",
                 params![id, now, actor.user_id, format!("Account deactivated: {why}")],
             )?;
+            for assignment in assignments {
+                let case_id = assignment["case_id"].as_i64().unwrap_or_default();
+                audit::record(tx, Some(&actor), Event::new("case.unassigned", "case", case_id,
+                    "Assignment ended after account deactivation")
+                    .case(Some(case_id))
+                    .details(json!({ "assignment_id": assignment["id"], "user_id": id,
+                        "role": assignment["role"], "reason": format!("Account deactivated: {why}") })))?;
+            }
             let after = user_json(tx, id)?;
             audit::record(
                 tx,
@@ -546,7 +571,7 @@ async fn user_reset_password(
     let v = ctx
         .db
         .write(move |tx| {
-            user_exists(tx, id)?;
+            require_manageable_user(tx, id)?;
             let why = reason(&req.reason)?;
             let temp = temporary_password();
             let hash = auth::hash_password(&temp)?;
@@ -583,7 +608,7 @@ async fn user_reset_mfa(
     let v = ctx
         .db
         .write(move |tx| {
-            user_exists(tx, id)?;
+            require_manageable_user(tx, id)?;
             let why = reason(&req.reason)?;
             tx.execute(
                 "UPDATE users SET totp_secret = NULL, totp_pending = NULL, totp_last_step = NULL WHERE id = ?1",
