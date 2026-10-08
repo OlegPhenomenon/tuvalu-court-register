@@ -1,0 +1,109 @@
+# Assumptions and design decisions — Tuvalu Court Register
+
+Everything below is a **design decision made by the developer**, not a fact about
+the Tuvalu courts. The spec (`docs/spec/SPEC_RU.txt`) deliberately leaves these
+open; each must be confirmed with the Office of the Judiciary before real use
+(§15).
+
+## Platform
+
+1. **Stack override.** Spec §13 suggested Rails + Hotwire + PostgreSQL + Docker
+   Compose. The implementation is **Rust (axum) + SQLite + React/Vite/TypeScript**.
+   Rationale: one small self-contained binary, minimal memory footprint, no
+   database server to operate, single-file encrypted backup — a good fit for a
+   small jurisdiction running one modest host. Atomicity guarantees (case
+   numbering, hearing booking, finalisation) come from `BEGIN IMMEDIATE`
+   single-writer transactions plus database constraints/triggers, not from
+   Postgres-specific features. Consequence: single-node deployment only; high
+   availability would require re-platforming the storage layer.
+2. **No external services.** E-mail, e-signature and OCR are all local/absent —
+   nothing depends on a paid third-party API or LLM.
+
+## Calendar, numbering, formats
+
+3. **Fixed timezone.** Court-local time is compiled in as **Pacific/Funafuti =
+   UTC+12, no DST** (`src/time.rs`), not configurable. Instants are stored in
+   UTC; calendar dates (document date, received date, registration date,
+   closure date, due date) are stored separately as court-local `YYYY-MM-DD`.
+   The browser timezone never changes a court date.
+4. **Case number format** `<SERIES>-<YYYY>-<NNNN>` (e.g. `DEMO-CIV-2026-0001`)
+   per registry series and calendar year; uniqueness is enforced by the
+   database and gaps are never back-filled. Real courts configure their own
+   series/format. Imported legacy numbers are preserved in `legacy_number`, not
+   overwritten.
+5. **Hearing intervals are `[start, end)`** — 09:00–10:00 does not conflict with
+   10:00–11:00. An optional buffer between hearings is the setting
+   `hearing_buffer_minutes` (default 0); no buffer is invented.
+6. **Intake reference prefix** defaults to `IN`; court name and reference lists
+   are settings, editable by `admin.settings`.
+
+## Data model choices
+
+7. **Reference lists are examples.** Case categories, intake channels, origin
+   islands, document types, closure bases, hearing types, participant roles,
+   dispatch methods, relation kinds and message templates are seeded as
+   editable sample data (`src/seed.rs`) — they are **not** official Tuvalu
+   classifications.
+8. **Persona permission sets** (`src/seed.rs`, also in the README table) are a
+   demo design, not an org chart. In production the court grants permissions
+   per person; judicial/case-access permissions additionally require the CLI
+   `grant` command, not the admin UI.
+9. **Intake supplements** are separate intake rows linked to the original
+   (`related_intakes`), not file attachments appended in place. A supplement
+   cannot be marked ready or registered on its own. Intakes are never deleted;
+   a duplicate keeps a link to its source intake.
+10. **Closure is a registry state.** `closed` requires a basis, a responsible
+    person and resolution of open items (each must be completed, cancelled with
+    a reason, or carried forward with a reason). `closed`/`reopened` assert
+    nothing about appeals being exhausted or the judgment being final.
+11. **Demo-only early outcomes.** Production refuses to record a hearing
+    outcome before its start time; demo mode allows it so visitors can finish
+    the walkthrough on fictional dates (`src/api/hearings.rs`).
+12. **Dispatch = local mailbox.** Notices and copy packages are drafted from
+    templates, reviewed by a person, queued to an internal outbox and delivered
+    to a **local mailbox viewer** (`/api/mailbox`). Nothing leaves the server;
+    "sent" means "placed in the local mailbox". Human confirmation of hand
+    delivery and the legal assessment of service are separate manual records.
+    Wiring real e-mail would require adding an SMTP sender behind the same
+    outbox.
+13. **No retention/destruction policy** (spec §10). Production never deletes
+    cases, intakes or audit rows automatically; the retention schedule is the
+    court's decision. Demo sandbox expiry applies to fictional data only.
+14. **Optimistic locking & idempotency** are API conventions: editable records
+    carry `version`; create-type operations accept `Idempotency-Key`, and a
+    replay returns the stored result (a second case number/decision/attempt is
+    never produced).
+
+## Import / export / backup formats
+
+15. **Legacy case import CSV** columns:
+    `number,category,title,registered_date,status,responsible_username,closed_date,closure_basis,parties`.
+    Flow is preview → conflict/missing report → idempotent commit. Original
+    registration dates are kept; rows with missing data are flagged
+    `historical_incomplete` rather than filled with invented facts.
+16. **File import package** = a zip with `manifest.csv`
+    (`case_number,filename,title,doc_type,visibility,document_date`) plus the
+    files. Traversal paths, symlinks, duplicate entries and declared-size
+    over-expansion are rejected; the archive cannot write outside its staging
+    area.
+17. **Case export (user package)** = a zip containing only the document
+    versions the requesting user is permitted to see, plus `manifest.json`
+    (`tcr-case-export/1`) with the case's permitted chronology. It is **not** a
+    backup and cannot restore restricted data.
+18. **Backup format** `.tcrb`: zip manifest + `db.sqlite` snapshot + all stored
+    files, encrypted with chunked XChaCha20-Poly1305 (`src/backup.rs`). Restore
+    verifies everything before publishing and requires an empty target
+    directory.
+
+## To confirm with the court before real use (spec §15)
+
+- Court units, registries, number series and their powers.
+- Real case categories and numbering rules.
+- Intake/registration procedure: what "ready for registration" means and who
+  performs it.
+- Who assigns the judge and who finalises decisions.
+- Mandatory document types and filing requirements.
+- Approved service and copy-delivery methods (whether real e-mail is wanted).
+- Access rules, retention and destruction policy.
+- How legacy cases should be migrated, and whether an existing system or
+  contractor must interoperate.
