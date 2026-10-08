@@ -10,7 +10,7 @@ use crate::state::AppState;
 use axum::extract::{Path, Query};
 use axum::routing::{get, post};
 use axum::{Json, Router};
-use rusqlite::{Connection, OptionalExtension, Transaction, params};
+use rusqlite::{Connection, Transaction, params};
 use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
 

@@ -330,3 +330,86 @@ pub async fn settlement_document(c: &Client, app: &TestApp, case_id: i64) -> i64
     db.open().unwrap().execute("UPDATE documents SET document_date=?2 WHERE id=?1", rusqlite::params![doc, today()]).unwrap();
     vid
 }
+
+/// A database at schema version 6 (before the audit migrations) holding legacy rows written with
+/// that schema only: a case, a document with two versions, a finalised decision, a sent dispatch
+/// with its mailbox copy and a queued notice. Today's DEMO seed targets the current schema.
+pub fn legacy_v6_db(dir: &std::path::Path) -> tuvalu_court::db::Db {
+    let db = tuvalu_court::db::Db::new(dir.join("legacy.sqlite"), dir.join("legacy-files"), None);
+    std::fs::create_dir_all(db.files_dir()).unwrap();
+    let conn = db.open().unwrap();
+    for sql in [
+        include_str!("../../src/migrations/0001_init.sql"),
+        include_str!("../../src/migrations/0002_hearings.sql"),
+        include_str!("../../src/migrations/0003_documents.sql"),
+        include_str!("../../src/migrations/0004_dispatch.sql"),
+        include_str!("../../src/migrations/0005_reports.sql"),
+        include_str!("../../src/migrations/0006_admin.sql"),
+    ] {
+        conn.execute_batch(sql).unwrap();
+    }
+    conn.execute_batch("PRAGMA user_version=6").unwrap();
+    tuvalu_court::seed::seed_reference(&db).unwrap();
+    let now = tuvalu_court::time::now_utc();
+    conn.execute(
+        "INSERT INTO users (username, display_name, password_hash, is_judge, created_at) VALUES ('legacyjudge', 'DEMO Legacy Judge', 'x', 1, ?1)",
+        [&now],
+    )
+    .unwrap();
+    let uid = conn.last_insert_rowid();
+    conn.execute_batch("INSERT INTO court_units (code, name) VALUES ('DEMO-LEG', 'DEMO legacy court unit (fictional)')").unwrap();
+    conn.execute(
+        "INSERT INTO registries (court_unit_id, series, name) VALUES (?1, 'DEMO-CIV', 'DEMO civil register')",
+        [conn.last_insert_rowid()],
+    )
+    .unwrap();
+    let registry = conn.last_insert_rowid();
+    conn.execute(
+        "INSERT INTO cases (registry_id, year, seq, number, title, category, status, registered_date, registered_at, registered_by, updated_at)
+         VALUES (?1, 2025, 1, 'DEMO-CIV-2025-0001', 'DEMO legacy case', 'civil_contract', 'active', '2025-03-01', ?2, ?3, ?2)",
+        rusqlite::params![registry, now, uid],
+    )
+    .unwrap();
+    let case_id = conn.last_insert_rowid();
+    let (doc, v1) = insert_document(&db, case_id, "DEMO legacy order", "order", "party_material", uid);
+    let v2_bytes = pdf("DEMO legacy order v2");
+    let (blob, sha) = tuvalu_court::storage::write_blob(&db, &v2_bytes).unwrap();
+    conn.execute(
+        "INSERT INTO document_versions (document_id, version_no, filename, content_type, size_bytes, sha256, storage_key, scan_status, uploaded_by, uploaded_at)
+         VALUES (?1, 2, 'DEMO_legacy_order_v2.pdf', 'application/pdf', ?6, ?2, ?3, 'clean', ?4, ?5)",
+        rusqlite::params![doc, sha, blob, uid, now, v2_bytes.len() as i64],
+    )
+    .unwrap();
+    conn.execute(
+        "INSERT INTO decisions (case_id, title, decision_date, status, document_id, document_version_id, author_user_id, finalised_by, finalised_at, created_at)
+         VALUES (?1, 'DEMO legacy order', '2025-04-01', 'finalised', ?2, ?3, ?4, ?4, ?5, ?5)",
+        rusqlite::params![case_id, doc, v1, uid, now],
+    )
+    .unwrap();
+    conn.execute(
+        "INSERT INTO parties (kind, name, contact_email, created_by, created_at) VALUES ('person', 'DEMO Legacy Party', 'legacy.party@example.invalid', ?1, ?2)",
+        rusqlite::params![uid, now],
+    )
+    .unwrap();
+    let party = conn.last_insert_rowid();
+    for (kind, status) in [("copies", "sent"), ("notice", "queued")] {
+        conn.execute(
+            "INSERT INTO dispatches (case_id, kind, recipient_party_id, recipient_name, method, address, subject, body, status, prepared_by, prepared_at, queued_by, queued_at, sent_at)
+             VALUES (?1, ?2, ?3, 'DEMO Legacy Party', 'email', 'legacy.party@example.invalid', 'DEMO legacy message', 'DEMO body', ?4, ?5, ?6, ?5, ?6,
+                     CASE WHEN ?4 = 'sent' THEN ?6 END)",
+            rusqlite::params![case_id, kind, party, status, uid, now],
+        )
+        .unwrap();
+        let dispatch = conn.last_insert_rowid();
+        conn.execute("INSERT INTO dispatch_items (dispatch_id, document_version_id) VALUES (?1, ?2)", rusqlite::params![dispatch, v1]).unwrap();
+        if status == "sent" {
+            conn.execute(
+                "INSERT INTO mailbox (dispatch_id, attempt_no, to_address, subject, body, attachments, delivered_at)
+                 VALUES (?1, 1, 'legacy.party@example.invalid', 'DEMO legacy message', 'DEMO body', '[]', ?2)",
+                rusqlite::params![dispatch, now],
+            )
+            .unwrap();
+        }
+    }
+    db
+}

@@ -612,24 +612,8 @@ async fn f08_t19_t21_labels_survive_custom_edits_and_mailbox_delivery() {
 #[tokio::test]
 async fn f07_t13_schema_upgrade_preserves_existing_dispatch_history() {
     let app = TestApp::production();
-    let path = app.dir.join("legacy.sqlite");
-    let files = app.dir.join("legacy-files");
-    let db = tuvalu_court::db::Db::new(path, files, None);
-    std::fs::create_dir_all(db.files_dir()).unwrap();
+    let db = legacy_v6_db(&app.dir);
     let conn = db.open().unwrap();
-    for sql in [
-        include_str!("../src/migrations/0001_init.sql"),
-        include_str!("../src/migrations/0002_hearings.sql"),
-        include_str!("../src/migrations/0003_documents.sql"),
-        include_str!("../src/migrations/0004_dispatch.sql"),
-        include_str!("../src/migrations/0005_reports.sql"),
-        include_str!("../src/migrations/0006_admin.sql"),
-    ] {
-        conn.execute_batch(sql).unwrap();
-    }
-    conn.execute_batch("PRAGMA user_version=6").unwrap();
-    tuvalu_court::seed::seed_reference(&db).unwrap();
-    tuvalu_court::seed::seed_demo(&db).unwrap();
     let before: i64 = conn
         .query_row("SELECT count(*) FROM dispatches", [], |r| r.get(0))
         .unwrap();

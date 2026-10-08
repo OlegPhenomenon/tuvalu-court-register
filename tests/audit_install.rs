@@ -4,6 +4,8 @@ use common::*;
 use serde_json::{Value, json};
 use std::process::{Command, Stdio};
 use tuvalu_court::{auth, outbox, seed};
+/// Import/export share one process-wide heavy-operation permit; serialise the tests that use it.
+static HEAVY: std::sync::LazyLock<tokio::sync::Mutex<()>> = std::sync::LazyLock::new(|| tokio::sync::Mutex::new(()));
 
 async fn enrolled(app: &TestApp) -> Client {
     let db = app.state.main_db.as_ref().unwrap();
@@ -656,6 +658,7 @@ async fn f10_t34_clamd_clean_infected_error_timeout() {
 
 #[tokio::test]
 async fn f10_t34_pending_and_quarantine_block_all_file_channels() {
+    let _lock = HEAVY.lock().await;
     let app = TestApp::demo();
     let c = app.persona("olga").await;
     let (cid, _) = register_case(&c, "DEMO blocked channels").await;
@@ -707,6 +710,7 @@ async fn f10_t34_pending_and_quarantine_block_all_file_channels() {
 
 #[tokio::test]
 async fn f10_t34_file_import_is_not_a_quarantine_bypass() {
+    let _lock = HEAVY.lock().await;
     let (endpoint, server) = fake_clamd("stream: Eicar FOUND\0").await;
     let mut cfg = tuvalu_court::config::Config::for_tests(Default::default(), tuvalu_court::config::Mode::Production);
     cfg.clamd = Some(endpoint);
@@ -1040,6 +1044,7 @@ async fn f16_t33_t36_env_file_cli_backup_restore_and_real_server_login() {
 
 #[tokio::test]
 async fn f10_t34_upload_is_pending_until_clamd_verdict() {
+    let _lock = HEAVY.lock().await;
     use tokio::io::{AsyncReadExt, AsyncWriteExt};
     let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
     let mut cfg = tuvalu_court::config::Config::for_tests(Default::default(), tuvalu_court::config::Mode::Production);
@@ -1299,21 +1304,8 @@ fn f16_t36_all_maintenance_commands_refuse_missing_source() {
 #[test]
 fn f10_f16_t33_t34_upgrade_preserves_old_versions_and_legacy_backups() {
     let app = TestApp::demo();
-    let db = tuvalu_court::db::Db::new(app.dir.join("old.sqlite"), app.dir.join("old-files"), None);
+    let db = legacy_v6_db(&app.dir);
     let conn = db.open().unwrap();
-    for sql in [
-        include_str!("../src/migrations/0001_init.sql"),
-        include_str!("../src/migrations/0002_hearings.sql"),
-        include_str!("../src/migrations/0003_documents.sql"),
-        include_str!("../src/migrations/0004_dispatch.sql"),
-        include_str!("../src/migrations/0005_reports.sql"),
-        include_str!("../src/migrations/0006_admin.sql"),
-    ] {
-        conn.execute_batch(sql).unwrap();
-    }
-    conn.execute_batch("PRAGMA user_version=6").unwrap();
-    seed::seed_reference(&db).unwrap();
-    seed::seed_demo(&db).unwrap();
     let versions: i64 = conn.query_row("SELECT COUNT(*) FROM document_versions", [], |r| r.get(0)).unwrap();
     let decisions: i64 = conn.query_row("SELECT COUNT(*) FROM decisions", [], |r| r.get(0)).unwrap();
     let key = app.dir.join("old.key");
