@@ -1,2 +1,3 @@
--- Reserved for the dispatch slice. Add schema changes here only if 0001 is insufficient.
-SELECT 1;
+-- Dispatch slice: the court-local date a manual handover/posting actually happened,
+-- recorded by record-sent (`at` stays the instant the row was written).
+ALTER TABLE delivery_attempts ADD COLUMN occurred_date TEXT;
