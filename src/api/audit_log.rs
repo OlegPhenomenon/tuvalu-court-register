@@ -251,11 +251,10 @@ fn event_json(
             )
             .optional()?
             .flatten();
-        if let Some(iid) = iid {
-            if super::intake::require_intake(c, actor, iid).is_err() {
+        if let Some(iid) = iid
+            && super::intake::require_intake(c, actor, iid).is_err() {
                 return Ok(None);
             }
-        }
     }
     let hidden_document = touches_hidden_document(c, actor, entity_type, entity_id, action)?
         || (entity_type == "decision"

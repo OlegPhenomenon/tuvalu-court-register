@@ -410,7 +410,7 @@ fn csv_cell(value: &Value) -> String {
         other => other.to_string(),
     };
     match s.chars().next() {
-        Some(c) if matches!(c, '=' | '+' | '-' | '@' | '\t' | '\r') => format!("'{s}"),
+        Some('=' | '+' | '-' | '@' | '\t' | '\r') => format!("'{s}"),
         _ => s,
     }
 }

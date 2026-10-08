@@ -436,11 +436,10 @@ fn check_upload_target_intake(conn: &Connection, actor: &Actor, intake_id: i64) 
 }
 
 fn check_open_case(conn: &Connection, actor: &Actor, case_id: Option<i64>) -> AppResult<()> {
-    if let Some(id) = case_id {
-        if policy::require_case(conn, actor, id)?.status == "closed" {
+    if let Some(id) = case_id
+        && policy::require_case(conn, actor, id)?.status == "closed" {
             return Err(AppError::invalid_transition("Reopen the case before adding documents."));
         }
-    }
     Ok(())
 }
 

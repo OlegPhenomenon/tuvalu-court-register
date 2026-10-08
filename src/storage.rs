@@ -678,8 +678,8 @@ impl<'a> PdfCodes<'a> {
                         } else {
                             self.sequence(code, &mut sequence)?;
                         }
-                        if let Some(previous) = self.previous {
-                            if self.next < 4096 {
+                        if let Some(previous) = self.previous
+                            && self.next < 4096 {
                                 self.prefix[self.next] = previous;
                                 self.suffix[self.next] = sequence[0];
                                 self.next += 1;
@@ -687,7 +687,6 @@ impl<'a> PdfCodes<'a> {
                                     self.width += 1;
                                 }
                             }
-                        }
                         self.previous = Some(code);
                         self.pending = sequence;
                     }
@@ -1148,11 +1147,10 @@ impl PdfCheck {
         if filters.len() > 1 && matches!(params, Some(PdfValue::Dict(_))) {
             return Err("PDF decode parameters do not match filters");
         }
-        if let Some(PdfValue::Array(a)) = params {
-            if a.len() != filters.len() {
+        if let Some(PdfValue::Array(a)) = params
+            && a.len() != filters.len() {
                 return Err("PDF decode parameters do not match filters");
             }
-        }
         // Image codecs are opaque only on image XObjects, never on arbitrary streams.
         if image
             && filters.iter().any(|f| {
@@ -1463,8 +1461,8 @@ impl PdfCheck {
             let mut normalized = Vec::with_capacity(name.len());
             let mut at = 0;
             while at < name.len() {
-                if name[at] == b'%' && at + 2 < name.len() {
-                    if let (Some(a), Some(b)) = (
+                if name[at] == b'%' && at + 2 < name.len()
+                    && let (Some(a), Some(b)) = (
                         (name[at + 1] as char).to_digit(16),
                         (name[at + 2] as char).to_digit(16),
                     ) {
@@ -1472,7 +1470,6 @@ impl PdfCheck {
                         at += 3;
                         continue;
                     }
-                }
                 normalized.push(name[at]);
                 at += 1;
             }
@@ -1546,16 +1543,15 @@ impl PdfCheck {
                 if pdf_field(d, b"EF").is_some() {
                     return Err("PDF contains attachments");
                 }
-                if let Some(subtype) = pdf_field(d, b"Subtype") {
-                    if pdf_name_is(Some(self.resolve(subtype, work)?), b"FileAttachment") {
+                if let Some(subtype) = pdf_field(d, b"Subtype")
+                    && pdf_name_is(Some(self.resolve(subtype, work)?), b"FileAttachment") {
                         return Err("PDF contains attachments");
                     }
-                }
                 if pdf_field(d, b"S").is_some() {
                     // /S is also used by non-action dictionaries (e.g. transparency).
                     let s = self.resolve(pdf_field(d, b"S").unwrap(), work)?;
-                    if let PdfValue::Name(n) = s {
-                        if [
+                    if let PdfValue::Name(n) = s
+                        && [
                             b"JavaScript".as_slice(),
                             b"Launch",
                             b"SubmitForm",
@@ -1578,7 +1574,6 @@ impl PdfCheck {
                         {
                             self.action(value, false, depth + 1, work)?;
                         }
-                    }
                 }
                 let annotation = pdf_name_is(pdf_field(d, b"Type"), b"Annot")
                     || matches!(pdf_field(d, b"Subtype"), Some(PdfValue::Name(n)) if [

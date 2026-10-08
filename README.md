@@ -154,11 +154,17 @@ docs/OPERATIONS.md  Install / upgrade / backup / restore runbook
 
 ```sh
 cargo test          # unit + integration tests; temporary data dirs, no external services
-cd web && npm run typecheck
+cd web && npm run typecheck && npm run build
+scripts/clean-install-check.sh   # needs Docker + python3: clean production install in a fresh
+                                 # volume, CLI accounts, TOTP + forced password change over HTTP,
+                                 # real data, encrypted backup, restore into a new volume, comparison
 ```
 
-See `ACCEPTANCE.md` for the requirement-by-requirement checklist and the tests
-that cover each item.
+See `ACCEPTANCE.md` for the requirement-by-requirement checklist and
+`TEST_RESULTS.md` for the latest recorded results. External services are replaced
+in tests by in-process fakes (an ESMTP server with TLS for the mail transport, a
+clamd INSTREAM server for the antivirus hook); a real provider and a real ClamAV
+must be verified at the installation.
 
 ## Resource footprint
 

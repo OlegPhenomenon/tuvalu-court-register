@@ -36,7 +36,7 @@ pub async fn run(state: AppState, mut rx: mpsc::UnboundedReceiver<Db>) {
                     process(db.clone()).await;
                 }
                 sweeps += 1;
-                if sweeps % 60 == 0
+                if sweeps.is_multiple_of(60)
                     && let Some(mgr) = state.sandboxes.clone()
                 {
                     match tokio::task::spawn_blocking(move || mgr.sweep()).await {

@@ -1,0 +1,2 @@
+# Internal transaction helpers take (tx, actor, ids…, fields…); 8 is the project limit.
+too-many-arguments-threshold = 8

@@ -520,11 +520,10 @@ pub fn restore(input: &Path, keyfile: &Path, target_dir: &Path) -> AppResult<Str
         } else {
             layout.join(&name)
         };
-        if let Some(b) = blob {
-            if entry.size() != b.size {
+        if let Some(b) = blob
+            && entry.size() != b.size {
                 return Err(invalid("Backup file size mismatch."));
             }
-        }
         if let Some(p) = path.parent() {
             fs::create_dir_all(p)?;
         }

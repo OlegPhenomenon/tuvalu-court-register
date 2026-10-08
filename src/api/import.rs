@@ -257,11 +257,10 @@ fn case_preview(
                 problems.push("Closed date cannot be in the future.".into());
             }
         }
-        if !r.closure_basis.is_empty() {
-            if let Err(e) = require_ref(c, "closure_basis", &r.closure_basis) {
+        if !r.closure_basis.is_empty()
+            && let Err(e) = require_ref(c, "closure_basis", &r.closure_basis) {
                 problems.push(e.message);
             }
-        }
         if let Err(e) = parties(c, &r.parties) {
             problems.push(e.message);
         }
@@ -309,11 +308,10 @@ fn case_preview(
                 problems.push("Choose a registry for legacy numbers.".into());
             }
         }
-        if let Some(id) = existing {
-            if policy::require_case(c, actor, id).is_err() {
+        if let Some(id) = existing
+            && policy::require_case(c, actor, id).is_err() {
                 problems.push("Number cannot be imported.".into());
             }
-        }
         if counts[&r.number] > 1 {
             problems.push("Duplicate number in this file.".into());
         }
@@ -615,9 +613,8 @@ async fn preview(ctx: Ctx, mp: Multipart, is_zip: bool) -> JsonResult {
     let result=ctx.db.write(move |tx| {
         let _permit = permit;
         let mut v=if is_zip { let files=unpack(&bytes)?; files_preview(tx,&actor,&file_rows(&files)?,&files)? } else { case_preview(tx,&actor,&cases_rows(&bytes)?,registry)? };
-        if let Some(quota) = db.quota_bytes() {
-            if storage::used_bytes(tx)?.saturating_add(bytes.len() as u64) > quota { return Err(too_large()); }
-        }
+        if let Some(quota) = db.quota_bytes()
+            && storage::used_bytes(tx)?.saturating_add(bytes.len() as u64) > quota { return Err(too_large()); }
         let (key,sha)=storage::write_blob(&db,&bytes)?;
         keys.lock().push(key.clone());
         tx.execute("INSERT INTO import_batches(kind,filename,source_sha256,storage_key,status,preview_json,created_by,created_at,source_options)

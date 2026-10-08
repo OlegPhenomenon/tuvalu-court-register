@@ -7,14 +7,13 @@ use std::time::Duration;
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 
 pub fn validate_endpoint(endpoint: &str) -> AppResult<()> {
-    if let Some(address) = endpoint.strip_prefix("tcp://") {
-        if address
+    if let Some(address) = endpoint.strip_prefix("tcp://")
+        && address
             .rsplit_once(':')
             .is_some_and(|(host, port)| !host.is_empty() && port.parse::<u16>().is_ok_and(|p| p > 0))
         {
             return Ok(());
         }
-    }
     #[cfg(unix)]
     if endpoint.strip_prefix("unix:").is_some_and(|p| p.starts_with('/') && p.len() > 1) {
         return Ok(());
