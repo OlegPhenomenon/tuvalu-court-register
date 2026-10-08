@@ -32,9 +32,9 @@ PDF p. 92) [T2].
 Boundary: the budget confirms the need and the expenditure line — it does **not**
 confirm a detailed technical specification, the absence of a contractor, or the
 court's current records procedures. Everything in this repository is a design
-proposal built on fictional data. See `ASSUMPTIONS.md` and
-`docs/spec/SPEC_RU.txt` §15 for what must be confirmed with the court before real
-use.
+proposal built on fictional data. See `ASSUMPTIONS.md` (last section) for what
+must be confirmed with the court before real use. Section and feature numbers
+(§N, C01–C18) refer to the project brief, which is not published in this repository.
 
 ## Features (spec C01–C18)
 

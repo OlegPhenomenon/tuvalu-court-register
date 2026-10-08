@@ -1,7 +1,7 @@
 # Assumptions and design decisions — Tuvalu Court Register
 
 Everything below is a **design decision made by the developer**, not a fact about
-the Tuvalu courts. The spec (`docs/spec/SPEC_RU.txt`) deliberately leaves these
+the Tuvalu courts. The project brief (not published in this repository) deliberately leaves these
 open; each must be confirmed with the Office of the Judiciary before real use
 (§15).
 

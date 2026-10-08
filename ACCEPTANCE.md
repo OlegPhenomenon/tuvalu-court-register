@@ -1,6 +1,6 @@
 # Acceptance checklist — Tuvalu Court Register
 
-Derived from `docs/spec/SPEC_RU.txt` §3–§4, §7–§12, §14 and features C01–C18.
+Derived from the project brief (not published here) §3–§4, §7–§12, §14 and features C01–C18.
 Every check names the automated test(s) that cover it, or "manual" where only
 the UI walkthrough demonstrates it (`docs/demo/`, `docs/demo/main-scenario.mp4`).
 

@@ -8,3 +8,4 @@ data/
 .worktrees/
 .playwright-mcp/
 .kamal/secrets
+docs/spec/

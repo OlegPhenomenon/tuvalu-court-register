@@ -1,6 +1,6 @@
 # Tuvalu Court Register — Architecture & Contract
 
-Source requirements: `docs/spec/SPEC_RU.txt` (Russian, authoritative for behaviour; C01–C18).
+Source requirements: the project brief (Russian, not published in this repository; authoritative for behaviour; C01–C18).
 Stack override vs spec §13: **Rust (axum) + SQLite + React (Vite, TypeScript)** instead of Rails/Postgres.
 Everything outside the court (e-mail, signatures, OCR) is local/mocked. UI language: **English**.
 All demo names/numbers are fictional and carry `DEMO`.
