@@ -6,6 +6,7 @@
  */
 
 import { useMemo, useState } from 'react';
+import { Link, useSearchParams } from 'react-router-dom';
 import { Button } from '../components/Button';
 import { Card } from '../components/Card';
 import { DispatchCard } from '../components/DispatchCard';
@@ -34,8 +35,14 @@ const KIND_FILTERS = [
 ];
 
 export default function Dispatch() {
+  const [params] = useSearchParams();
   const [status, setStatus] = useState('');
   const [kind, setKind] = useState('');
+
+  // ?dispatch={id} — a deep link (e.g. "Review and send now") shows that one
+  // dispatch directly, whatever filters would otherwise hide it.
+  const dispatchParam = params.get('dispatch');
+  const single = useApi<DispatchRecord>(dispatchParam ? `/dispatches/${dispatchParam}` : null);
 
   const path = useMemo(() => {
     const p = new URLSearchParams();
@@ -47,7 +54,9 @@ export default function Dispatch() {
     return `/dispatches${s ? `?${s}` : ''}`;
   }, [status, kind]);
 
-  const { data, error, loading, reload } = useApi<{ items: DispatchRecord[] }>(path);
+  const { data, error, loading, reload } = useApi<{ items: DispatchRecord[] }>(
+    dispatchParam ? null : path,
+  );
 
   const items = useMemo(() => {
     const all = data?.items ?? [];
@@ -56,6 +65,22 @@ export default function Dispatch() {
       (d) => !d.confirmations.some((c) => c.kind === 'human_handover'),
     );
   }, [data, status]);
+
+  if (dispatchParam) {
+    return (
+      <>
+        <PageHeader title="Dispatch" />
+        <p className="muted">
+          Showing one dispatch. <Link to="/dispatch">Show the whole dispatch queue</Link>
+        </p>
+        {single.loading && <p className="muted">Loading…</p>}
+        <ErrorBanner error={single.error} onRetry={single.reload} />
+        {single.data && (
+          <DispatchCard dispatch={single.data} showContext onChanged={single.reload} />
+        )}
+      </>
+    );
+  }
 
   return (
     <>

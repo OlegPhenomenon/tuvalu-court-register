@@ -5,9 +5,9 @@
  * locking (`version`), close uses an Idempotency-Key.
  */
 
-import { useRef, useState } from 'react';
+import { useEffect, useRef, useState } from 'react';
 import type { FormEvent, ReactNode } from 'react';
-import { Link, useNavigate } from 'react-router-dom';
+import { Link, useNavigate, useSearchParams } from 'react-router-dom';
 import { api, newKey, ApiError } from '../../api';
 import { Button } from '../../components/Button';
 import { Card } from '../../components/Card';
@@ -46,6 +46,7 @@ const OPEN_ITEM_TAB: Record<string, string> = {
   task: 'tasks',
   hearing: 'hearings',
   dispatch: 'dispatch',
+  unconfirmed_dispatch: 'dispatch',
   decision: 'decisions',
 };
 
@@ -145,7 +146,7 @@ function EditCaseModal({ caseData, onClose, onSaved }: {
           label="Responsible officer"
           value={responsible}
           onChange={setResponsible}
-          options={staffOptions(ref?.staff)}
+          options={staffOptions((ref?.staff ?? []).filter((s) => s.assignable !== false))}
           placeholder={c.responsible_user_id ? "Keep current responsible officer" : "Not assigned"}
           required={Boolean(c.responsible_user_id)}
         />
@@ -182,18 +183,33 @@ function CloseCaseModal({ caseId, onClose, onSaved }: {
   const [busy, setBusy] = useState(false);
   const [error, setError] = useState<unknown>(null);
   const [openItems, setOpenItems] = useState<OpenItem[] | null>(null);
+  // Per-dispatch reason for leaving a sent notice without a confirmed handover.
+  const [ackReasons, setAckReasons] = useState<Record<number, string>>({});
+
+  // `unconfirmed_dispatch` items block closing until each is either confirmed
+  // via the Dispatch tab or acknowledged here with a non-empty reason.
+  const unconfirmed = (openItems ?? []).filter((i) => i.kind === 'unconfirmed_dispatch');
+  const unacked = unconfirmed.filter((i) => !(ackReasons[i.id] ?? '').trim());
 
   const submit = async (e: FormEvent) => {
     e.preventDefault();
     setBusy(true);
     setError(null);
     setOpenItems(null);
+    const body: Record<string, unknown> = {
+      basis,
+      note: note || null,
+      closed_date: closedDate || null,
+    };
+    if (unconfirmed.length > 0) {
+      body.acknowledge = unconfirmed.map((i) => ({
+        kind: 'unconfirmed_dispatch',
+        id: i.id,
+        reason: (ackReasons[i.id] ?? '').trim(),
+      }));
+    }
     try {
-      await api('POST', `/cases/${caseId}/close`, {
-        basis,
-        note: note || null,
-        closed_date: closedDate || null,
-      }, { idempotencyKey: idemKey });
+      await api('POST', `/cases/${caseId}/close`, body, { idempotencyKey: idemKey });
       onSaved();
       onClose();
     } catch (err) {
@@ -222,11 +238,37 @@ function CloseCaseModal({ caseId, onClose, onSaved }: {
             <ul>
               {openItems.map((it) => (
                 <li key={`${it.kind}-${it.id}`}>
-                  <Link onClick={onClose} to={`?tab=${OPEN_ITEM_TAB[it.kind] ?? 'summary'}`}>{it.label}</Link>{' '}
-                  <StatusBadge status={it.status} />
+                  {it.kind === 'unconfirmed_dispatch' ? (
+                    <>
+                      {it.label} <StatusBadge status={it.status} /> —{' '}
+                      <Link onClick={onClose} to={`?tab=dispatch&dispatch=${it.id}`}>
+                        Confirm handover
+                      </Link>{' '}
+                      or leave it unconfirmed with a reason:
+                      <TextArea
+                        label={`Why “${it.label}” can stay unconfirmed`}
+                        value={ackReasons[it.id] ?? ''}
+                        onChange={(v) => setAckReasons((s) => ({ ...s, [it.id]: v }))}
+                        required
+                        rows={2}
+                        disabled={busy}
+                      />
+                    </>
+                  ) : (
+                    <>
+                      <Link onClick={onClose} to={`?tab=${OPEN_ITEM_TAB[it.kind] ?? 'summary'}`}>{it.label}</Link>{' '}
+                      <StatusBadge status={it.status} />
+                    </>
+                  )}
                 </li>
               ))}
             </ul>
+            {unconfirmed.length > 0 && (
+              <p>
+                Sent notices without a confirmed handover can be left as they are — write a short
+                reason for each; it is kept with the closure record.
+              </p>
+            )}
           </div>
         )}
         <SelectField
@@ -251,7 +293,7 @@ function CloseCaseModal({ caseId, onClose, onSaved }: {
           decision was enforced or that appeal rights have expired.
         </p>
         <div className="actions">
-          <Button type="submit" variant="danger" busy={busy} disabled={!basis}>
+          <Button type="submit" variant="danger" busy={busy} disabled={!basis || unacked.length > 0}>
             Close the case
           </Button>
           <Button type="button" variant="secondary" onClick={onClose}>Cancel</Button>
@@ -267,7 +309,7 @@ function CloseCaseModal({ caseId, onClose, onSaved }: {
 function AssignModal({ caseId, allowed, staff, onClose, onSaved }: {
   caseId: number;
   allowed: CaseData['allowed'];
-  staff: { id: number; display_name: string; title: string | null; is_judge: number | boolean }[];
+  staff: { id: number; display_name: string; title: string | null; is_judge: number | boolean; assignable?: boolean }[];
   onClose: () => void;
   onSaved: () => void;
 }) {
@@ -289,8 +331,11 @@ function AssignModal({ caseId, allowed, staff, onClose, onSaved }: {
   const [busy, setBusy] = useState(false);
   const [error, setError] = useState<unknown>(null);
 
-  // The judge role only accepts registered judicial officers.
-  const eligible = role === 'judge' ? staff.filter((s) => s.is_judge) : staff;
+  // The judge role only accepts registered judicial officers; people flagged
+  // non-assignable (system administration only) are never offered at all.
+  const eligible = (role === 'judge' ? staff.filter((s) => s.is_judge) : staff).filter(
+    (s) => s.assignable !== false,
+  );
 
   const submit = async (e: FormEvent) => {
     e.preventDefault();
@@ -411,6 +456,7 @@ function AddRelationModal({ caseId, onClose, onSaved }: {
 export default function SummaryTab({ caseId, caseData, reload }: CaseTabProps) {
   const [exportOpen, setExportOpen] = useState(false);
   const navigate = useNavigate();
+  const [params] = useSearchParams();
   const { data: ref, error: refError, reload: reloadRef } = useRefData();
   const c = caseData.case;
   const allowed = caseData.allowed;
@@ -427,6 +473,19 @@ export default function SummaryTab({ caseId, caseData, reload }: CaseTabProps) {
     setActionError(null);
     setModal(m);
   };
+
+  // Next-action links may deep-open a dialog: /cases/{id}?tab=summary&action=assign-judge.
+  const handledAction = useRef<string | null>(null);
+  useEffect(() => {
+    const action = params.get('action');
+    if (action && action !== handledAction.current) {
+      handledAction.current = action;
+      if (action === 'assign-judge' && (allowed.assign_judge || allowed.assign_staff)) {
+        openModal('assign');
+      }
+    }
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [params]);
 
   const run = async (fn: () => Promise<void>) => {
     setBusy(true);

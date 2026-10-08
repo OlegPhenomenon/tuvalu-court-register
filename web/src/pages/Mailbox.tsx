@@ -17,10 +17,13 @@ import { fmtLocal } from '../time';
 import './dispatch.css';
 
 interface MailAttachment {
-  filename: string;
-  sha256: string;
-  size_bytes: number;
-  document_version_id: number;
+  filename?: string;
+  sha256?: string;
+  size_bytes?: number;
+  /** Missing/unknown when the version was redacted or the row predates version ids. */
+  document_version_id?: number | null;
+  /** The server redacts versions the viewer may not see. */
+  restricted?: boolean;
 }
 
 /** GET /api/mailbox item (mailbox.rs). */
@@ -128,15 +131,23 @@ export default function Mailbox() {
                 <div className="dispatch-section">
                   <h3>Attachments</h3>
                   <ul className="dispatch-items">
-                    {selected.attachments.map((a) => (
-                      <li key={a.document_version_id}>
-                        <a
-                          href={downloadUrl(`/document-versions/${a.document_version_id}/download`)}
-                          download
-                        >
-                          {a.filename}
-                        </a>{' '}
-                        <span className="muted">({fmtSize(a.size_bytes)})</span>
+                    {selected.attachments.map((a, i) => (
+                      <li key={a.document_version_id ?? i}>
+                        {a.restricted || !a.document_version_id ? (
+                          <span className="muted">Restricted document (not shown)</span>
+                        ) : (
+                          <>
+                            <a
+                              href={downloadUrl(`/document-versions/${a.document_version_id}/download`)}
+                              download
+                            >
+                              {a.filename}
+                            </a>{' '}
+                            {typeof a.size_bytes === 'number' && (
+                              <span className="muted">({fmtSize(a.size_bytes)})</span>
+                            )}
+                          </>
+                        )}
                       </li>
                     ))}
                   </ul>

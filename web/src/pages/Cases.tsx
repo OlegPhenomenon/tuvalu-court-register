@@ -17,7 +17,7 @@ import { PageHeader } from '../components/PageHeader';
 import { StatusBadge } from '../components/StatusBadge';
 import { useApi } from '../components/useApi';
 import { label, options, refList, staffOptions, useRef as useRefData } from '../components/refdata';
-import { fmtDate, fmtLocal } from '../time';
+import { fmtCourtLocal, fmtDate, fmtLocal } from '../time';
 
 interface CaseRow {
   id: number;
@@ -114,7 +114,8 @@ export default function Cases() {
     {
       key: 'next_hearing_at',
       header: 'Next hearing',
-      render: (r) => (r.next_hearing_at ? fmtLocal(r.next_hearing_at) : '—'),
+      render: (r) =>
+        r.next_hearing_local ? fmtCourtLocal(r.next_hearing_local) : r.next_hearing_at ? fmtLocal(r.next_hearing_at) : '—',
     },
     {
       key: 'registered_date',

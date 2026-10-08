@@ -103,6 +103,8 @@ interface IntakeDetailData {
   dispatches: IntakeDispatch[];
   checksum_matches: ChecksumMatch[];
   allowed_actions: string[];
+  /** Server-computed "what happens next" (same shape as the case workspace). */
+  next_actions?: { code: string; message: string; link?: string }[];
 }
 
 type ActionKind =
@@ -177,6 +179,7 @@ export default function IntakeDetail() {
   const [editVersion, setEditVersion] = useState<number | null>(null);
   const [returnReason, setReturnReason] = useState('');
   const [requestInfoSent, setRequestInfoSent] = useState(false);
+  const [sentDispatchId, setSentDispatchId] = useState<number | null>(null);
 
   // Action-scoped form state
   const [note, setNote] = useState('');
@@ -197,6 +200,7 @@ export default function IntakeDetail() {
     setEditVersion(data?.intake.version ?? null);
     setActionError(null);
     setRequestInfoSent(false);
+    setSentDispatchId(null);
     setIdemKey(newKey());
     setNote('');
     setMissingItems('');
@@ -254,11 +258,16 @@ export default function IntakeDetail() {
 
   const submitRequestInfo = () =>
     run(async () => {
-      await api('POST', `/intakes/${intake.id}/request-info`, {
-        missing_items: missingItems,
-        method: method || null,
-        address: address || null,
-      });
+      const res = await api<{ ok: boolean; dispatch_id: number }>(
+        'POST',
+        `/intakes/${intake.id}/request-info`,
+        {
+          missing_items: missingItems,
+          method: method || null,
+          address: address || null,
+        },
+      );
+      setSentDispatchId(res.dispatch_id ?? null);
       setRequestInfoSent(true);
       reload();
     });
@@ -352,7 +361,9 @@ export default function IntakeDetail() {
         }
       />
 
-      <NextActions items={steps} />
+      {/* Server next_actions include e.g. "Review and send the information request…"
+          deep links; the local steps remain as a fallback for older responses. */}
+      <NextActions items={data.next_actions ?? steps} />
       <ErrorBanner error={refError} onRetry={reloadRef} />
       {!action && Boolean(actionError) && <>
         {returnReason && <p>Recorded basis: {returnReason}</p>}
@@ -532,11 +543,15 @@ export default function IntakeDetail() {
       <Modal title="Request missing information" open={action === 'request_info'} onClose={closeAction}>
         {requestInfoSent ? (
           <>
-            <p>
-              A draft message was prepared — review and send it in{' '}
-              <Link to="/dispatch" onClick={closeAction}>Dispatch</Link>.
-            </p>
+            <p>A draft message was prepared — nothing has been sent yet.</p>
             <div className="actions">
+              {sentDispatchId != null ? (
+                <Link to={`/dispatch?dispatch=${sentDispatchId}`} onClick={closeAction}>
+                  Review and send now
+                </Link>
+              ) : (
+                <Link to="/dispatch" onClick={closeAction}>Review it in Dispatch</Link>
+              )}
               <Button variant="secondary" onClick={closeAction}>Close</Button>
             </div>
           </>

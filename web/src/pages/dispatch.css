@@ -54,6 +54,13 @@
   margin-bottom: 0.5rem;
 }
 
+/* ---------- Deep-link target ---------- */
+
+.dispatch-anchor--on .card {
+  border-color: var(--accent);
+  box-shadow: 0 0 0 2px rgba(31, 78, 158, 0.3); /* var(--accent) at 30% */
+}
+
 /* ---------- Dispatch page filters ---------- */
 
 .dispatch-filters {

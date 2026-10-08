@@ -17,6 +17,30 @@ export function fmtLocal(utc: string): string {
   return `${DAYS[d.getUTCDay()]} ${d.getUTCDate()} ${MONTHS[d.getUTCMonth()]} ${d.getUTCFullYear()}, ${pad(d.getUTCHours())}:${pad(d.getUTCMinutes())}`;
 }
 
+/**
+ * Court-local wall-clock string ("2026-11-19T09:00") → "Thu 19 Nov 2026, 09:00".
+ * `*_local` API fields carry no zone — this is pure string parsing; passing them
+ * through `new Date` would shift them by the visitor's timezone.
+ */
+export function fmtCourtLocal(local: string): string {
+  const [datePart, timePart] = local.split('T');
+  const [y, m, d] = (datePart ?? '').split('-').map(Number);
+  const time = (timePart ?? '').slice(0, 5);
+  if (!y || !m || !d || m < 1 || m > 12 || d < 1 || d > 31 || !/^\d{2}:\d{2}$/.test(time)) {
+    return local;
+  }
+  const wday = DAYS[new Date(Date.UTC(y, m - 1, d)).getUTCDay()];
+  return `${wday} ${d} ${MONTHS[m - 1]} ${y}, ${time}`;
+}
+
+/** Month-year label for headings: "2026-11" or "2026-11-17" → "Nov 2026". */
+export function fmtMonthYear(date: string): string {
+  const y = Number(date.slice(0, 4));
+  const m = Number(date.slice(5, 7));
+  if (!y || !m || m < 1 || m > 12) return date;
+  return `${MONTHS[m - 1]} ${y}`;
+}
+
 /** Court-local calendar date ("2026-11-17") → "17 Nov 2026". Pure string math. */
 export function fmtDate(date: string): string {
   const [y, m, d] = date.split('-').map(Number);

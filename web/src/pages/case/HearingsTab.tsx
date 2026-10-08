@@ -6,11 +6,12 @@
  * clashes and a count of bookings the user may not see.
  */
 
-import { useRef, useState } from 'react';
+import { useEffect, useRef, useState } from 'react';
 import type { FormEvent, ReactNode } from 'react';
+import { useSearchParams } from 'react-router-dom';
 import { api, ApiError, newKey } from '../../api';
 import { useSession } from '../../session';
-import { fmtLocal } from '../../time';
+import { fmtCourtLocal, fmtLocal } from '../../time';
 import { Button } from '../../components/Button';
 import { Card } from '../../components/Card';
 import { ErrorBanner } from '../../components/ErrorBanner';
@@ -156,8 +157,10 @@ function AdjournModal({ hearing, caseData, onClose, onSaved }: {
   const form = useRef<HTMLFormElement>(null);
   const [idemKey] = useState(() => newKey());
   const judges = caseData.assignments.filter((a) => a.role === 'judge' && a.end_at === null);
-  const [start, setStart] = useState(hearing.starts_local);
-  const [end, setEnd] = useState(hearing.ends_local);
+  // The new date/time starts EMPTY — pre-filling the old slot made it too easy
+  // to "adjourn" to the same time (the server rejects an unchanged start anyway).
+  const [start, setStart] = useState('');
+  const [end, setEnd] = useState('');
   const [room, setRoom] = useState(hearing.room_id ? String(hearing.room_id) : '');
   const [judge, setJudge] = useState(hearing.judge_user_id ? String(hearing.judge_user_id) : '');
   const [reason, setReason] = useState('');
@@ -165,9 +168,18 @@ function AdjournModal({ hearing, caseData, onClose, onSaved }: {
   const [busy, setBusy] = useState(false);
   const [error, setError] = useState<unknown>(null);
   const [conflicts, setConflicts] = useState<{ visible: HearingConflict[]; hidden: number } | null>(null);
+  const [overrideReason, setOverrideReason] = useState('');
+  const [localError, setLocalError] = useState('');
+  const { hasPerm } = useSession();
+  const canOverride = hasPerm('hearing.override_conflict');
 
   const submit = async (e: FormEvent) => {
     e.preventDefault();
+    if (start === hearing.starts_local) {
+      setLocalError('Choose a new date or time — the adjournment must differ from the old start.');
+      return;
+    }
+    setLocalError('');
     setBusy(true);
     setError(null);
     setConflicts(null);
@@ -179,6 +191,7 @@ function AdjournModal({ hearing, caseData, onClose, onSaved }: {
         judge_user_id: judge ? Number(judge) : null,
         reason,
         authorised_by: authorisedBy,
+        override_reason: overrideReason.trim() || null,
       }, { idempotencyKey: idemKey });
       onSaved();
       onClose();
@@ -201,10 +214,38 @@ function AdjournModal({ hearing, caseData, onClose, onSaved }: {
       </p>
       <ErrorBanner error={refError} onRetry={reloadRef} />
       <ErrorBanner error={error && !conflicts ? error : null} onRetry={() => form.current?.requestSubmit()} />
+      {localError && (
+        <div className="banner banner--error" role="alert">
+          <p>{localError}</p>
+        </div>
+      )}
       {conflicts && (
         <>
           <ConflictDetails conflicts={conflicts.visible} hidden={conflicts.hidden} />
-          <p className="muted">Pick a different time, room or judge — an adjournment cannot be overridden.</p>
+          {canOverride ? (
+            <>
+              <TextArea
+                label="Reason for booking over the conflict"
+                value={overrideReason}
+                onChange={setOverrideReason}
+                required
+                rows={2}
+                help="Written to the audit log together with your name."
+              />
+              <div className="actions">
+                <Button
+                  variant="danger"
+                  busy={busy}
+                  disabled={!overrideReason.trim() || !reason.trim() || !authorisedBy.trim() || !start || !end}
+                  onClick={() => form.current?.requestSubmit()}
+                >
+                  Adjourn anyway
+                </Button>
+              </div>
+            </>
+          ) : (
+            <p className="muted">Pick a different time, room or judge — booking over a conflict needs special permission.</p>
+          )}
         </>
       )}
       <form ref={form} onSubmit={submit}>
@@ -257,7 +298,8 @@ function OutcomeModal({ hearing, caseData, onClose, onSaved, onDemoNote }: {
   onSaved: () => void;
   onDemoNote: (note: string) => void;
 }) {
-  const { session } = useSession();
+  const { session, hasPerm } = useSession();
+  const canOverride = hasPerm('hearing.override_conflict');
   const { data: ref, error: refError, reload: reloadRef } = useRefData();
   const form = useRef<HTMLFormElement>(null);
   const [held, setHeld] = useState<'yes' | 'no'>('yes');
@@ -280,6 +322,7 @@ function OutcomeModal({ hearing, caseData, onClose, onSaved, onDemoNote }: {
   const [error, setError] = useState<unknown>(null);
   const [conflicts, setConflicts] = useState<{ visible: HearingConflict[]; hidden: number } | null>(null);
   const [localError, setLocalError] = useState('');
+  const [nhOverride, setNhOverride] = useState('');
 
   const submit = async (e: FormEvent) => {
     e.preventDefault();
@@ -328,6 +371,7 @@ function OutcomeModal({ hearing, caseData, onClose, onSaved, onDemoNote }: {
                 ends_local: nhEnd,
                 room_id: nhRoom ? Number(nhRoom) : null,
                 hearing_type: nhType || null,
+                override_reason: nhOverride.trim() || null,
               }
             : null,
       });
@@ -352,7 +396,30 @@ function OutcomeModal({ hearing, caseData, onClose, onSaved, onDemoNote }: {
       {conflicts && (
         <>
           <ConflictDetails conflicts={conflicts.visible} hidden={conflicts.hidden} />
-          <p className="muted">The next hearing clashes — change its time or room, or book it later.</p>
+          {canOverride ? (
+            <>
+              <TextArea
+                label="Reason for booking the next hearing over the conflict"
+                value={nhOverride}
+                onChange={setNhOverride}
+                required
+                rows={2}
+                help="Written to the audit log together with your name."
+              />
+              <div className="actions">
+                <Button
+                  variant="danger"
+                  busy={busy}
+                  disabled={!nhOverride.trim()}
+                  onClick={() => form.current?.requestSubmit()}
+                >
+                  Record anyway
+                </Button>
+              </div>
+            </>
+          ) : (
+            <p className="muted">The next hearing clashes — change its time or room, or book it later.</p>
+          )}
         </>
       )}
       {localError && (
@@ -556,6 +623,13 @@ export default function HearingsTab({ caseId, caseData, reload }: CaseTabProps) 
   const { data, error, loading, reload: reloadList } = useApi<{ items: Hearing[] }>(
     `/cases/${caseId}/hearings`,
   );
+  // ?hearing={id} — deep links scroll straight to that hearing's card.
+  const [params] = useSearchParams();
+  const hearingParam = params.get('hearing');
+  useEffect(() => {
+    if (!hearingParam || !data) return;
+    document.getElementById(`hearing-${hearingParam}`)?.scrollIntoView({ block: 'start' });
+  }, [hearingParam, data]);
   const allowed = caseData.allowed;
   const [modal, setModal] = useState<ModalState>(null);
   const [modalTick, setModalTick] = useState(0);
@@ -629,13 +703,10 @@ export default function HearingsTab({ caseId, caseData, reload }: CaseTabProps) 
       {demoNote && (
         <div
           className="banner"
-          role="status"
+          role="note"
           style={{ background: '#eef4fd', border: '1px solid #c8d9f3' }}
         >
           <p>{demoNote}</p>
-          <div className="banner-actions">
-            <Button variant="secondary" onClick={() => setDemoNote(null)}>Understood</Button>
-          </div>
         </div>
       )}
       <Card
@@ -719,7 +790,7 @@ export default function HearingsTab({ caseId, caseData, reload }: CaseTabProps) 
                 <p>
                   Adjourned to{' '}
                   {next ? (
-                    <a href={`#hearing-${next.id}`}>{fmtLocal(next.starts_at)}</a>
+                    <a href={`#hearing-${next.id}`}>{fmtCourtLocal(next.starts_local)}</a>
                   ) : (
                     'a new hearing'
                   )}
@@ -731,7 +802,7 @@ export default function HearingsTab({ caseId, caseData, reload }: CaseTabProps) 
                 <p className="muted">
                   Moved here from{' '}
                   {prev ? (
-                    <a href={`#hearing-${prev.id}`}>{fmtLocal(prev.starts_at)}</a>
+                    <a href={`#hearing-${prev.id}`}>{fmtCourtLocal(prev.starts_local)}</a>
                   ) : (
                     'an earlier hearing'
                   )}
@@ -792,7 +863,7 @@ export default function HearingsTab({ caseId, caseData, reload }: CaseTabProps) 
       {modal?.kind === 'cancel' && (
         <ReasonModal
           key={modalTick}
-          title={`Cancel the hearing on ${fmtLocal(modal.hearing.starts_at)}`}
+          title={`Cancel the hearing on ${fmtCourtLocal(modal.hearing.starts_local)}`}
           label="Reason for cancelling"
           confirmLabel="Cancel the hearing"
           danger

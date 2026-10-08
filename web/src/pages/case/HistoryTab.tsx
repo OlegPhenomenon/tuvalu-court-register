@@ -13,7 +13,7 @@ import type { Column } from '../../components/DataTable';
 import { ErrorBanner } from '../../components/ErrorBanner';
 import { TextField } from '../../components/fields';
 import { useApi } from '../../components/useApi';
-import { fmtLocal } from '../../time';
+import { fmtCourtLocal, fmtLocal } from '../../time';
 import type { CaseTabProps } from './types';
 import '../dispatch.css';
 
@@ -49,7 +49,7 @@ export default function HistoryTab({ caseId }: CaseTabProps) {
     {
       key: 'at',
       header: 'When (court time)',
-      render: (ev) => fmtLocal(ev.at),
+      render: (ev) => (ev.at_local ? fmtCourtLocal(ev.at_local) : fmtLocal(ev.at)),
     },
     {
       key: 'user_name',

@@ -10,7 +10,7 @@
 import { useMemo, useState } from 'react';
 import { Link } from 'react-router-dom';
 import { useSession } from '../session';
-import { courtToday, fmtDate } from '../time';
+import { courtToday, fmtDate, fmtMonthYear } from '../time';
 import { Button } from '../components/Button';
 import { ErrorBanner } from '../components/ErrorBanner';
 import { SelectField } from '../components/fields';
@@ -87,7 +87,7 @@ function Chip({ h }: { h: Hearing }) {
   return (
     <Link
       className={`cal-chip cal-chip--${tone(h.status)}${dead ? ' cal-chip--dead' : ''}`}
-      to={`/cases/${h.case_id}?tab=hearings`}
+      to={`/cases/${h.case_id}?tab=hearings&hearing=${h.id}`}
       title={`${h.hearing_type_label} — ${hearingTimeRange(h)}${h.judge_name ? `, ${h.judge_name}` : ''}`}
     >
       <span className="cal-chip-time">{h.starts_local.slice(11, 16)}</span>{' '}
@@ -133,7 +133,7 @@ export default function Calendar() {
       ? `${WDAYS_FULL[weekday(date)]}, ${fmtDate(date)}`
       : view === 'week'
         ? `Week of ${fmtDate(from)}`
-        : `${fmtDate(`${date.slice(0, 8)}01`).slice(3)}`; // "Nov 2026"
+        : fmtMonthYear(date); // "Nov 2026"
 
   const judges = (ref?.staff ?? []).filter((s) => s.is_judge);
   const printItems = byDay.get(date) ?? [];
