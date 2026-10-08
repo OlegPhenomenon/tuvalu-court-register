@@ -715,14 +715,14 @@ async fn export_manifest_preserves_versions_times_relations_and_redacted_history
     );
     assert_eq!(m["hearings"][0]["starts_local"], local);
     assert_eq!(m["hearings"][0]["starts_at"], start);
-    assert_eq!(m["decisions"].as_array().unwrap().len(), 2);
-    assert!(
-        m["decisions"]
-            .as_array()
-            .unwrap()
-            .iter()
-            .all(|d| d["document_version_id"] == v1)
-    );
+    // Default selection picked v2; decisions bound to unselected v1 must be omitted.
+    assert_eq!(m["decisions"], json!([]));
+    let (s, _, selected_raw) = package(&elena, cid, json!({"purpose":"Selected decision versions","version_ids":[v1]})).await;
+    assert_eq!(s, StatusCode::OK);
+    let mut selected_zip = zip::ZipArchive::new(Cursor::new(selected_raw)).unwrap();
+    let selected: Value = serde_json::from_reader(selected_zip.by_name("manifest.json").unwrap()).unwrap();
+    assert_eq!(selected["decisions"].as_array().unwrap().len(), 2);
+    assert!(selected["decisions"].as_array().unwrap().iter().all(|d| d["document_version_id"] == v1));
     assert_eq!(m["relations"].as_array().unwrap().len(), 1);
     assert_eq!(m["relations"][0]["number"], visible_number);
     assert!(!m.to_string().contains(&hidden_number));

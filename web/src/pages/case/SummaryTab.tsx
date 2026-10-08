@@ -97,6 +97,8 @@ function EditCaseModal({ caseData, onClose, onSaved }: {
   const [category, setCategory] = useState(c.category);
   const [summary, setSummary] = useState(c.summary ?? '');
   const [responsible, setResponsible] = useState(c.responsible_user_id ? String(c.responsible_user_id) : '');
+  const [assignmentReason, setAssignmentReason] = useState('');
+  const responsibleChanged = responsible !== (c.responsible_user_id ? String(c.responsible_user_id) : '');
   const [restricted, setRestricted] = useState(Boolean(c.restricted));
   const [busy, setBusy] = useState(false);
   const [error, setError] = useState<unknown>(null);
@@ -109,7 +111,7 @@ function EditCaseModal({ caseData, onClose, onSaved }: {
       title,
       category,
       summary,
-      responsible_user_id: responsible ? Number(responsible) : null,
+      ...(caseData.allowed.assign_staff && responsibleChanged ? { responsible_user_id: Number(responsible), assignment_reason: assignmentReason } : {}),
       restricted,
     };
     setAttempted(body as Record<string, unknown>);
@@ -142,14 +144,15 @@ function EditCaseModal({ caseData, onClose, onSaved }: {
           required
         />
         <TextArea label="Summary" value={summary} onChange={setSummary} rows={3} />
-        <SelectField
+        {caseData.allowed.assign_staff && <SelectField
           label="Responsible officer"
           value={responsible}
           onChange={setResponsible}
           options={staffOptions((ref?.staff ?? []).filter((s) => s.assignable !== false))}
           placeholder={c.responsible_user_id ? "Keep current responsible officer" : "Not assigned"}
-          required={Boolean(c.responsible_user_id)}
-        />
+          required
+        />}
+        {caseData.allowed.assign_staff && responsibleChanged && <TextArea label="Reason for changing responsible officer" value={assignmentReason} onChange={setAssignmentReason} required rows={2} />}
         <CheckboxField
           label="Restricted case"
           checked={restricted}

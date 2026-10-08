@@ -170,10 +170,12 @@ fn build_package(
             h["ends_at"].as_str().unwrap_or("")
         ));
     }
-    let decisions=query_json(tx,&format!("SELECT x.id,x.title,x.decision_date,x.status,x.document_id,x.document_version_id,x.finalised_at,x.amends_decision_id,x.superseded_by_id
+    let mut decisions=query_json(tx,&format!("SELECT x.id,x.title,x.decision_date,x.status,x.document_id,x.document_version_id,x.finalised_at,x.amends_decision_id,x.superseded_by_id
                  FROM decisions x JOIN documents d ON d.id=x.document_id WHERE x.case_id=?1
                  AND d.case_id=x.case_id AND x.status IN ('finalised','superseded') AND d.visibility<>'judicial_note'
-                 AND {} ORDER BY x.id",policy::document_visible_sql(actor,"d")),[id])?;
+                 AND {} AND x.document_version_id IN (SELECT value FROM json_each(?2)) ORDER BY x.id",policy::document_visible_sql(actor,"d")),params![id,serde_json::to_string(&ids)?])?;
+    let selected_decisions: BTreeSet<i64>=decisions.iter().filter_map(|d|d["id"].as_i64()).collect();
+    for decision in &mut decisions { for field in ["amends_decision_id","superseded_by_id"] { if decision[field].as_i64().is_some_and(|i|!selected_decisions.contains(&i)) { decision.as_object_mut().unwrap().remove(field); } } }
     let relations=query_json(tx,&format!("SELECT r.kind,r.note,c.id AS case_id,c.number,c.title FROM case_relations r JOIN cases c ON
                  c.id=CASE WHEN r.from_case_id=?1 THEN r.to_case_id ELSE r.from_case_id END
                  WHERE (r.from_case_id=?1 OR r.to_case_id=?1) AND {} ORDER BY r.id",policy::case_visible_sql(actor,"c.id")),[id])?;

@@ -110,9 +110,7 @@ fn insert_intake(tx: &Transaction, actor: &Actor, input: &IntakeInput, parent: O
         return Err(AppError::validation("Say where the paper original is kept.").with_details(json!({ "field": "paper_location" })));
     }
     if let Some(pid) = input.sender_party_id {
-        tx.query_row("SELECT id FROM parties WHERE id = ?1", [pid], |r| r.get::<_, i64>(0))
-            .optional()?
-            .ok_or_else(|| AppError::validation("Unknown sender party."))?;
+        policy::require_party(tx, actor, pid)?;
     }
     let reference = next_reference(tx, &received)?;
     let now = crate::time::now_utc();
@@ -295,6 +293,7 @@ async fn update(ctx: Ctx, Path(id): Path<i64>, JsonBody(req): JsonBody<UpdateReq
                 return Err(AppError::version_conflict(current));
             }
             let i = &req.input;
+            if let Some(pid)=i.sender_party_id { policy::require_party(tx,&actor,pid)?; }
             require_ref(tx, "intake_channel", &i.channel)?;
             if let Some(island) = optional(&i.origin_island) {
                 require_ref(tx, "origin_island", &island)?;

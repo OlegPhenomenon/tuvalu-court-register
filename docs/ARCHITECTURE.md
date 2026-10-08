@@ -72,7 +72,9 @@ JSON `{"error":{"code":"snake_case","message":"Human readable","details":{}}}`.
 - CSRF: cookies are `SameSite=Strict; HttpOnly`; all non-GET requests must send header `X-TCR: 1`, else 403 `csrf`.
 - Optimistic locking: editable records have `version INTEGER`; PATCH bodies include `version`; mismatch → 409 `version_conflict` with current record.
 - Idempotency: `Idempotency-Key` header (client UUID) on register/close/finalise/queue-dispatch/schedule; stored in `operation_keys`;
-  replay returns stored result, never a second case number / decision / attempt.
+  replay returns stored result, never a second case number / decision / attempt. Party creation, participant addition/ending,
+  and participant representation edits also accept a key; the operation, target and body are bound to the actor.
+  A changed body returns `409 idempotency_mismatch`; access is checked again on replay. The UI keeps one key per opened form (separate keys for party creation and participant addition).
 - Every response for private data: `Cache-Control: no-store, private`.
 
 ## 3. Time
@@ -135,6 +137,30 @@ Document metadata/detail and list reads do not record views. Case history, expor
 outside the viewer's document access and `case.related` events whose counterpart case is hidden.
 Intake documents (no case yet): `intake.manage` holders.
 
+Party directory list/search/detail and same-name warnings follow case/intake visibility. A party is visible when linked
+as a participant, representative, intake sender, document source or dispatch recipient to a visible record. An unlinked
+party is visible only to its creator. Hidden contacts return 404, including when submitted as an existing party id.
+Contact writes require `case.edit` on a visible linked case or `intake.manage` on a visible unlinked intake; the creator
+may correct an unlinked contact when holding intake/registration/edit permission. If any linked case is hidden from
+the editor, PATCH returns `409 party_shared` with the neutral message "This person is linked to records you cannot
+access; ask the registry head". No hidden case identity is included. Equal names remain separate records.
+
+Decision list/detail responses check the exact bound document version. Without document access, `title` and
+`document_title` are "Restricted document", `restricted` is true and `document_version_id` remains the reference;
+`document_id`, `filename`, `sha256`, `version_no`, `status_reason` and `amendment_basis` are omitted. History/audit
+summaries and draft-decision prompts/closure blockers are neutral. Old decision events resolve the document version
+bound at that time from draft-edit snapshots, so replacing a restricted draft does not disclose its old metadata.
+Case history includes received/completed/supplemented/registered events and information-request events from linked
+intakes and their supplements, with original timestamps/authors and no duplicate event ids. Document redaction also
+applies to those earlier events.
+
+Case PATCH changing `responsible_user_id` requires `case.assign_staff`, a non-empty `assignment_reason` and the
+same active/eligible-user checks as manual staff assignment. Other case fields still require `case.edit`. The edit
+form exposes this field only with staff-assignment permission and sends it only when changed. Import preview and
+commit use the same assignee eligibility policy and require staff-assignment permission for a named responsible
+user; invalid rows are reported individually and skipped. Eligibility changes after preview abort commit with
+`409 import_changed` and no partial creation. Imported responsibility creates a clerk assignment, never a judge role.
+
 ## 5. State machines (server-enforced; invalid → 409 `invalid_transition`)
 - Intake: `received → needs_information → received|ready_for_registration`; `received|ready_for_registration → linked_to_case` (register or link);
   any non-linked → `returned_or_redirected` (reason required); any non-linked → `duplicate` (link to original required). Intakes are never deleted.
@@ -194,7 +220,8 @@ GET  /queue                            work queue for current user
 GET/POST /intakes   GET/PATCH /intakes/:id   POST /intakes/:id/{request-info,mark-ready,mark-duplicate,return,link,register,supplement}
 GET  /cases?q=&status=&category=&party=&responsible=&from=&to=   GET/PATCH /cases/:id
 POST /cases/:id/{status,close,reopen,relations,participants,assignments}   POST /cases/:id/assignments/:aid/end
-GET/POST /parties  GET /parties/:id
+GET/POST /parties  GET/PATCH /parties/:id
+PATCH /cases/:id/participants/:pid
 GET  /hearings?from=&to=&judge=&room=   POST /cases/:id/hearings   POST /hearings/:id/{confirm,adjourn,cancel,outcome,correct}
 GET/POST /cases/:id/tasks   POST /tasks/:id/{complete,cancel,carry-forward}   GET /tasks?mine=1
 GET/POST /cases/:id/documents   POST /documents/:id/versions (multipart)   GET /documents/:id
@@ -210,6 +237,21 @@ GET  /audit?case_id=&user_id=
 /admin/users, /admin/users/:id/{permissions,deactivate,revoke-sessions,reset-password}, /admin/rooms, /admin/registries,
 /admin/ref-items, /admin/templates, /admin/settings
 ```
+`GET /parties/:id` returns `{party, cases, editable}`; party list items include `version`.
+`PATCH /parties/:id` accepts `{version,name,contact_email,contact_phone,address,island,notes?}` and returns the party.
+Omitted `notes` is preserved; explicit null clears it. Ordinary optional contact fields accept null to clear.
+`PATCH /cases/:id/participants/:pid` accepts `{version,role,representative_party_id,representation_basis,service_contact}`
+and returns the updated participation. A representative requires a non-empty basis; null removes the link/basis.
+Case participant rows include their own `version` (schema migration 0007); stale contact/participation edits return
+`409 version_conflict` with `details.current`. UI contact and participation forms offer an explicit reload after a conflict.
+Contact and participation audits record changed field names without copying contact values into the journal.
+
+A case package contains only selected accessible document versions and decision metadata bound to those versions.
+An empty selection includes no document or decision metadata/events. Chronology excludes every unselected document,
+version or decision event, and dispatch events with unselected attachments. Selected material events have neutral
+summaries; amendment/supersession ids of unselected decisions are omitted. The user's ability to read a document
+does not automatically select it for a recipient. Default selection remains clean administrative/party material.
+
 Technical full backup/restore is **CLI only** (`tuvalu-court backup --out f.tcrb --key keyfile`), encrypted
 (ChaCha20-Poly1305, key file kept outside repo), manifest with counts + sha256 of every file, verified on restore into an empty data dir.
 

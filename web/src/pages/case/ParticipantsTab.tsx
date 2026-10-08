@@ -7,7 +7,7 @@
 
 import { useRef, useState } from 'react';
 import type { FormEvent } from 'react';
-import { api } from '../../api';
+import { api, newKey, ApiError } from '../../api';
 import { Button } from '../../components/Button';
 import { Card } from '../../components/Card';
 import { DataTable } from '../../components/DataTable';
@@ -18,7 +18,7 @@ import { Modal } from '../../components/Modal';
 import { label, options, refList, useRef as useRefData } from '../../components/refdata';
 import { fmtLocal } from '../../time';
 import { FormErrors } from '../intake/FormErrors';
-import { PartyPicker } from '../intake/pickers';
+import { PartyPicker, PartyContactEditor } from '../intake/pickers';
 import type { Party } from '../intake/pickers';
 import type { CaseTabProps, Participant } from './types';
 
@@ -39,6 +39,8 @@ function AddParticipantModal({ caseId, onClose, onSaved, onSameName }: {
   const { data: ref, error: refError, reload: reloadRef } = useRefData();
   const form = useRef<HTMLFormElement>(null);
   const [sameName, setSameName] = useState<SameNameRecord[]>([]);
+  const [partyKey] = useState(newKey);
+  const [participationKey] = useState(newKey);
   const [mode, setMode] = useState<'existing' | 'new'>('existing');
   const [party, setParty] = useState<Party | null>(null);
   const [kind, setKind] = useState<'person' | 'organisation'>('person');
@@ -90,6 +92,7 @@ function AddParticipantModal({ caseId, onClose, onSaved, onSameName }: {
             address: address || null,
             island: island || null,
           },
+          { idempotencyKey: partyKey },
         );
         partyId = created.id;
         // Reuse the successfully created record if adding the participation fails.
@@ -104,7 +107,7 @@ function AddParticipantModal({ caseId, onClose, onSaved, onSameName }: {
         representative_party_id: rep?.id ?? null,
         representation_basis: rep ? repBasis : null,
         service_contact: serviceContact || null,
-      });
+      }, { idempotencyKey: participationKey });
       onSaved();
       onClose();
     } catch (err) {
@@ -210,6 +213,7 @@ function EndParticipationModal({ participant, caseId, onClose, onSaved }: {
   onSaved: () => void;
 }) {
   const [reason, setReason] = useState('');
+  const [key] = useState(newKey);
   const [busy, setBusy] = useState(false);
   const [error, setError] = useState<unknown>(null);
 
@@ -217,7 +221,7 @@ function EndParticipationModal({ participant, caseId, onClose, onSaved }: {
     setBusy(true);
     setError(null);
     try {
-      await api('POST', `/cases/${caseId}/participants/${participant.id}/end`, { reason });
+      await api('POST', `/cases/${caseId}/participants/${participant.id}/end`, { reason }, { idempotencyKey: key });
       onSaved();
       onClose();
     } catch (err) {
@@ -241,10 +245,40 @@ function EndParticipationModal({ participant, caseId, onClose, onSaved }: {
   );
 }
 
+function EditParticipationModal({ participant: p, caseId, onClose, onSaved }: { participant: Participant; caseId: number; onClose: () => void; onSaved: () => void }) {
+  const { data: ref } = useRefData();
+  const [key] = useState(newKey);
+  const [role, setRole] = useState(p.role);
+  const [rep, setRep] = useState<Party | null>(p.representative_party_id ? { id: p.representative_party_id, kind: 'person', name: p.representative_name ?? 'Representative' } : null);
+  const [basis, setBasis] = useState(p.representation_basis ?? '');
+  const [contact, setContact] = useState(p.service_contact ?? '');
+  const [error, setError] = useState<unknown>(null);
+  const [busy, setBusy] = useState(false);
+  const conflict = error instanceof ApiError && error.code === 'version_conflict';
+  const submit = async (e: FormEvent) => {
+    e.preventDefault(); setBusy(true); setError(null);
+    try { await api('PATCH', `/cases/${caseId}/participants/${p.id}`, {version: p.version, role, representative_party_id: rep?.id ?? null, representation_basis: rep ? basis : null, service_contact: contact || null}, { idempotencyKey: key }); onSaved(); onClose(); }
+    catch (e) { setError(e); } finally { setBusy(false); }
+  };
+  return <Modal title={`Edit participation of ${p.name}`} open onClose={busy ? () => {} : onClose}>
+    {conflict ? <p role="alert">Changed by someone else, reload before saving. <Button type="button" variant="secondary" onClick={() => { onSaved(); onClose(); }}>Reload</Button></p> : <ErrorBanner error={error} />}
+    <form onSubmit={submit}><fieldset disabled={busy || conflict} style={{border: 0, padding: 0}}>
+      <SelectField label="Role" value={role} onChange={setRole} options={options(refList(ref, 'participant_role'))} required />
+      <PartyPicker label="Representative / lawyer" value={rep} onChange={setRep} />
+      {rep && <TextField label="Basis of representation" value={basis} onChange={setBasis} required />}
+      <TextField label="Service contact for this case" value={contact} onChange={setContact} />
+      <Button type="submit" busy={busy}>Save participation</Button>
+    </fieldset></form>
+    <Button type="button" variant="secondary" disabled={busy} onClick={onClose}>Cancel</Button>
+  </Modal>;
+}
+
 export default function ParticipantsTab({ caseId, caseData, reload }: CaseTabProps) {
   const { data: ref, error: refError, reload: reloadRef } = useRefData();
   const allowed = caseData.allowed;
   const [addOpen, setAddOpen] = useState(false);
+  const [editing, setEditing] = useState<Participant | null>(null);
+  const [contactEditing, setContactEditing] = useState<Participant | null>(null);
   const [ending, setEnding] = useState<Participant | null>(null);
   const [sameName, setSameName] = useState<{ name: string; records: SameNameRecord[] } | null>(null);
 
@@ -284,7 +318,7 @@ export default function ParticipantsTab({ caseId, caseData, reload }: CaseTabPro
         header: '',
         render: (p) =>
           allowed.edit ? (
-            <Button variant="secondary" onClick={() => setEnding(p)}>End participation</Button>
+            <><Button variant="secondary" onClick={() => setContactEditing(p)}>Edit contact</Button><Button variant="secondary" onClick={() => setEditing(p)}>Edit participation</Button><Button variant="secondary" onClick={() => setEnding(p)}>End participation</Button></>
           ) : null,
       });
     } else {
@@ -363,6 +397,8 @@ export default function ParticipantsTab({ caseId, caseData, reload }: CaseTabPro
           onSameName={(records, name) => setSameName({ records, name })}
         />
       )}
+      {editing && <EditParticipationModal participant={editing} caseId={caseId} onClose={() => setEditing(null)} onSaved={reload} />}
+      {contactEditing && <Modal title={`Edit contact of ${contactEditing.name}`} open onClose={() => setContactEditing(null)}><PartyContactEditor partyId={contactEditing.party_id} onSaved={reload} onClose={() => setContactEditing(null)} /></Modal>}
       {ending && (
         <EndParticipationModal
           participant={ending}

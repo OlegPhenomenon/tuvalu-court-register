@@ -808,7 +808,7 @@ async fn uploads_validate_before_storage_and_discard_after_failed_writes() {
         ("doc_type", "missing", StatusCode::BAD_REQUEST),
         ("visibility", "missing", StatusCode::BAD_REQUEST),
         ("source", "missing", StatusCode::BAD_REQUEST),
-        ("source_party_id", "999999", StatusCode::BAD_REQUEST),
+        ("source_party_id", "999999", StatusCode::NOT_FOUND),
         ("document_date", "2026-02-30", StatusCode::BAD_REQUEST),
         ("received_date", "invalid", StatusCode::BAD_REQUEST),
         ("is_paper_original", "true", StatusCode::BAD_REQUEST),
@@ -831,6 +831,8 @@ async fn uploads_validate_before_storage_and_discard_after_failed_writes() {
                 status,
                 if status == StatusCode::FORBIDDEN {
                     "forbidden"
+                } else if status == StatusCode::NOT_FOUND {
+                    "not_found"
                 } else {
                     "validation"
                 },

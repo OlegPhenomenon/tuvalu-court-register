@@ -19,13 +19,15 @@ import '../documents.css';
 export const finalisedNote = 'Finalised in this register. This is not a qualified electronic signature.';
 export interface Decision {
   id: number; case_id: number; case_number: string; title: string; decision_date: string | null;
-  status: string; status_reason: string | null; document_id: number; document_title: string;
-  document_version_id: number; version_no: number; filename: string; sha256: string;
+  restricted?: boolean;
+  status: string; status_reason?: string | null; document_id?: number; document_title: string;
+  document_version_id: number; version_no?: number; filename?: string; sha256?: string;
   hearing_id: number | null; author_name: string | null; finalised_by_name: string | null;
   finalised_at: string | null; amends_decision_id: number | null; amendment_basis: string | null;
   superseded_by_id: number | null; signed_file_uploaded: boolean; created_at: string; version: number; note?: string;
 }
 export function DecisionFile({ decision: d }: { decision: Decision }) {
+  if (d.restricted) return <span>Restricted document</span>;
   return <a href={downloadUrl(`/document-versions/${d.document_version_id}/download`)} target="_blank" rel="noopener noreferrer">{d.filename} · v{d.version_no}<span className="doc-sr-only"> (download, new tab)</span></a>;
 }
 export function DecisionChain({ decision: d, decisions }: { decision: Decision; decisions?: Decision[] }) {
@@ -171,7 +173,7 @@ function DecisionsTabContent(props: CaseTabProps) {
     </>}>
       <dl className="doc-meta">
         <div><dt>Decision date</dt><dd>{d.decision_date ? fmtDate(d.decision_date) : 'Not recorded'}</dd></div>
-        <div><dt>Bound document version</dt><dd><DecisionFile decision={d} /><div className="muted">{d.document_title}</div><code title={d.sha256}>{d.sha256.slice(0, 12)}…</code></dd></div>
+        <div><dt>Bound document version</dt><dd><DecisionFile decision={d} /><div className="muted">{d.document_title}</div>{d.sha256 && <code title={d.sha256}>{d.sha256.slice(0, 12)}…</code>}</dd></div>
         <div><dt>Author</dt><dd>{d.author_name ?? 'Not recorded'}<div className="muted">{fmtLocal(d.created_at)}</div></dd></div>
         {d.finalised_at && <div><dt>Finalised by / at</dt><dd>{d.finalised_by_name ?? 'Not recorded'}<div>{fmtLocal(d.finalised_at)}</div></dd></div>}
         {d.hearing_id && <div><dt>Hearing</dt><dd><Link to={`/cases/${caseId}?tab=hearings&hearing=${d.hearing_id}`}>{(() => { const h = hearingById.get(d.hearing_id!); return h ? `${h.hearing_type_label} — ${h.starts_local ? fmtCourtLocal(h.starts_local) : fmtLocal(h.starts_at)}` : 'View the hearing'; })()}</Link></dd></div>}

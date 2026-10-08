@@ -39,6 +39,7 @@ export interface CaseRecord {
 }
 
 export interface Participant {
+  version: number;
   id: number;
   party_id: number;
   kind: string;

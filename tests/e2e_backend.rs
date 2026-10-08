@@ -227,7 +227,7 @@ async fn c6_system_only_admin_cannot_gain_access_through_any_assignment_path() {
     assert_eq!(b["error"]["message"], "This person administers the system and cannot be assigned to cases.");
     let (_, card) = olga.get(&format!("/api/cases/{cid}")).await;
     let (s, b) = olga.patch(&format!("/api/cases/{cid}"), json!({"version":card["case"]["version"],"responsible_user_id":pavel})).await;
-    err(s, &b, StatusCode::BAD_REQUEST, "validation");
+    err(s, &b, StatusCode::FORBIDDEN, "forbidden");
     let admin = olga.switch("pavel").await;
     let (s, b) = admin.get(&format!("/api/cases/{cid}")).await;
     err(s, &b, StatusCode::NOT_FOUND, "not_found");

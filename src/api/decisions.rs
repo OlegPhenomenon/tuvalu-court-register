@@ -41,12 +41,19 @@ SELECT d.id, d.case_id, c.number AS case_number, d.title, d.decision_date, d.sta
   LEFT JOIN users fu ON fu.id = d.finalised_by";
 
 /// Display shaping shared by detail and list responses.
-fn decorate(mut d: Value) -> Value {
+fn decorate(conn: &Connection, actor: &Actor, mut d: Value) -> AppResult<Value> {
+    if policy::require_version(conn,actor,d["document_version_id"].as_i64().unwrap_or_default()).is_err() {
+        let object=d.as_object_mut().ok_or_else(||AppError::internal("Invalid decision record."))?;
+        for key in ["filename","sha256","version_no","document_id","status_reason","amendment_basis"] { object.remove(key); }
+        d["restricted"]=json!(true);
+        d["document_title"]=json!("Restricted document");
+        d["title"]=json!("Restricted document");
+    }
     d["signed_file_uploaded"] = json!(d["signed_file_uploaded"].as_i64() == Some(1));
     if matches!(d["status"].as_str(), Some("finalised") | Some("superseded")) {
         d["note"] = json!(FINALISED_NOTE);
     }
-    d
+    Ok(d)
 }
 
 /// Full decision JSON, or 404 when the actor may not see the case.
@@ -55,7 +62,7 @@ fn decision_json(conn: &Connection, actor: &Actor, id: i64) -> AppResult<Value> 
         "{DECISION_SQL} WHERE d.id = ?1 AND {}",
         policy::case_visible_sql(actor, "d.case_id")
     );
-    Ok(decorate(query_one_json(conn, &sql, [id])?))
+    decorate(conn,actor,query_one_json(conn, &sql, [id])?)
 }
 
 /// Resolve the container before applying the assigned-judge requirement.
@@ -148,8 +155,8 @@ async fn list_for_case(ctx: Ctx, Path(case_id): Path<i64>) -> JsonResult {
             );
             let items: Vec<Value> = query_json(c, &sql, [case_id])?
                 .into_iter()
-                .map(decorate)
-                .collect();
+                .map(|d|decorate(c,&actor,d))
+                .collect::<AppResult<_>>()?;
             Ok(json!({ "items": items }))
         })
         .await?;
@@ -171,7 +178,7 @@ async fn list_all(ctx: Ctx, Query(q): Query<ListQuery>) -> JsonResult {
                 "{DECISION_SQL} WHERE {} AND (?1 IS NULL OR d.status = ?1) ORDER BY d.id DESC LIMIT 500",
                 policy::case_visible_sql(&actor, "d.case_id")
             );
-            let items: Vec<Value> = query_json(c, &sql, params![optional(&q.status)])?.into_iter().map(decorate).collect();
+            let items: Vec<Value> = query_json(c, &sql, params![optional(&q.status)])?.into_iter().map(|d|decorate(c,&actor,d)).collect::<AppResult<_>>()?;
             Ok(json!({ "items": items }))
         })
         .await?;

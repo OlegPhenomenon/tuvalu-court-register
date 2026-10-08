@@ -202,18 +202,20 @@ fn parties(c: &Connection, input: &str) -> AppResult<Vec<(String, String)>> {
     }
     Ok(out)
 }
-fn responsible(c: &Connection, name: &str) -> AppResult<Option<i64>> {
+fn responsible(c: &Connection, actor: &Actor, name: &str) -> AppResult<Option<i64>> {
     if name.is_empty() {
         return Ok(None);
     }
-    c.query_row(
+    actor.require(perm::CASE_ASSIGN_STAFF)?;
+    let uid = c.query_row(
         "SELECT id FROM users WHERE username=?1 AND active=1",
         [name],
         |r| r.get(0),
     )
     .optional()?
-    .map(Some)
-    .ok_or_else(|| invalid("Unknown responsible user."))
+    .ok_or_else(|| invalid("Unknown responsible user."))?;
+    if !policy::user_assignable(c,uid)? { return Err(invalid("This user is not eligible for case work.")); }
+    Ok(Some(uid))
 }
 fn case_preview(
     c: &Connection,
@@ -236,7 +238,7 @@ fn case_preview(
         };
         check(crate::time::parse_date(&r.registered_date).map(|_| ()));
         check(require_ref(c, "case_category", &r.category));
-        check(responsible(c, &r.responsible_username).map(|_| ()));
+        check(responsible(c, actor, &r.responsible_username).map(|_| ()));
         if !matches!(
             r.status.as_str(),
             "registered" | "active" | "on_hold" | "closed" | "reopened"
@@ -747,7 +749,7 @@ fn commit_rows(
                     let (s, n) = super::cases::allocate_number(tx, reg, y)?;
                     (reg, y, s, n, Some(r.number.clone()))
                 };
-            let user = responsible(tx, &r.responsible_username)?;
+            let user = responsible(tx, actor, &r.responsible_username)?;
             tx.execute("INSERT INTO cases(registry_id,year,seq,number,legacy_number,title,category,status,registered_date,registered_at,registered_by,responsible_user_id,closed_date,closure_basis,import_batch_id,historical_incomplete,updated_at)
                  VALUES(?1,?2,?3,?4,?5,?6,?7,?8,?9,?10,?11,?12,?13,?14,?15,?16,?10)",params![registry,year,seq,number,legacy,r.title,r.category,r.status,r.registered_date,now,actor.user_id,user,(!r.closed_date.is_empty()).then_some(&r.closed_date),(!r.closure_basis.is_empty()).then_some(&r.closure_basis),id,!old["rows"][i]["missing"].as_array().is_some_and(|a|a.is_empty())])?;
             let cid = tx.last_insert_rowid();

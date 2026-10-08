@@ -231,3 +231,75 @@ pub fn require_version(conn: &Connection, actor: &Actor, version_id: i64) -> App
         .ok_or_else(AppError::not_found)?;
     Ok((require_document(conn, actor, document_id)?, version_id))
 }
+
+/// All records to which a contact is linked, including representation and service references.
+fn party_links_sql(id: &str) -> String {
+    format!("SELECT case_id, NULL AS intake_id FROM case_participations WHERE party_id={id} OR representative_party_id={id}
+        UNION SELECT case_id, id FROM intakes WHERE sender_party_id={id}
+        UNION SELECT COALESCE(d.case_id,(SELECT case_id FROM intakes WHERE id=d.intake_id)), d.intake_id FROM documents d WHERE d.source_party_id={id}
+        UNION SELECT COALESCE(dp.case_id,(SELECT case_id FROM intakes WHERE id=dp.intake_id)), dp.intake_id FROM dispatches dp WHERE dp.recipient_party_id={id}")
+}
+
+/// Directory visibility follows linked records. Only the creator sees an unlinked contact.
+pub fn party_visible_sql(actor: &Actor, id: &str) -> String {
+    let links = party_links_sql(id);
+    let intake = if actor.has(perm::INTAKE_MANAGE) {
+        "1"
+    } else {
+        "0"
+    };
+    format!("(EXISTS (SELECT 1 FROM ({links}) pl WHERE (pl.case_id IS NOT NULL AND {case_vis})
+        OR (pl.case_id IS NULL AND pl.intake_id IS NOT NULL AND {intake}))
+        OR ((SELECT created_by FROM parties WHERE id={id})={uid} AND NOT EXISTS(SELECT 1 FROM ({links}))))",
+        case_vis=case_visible_sql(actor,"pl.case_id"), uid=actor.user_id)
+}
+
+pub fn require_party(conn: &Connection, actor: &Actor, id: i64) -> AppResult<()> {
+    let exists: bool = conn.query_row(
+        &format!(
+            "SELECT EXISTS(SELECT 1 FROM parties p WHERE p.id=?1 AND {})",
+            party_visible_sql(actor, "p.id")
+        ),
+        [id],
+        |r| r.get(0),
+    )?;
+    if exists {
+        Ok(())
+    } else {
+        Err(AppError::not_found())
+    }
+}
+
+pub fn can_edit_party(conn: &Connection, actor: &Actor, id: i64) -> AppResult<bool> {
+    let links = party_links_sql("?1");
+    Ok(conn.query_row(&format!("SELECT EXISTS(SELECT 1 FROM ({links}) pl WHERE
+        (pl.case_id IS NOT NULL AND {case_vis} AND {edit}) OR (pl.case_id IS NULL AND pl.intake_id IS NOT NULL AND {intake}))
+        OR ((SELECT created_by FROM parties WHERE id=?1)={uid} AND NOT EXISTS(SELECT 1 FROM ({links})) AND {create})",
+        case_vis=case_visible_sql(actor,"pl.case_id"), edit=i32::from(actor.has(perm::CASE_EDIT)), intake=i32::from(actor.has(perm::INTAKE_MANAGE)),uid=actor.user_id,
+        create=i32::from(actor.has(perm::INTAKE_MANAGE)||actor.has(perm::CASE_EDIT)||actor.has(perm::CASE_REGISTER))),[id],|r|r.get(0))?)
+}
+
+pub fn require_party_edit(conn: &Connection, actor: &Actor, id: i64) -> AppResult<()> {
+    require_party(conn, actor, id)?;
+    if !can_edit_party(conn, actor, id)? {
+        return Err(AppError::forbidden(
+            "You cannot edit this person's contact record.",
+        ));
+    }
+    let links = party_links_sql("?1");
+    let shared: bool = conn.query_row(
+        &format!(
+            "SELECT EXISTS(SELECT 1 FROM ({links}) pl WHERE pl.case_id IS NOT NULL AND NOT ({}))",
+            case_visible_sql(actor, "pl.case_id")
+        ),
+        [id],
+        |r| r.get(0),
+    )?;
+    if shared {
+        return Err(AppError::conflict(
+            "party_shared",
+            "This person is linked to records you cannot access; ask the registry head",
+        ));
+    }
+    Ok(())
+}

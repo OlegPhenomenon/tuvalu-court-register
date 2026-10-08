@@ -56,6 +56,20 @@ reveals that a hidden case, document or intake exists. `403 forbidden` is
 returned only when the object is visible but the action needs a permission the
 actor lacks. Knowing a case number grants no access.
 
+Party directory access and existing-party links are scoped to visible cases/intakes (including
+representatives, senders and document sources). A creator can see an unlinked contact. Editing a
+contact shared with a hidden case returns neutral `409 party_shared`; known hidden ids return 404.
+Contact changes audit field names without copying contact values. Same-name warnings are scoped too.
+
+Restricted decision document references are redacted in list/detail, next actions, closure blockers,
+history and global audit, including old versions replaced during drafting. A participant export
+filters metadata, links and chronology by its selected versions as well as the exporter's permissions.
+Intake events become part of linked case history without rewriting the append-only journal.
+
+Changing responsibility through case PATCH and importing a named responsible user require staff
+assignment permission and an active user with case-work permissions. Imports cannot grant technical
+administrators case access. Party/participation command retries recheck access before replay.
+
 ## Sessions, cookies, CSRF
 
 - Session tokens are 256-bit random values; only their SHA-256 hash is stored.

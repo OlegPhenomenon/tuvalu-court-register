@@ -4,10 +4,13 @@
  * Picking a record is always explicit — the register never merges by name.
  */
 
-import { useCallback, useEffect, useId, useState } from 'react';
+import { useCallback, useEffect, useId, useRef, useState } from 'react';
 import type { ReactNode } from 'react';
 import { ErrorBanner } from '../../components/ErrorBanner';
-import { api } from '../../api';
+import { api, ApiError } from '../../api';
+import { Button } from '../../components/Button';
+import { TextField } from '../../components/fields';
+import { useSession } from '../../session';
 import { StatusBadge } from '../../components/StatusBadge';
 import { fmtDate } from '../../time';
 
@@ -23,6 +26,7 @@ function useDebounced<T>(value: T, ms = 300): T {
 export interface Party {
   id: number;
   kind: string;
+  version?: number;
   name: string;
   contact_email?: string | null;
   contact_phone?: string | null;
@@ -202,6 +206,41 @@ const searchCases = async (q: string) => {
   return res.items;
 };
 
+/** Shared contact editor; reload discards stale edits only after an explicit click. */
+export function PartyContactEditor({ partyId, onSaved, onClose }: { partyId: number; onSaved: (p: Party) => void; onClose: () => void }) {
+  const fields = useRef<HTMLFieldSetElement>(null);
+  const [party, setParty] = useState<Party | null>(null);
+  const [error, setError] = useState<unknown>(null);
+  const [busy, setBusy] = useState(false);
+  const [editable, setEditable] = useState(false);
+  const load = useCallback(async () => {
+    setError(null); setBusy(true);
+    try { const d = await api<{party: Party; editable: boolean}>('GET', `/parties/${partyId}`); setParty(d.party); setEditable(d.editable); }
+    catch (e) { setError(e); } finally { setBusy(false); }
+  }, [partyId]);
+  useEffect(() => { void load(); }, [load]);
+  const conflict = error instanceof ApiError && error.code === 'version_conflict';
+  const save = async () => {
+    if (!party || !Array.from(fields.current?.querySelectorAll('input') ?? []).every(input => input.reportValidity())) return;
+    setBusy(true); setError(null);
+    try { const p = await api<Party>('PATCH', `/parties/${partyId}`, { version: party.version, name: party.name, contact_email: party.contact_email || null, contact_phone: party.contact_phone || null, address: party.address || null, island: party.island || null }); onSaved(p); onClose(); }
+    catch (e) { setError(e); } finally { setBusy(false); }
+  };
+  return <fieldset ref={fields} disabled={busy} style={{border: '1px solid var(--line)', padding: '1rem'}}>
+    <legend>Edit contact details</legend>
+    {conflict ? <p role="alert">Changed by someone else, reload before saving. <Button type="button" variant="secondary" onClick={() => void load()}>Reload</Button></p> : <ErrorBanner error={error} onRetry={() => void (party ? save() : load())} />}
+    {party && editable && <>
+      <TextField label="Full name" value={party.name} onChange={name => setParty({...party, name})} required />
+      <TextField label="E-mail" type="email" value={party.contact_email ?? ''} onChange={contact_email => setParty({...party, contact_email})} />
+      <TextField label="Phone" value={party.contact_phone ?? ''} onChange={contact_phone => setParty({...party, contact_phone})} />
+      <TextField label="Postal address" value={party.address ?? ''} onChange={address => setParty({...party, address})} />
+      <Button type="button" busy={busy} disabled={!party.name.trim() || conflict} onClick={() => void save()}>Save contact details</Button>
+    </>}
+    {party && !editable && <p>You do not have permission to edit this contact record.</p>}
+    <Button type="button" variant="secondary" onClick={onClose}>Cancel</Button>
+  </fieldset>;
+}
+
 /** Pick an existing party record (person or organisation). */
 export function PartyPicker({
   value,
@@ -216,7 +255,17 @@ export function PartyPicker({
   required?: boolean;
   help?: string;
 }) {
-  return (
+  const [editing, setEditing] = useState(false);
+  const [canEdit, setCanEdit] = useState(false);
+  const { hasPerm } = useSession();
+  useEffect(() => {
+    let alive = true; setCanEdit(false); setEditing(false);
+    if (value && (hasPerm('case.edit') || hasPerm('intake.manage'))) {
+      api<{editable: boolean}>('GET', `/parties/${value.id}`).then(d => { if (alive) setCanEdit(d.editable); }).catch(() => {});
+    }
+    return () => { alive = false; };
+  }, [value?.id, hasPerm]);
+  return (<>
     <SearchSelect<Party>
       label={label}
       required={required}
@@ -232,7 +281,9 @@ export function PartyPicker({
       )}
       selectedLabel={(p) => `${p.name} (${p.kind})`}
     />
-  );
+    {value && canEdit && !editing && <Button type="button" variant="secondary" onClick={() => setEditing(true)}>Edit contact details</Button>}
+    {value && editing && <PartyContactEditor partyId={value.id} onSaved={onChange} onClose={() => setEditing(false)} />}
+  </>);
 }
 
 /** Pick an existing case (search by number, title or party). */

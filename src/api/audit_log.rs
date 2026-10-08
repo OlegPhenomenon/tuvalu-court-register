@@ -1,5 +1,5 @@
 //! C15 history & audit. Every actor who can see a case may read its history; events touching a
-//! document the actor cannot see are omitted.
+//! document the actor cannot see are omitted or replaced with a neutral decision event.
 //! The global audit browser and chain verification require `audit.view`.
 
 use super::common::{JsonResult, optional, query_json};
@@ -10,7 +10,7 @@ use crate::state::AppState;
 use axum::extract::{Path, Query};
 use axum::routing::get;
 use axum::{Json, Router};
-use rusqlite::{Connection, params};
+use rusqlite::{Connection, OptionalExtension, params};
 use serde::Deserialize;
 use serde_json::{Value, json};
 
@@ -29,7 +29,7 @@ fn touches_hidden_document(
     entity_id: Option<i64>,
     action: &str,
 ) -> AppResult<bool> {
-    if !matches!(entity_type, "document" | "document_version")
+    if !matches!(entity_type, "document" | "document_version" | "decision")
         && action != "document.viewed_restricted"
     {
         return Ok(false);
@@ -42,6 +42,8 @@ fn touches_hidden_document(
         policy::document_visible_sql(actor, "d"),
         id_expr = if entity_type == "document_version" {
             "(SELECT document_id FROM document_versions WHERE id=?1)"
+        } else if entity_type == "decision" {
+            "(SELECT document_id FROM decisions WHERE id=?1)"
         } else {
             "?1"
         }
@@ -49,8 +51,36 @@ fn touches_hidden_document(
     Ok(c.query_row(&sql, [doc_id], |r| r.get::<_, i64>(0))? == 0)
 }
 
+/// The first later draft edit records the version that was bound at this event's time.
+/// Resolve old events without changing the append-only audit trail.
+fn decision_event_version(c: &Connection, ev: &Value) -> AppResult<Option<i64>> {
+    let earlier: Option<i64> = c
+        .query_row(
+            "SELECT json_extract(details,'$.before.document_version_id') FROM audit_events
+        WHERE entity_type='decision' AND entity_id=?1 AND action='decision.updated' AND id>=?2
+          AND json_extract(details,'$.before.document_version_id') IS NOT NULL ORDER BY id LIMIT 1",
+            params![ev["entity_id"].as_i64(), ev["id"].as_i64()],
+            |r| r.get(0),
+        )
+        .optional()?;
+    if earlier.is_some() {
+        return Ok(earlier);
+    }
+    Ok(c.query_row(
+        "SELECT document_version_id FROM decisions WHERE id=?1",
+        [ev["entity_id"].as_i64()],
+        |r| r.get(0),
+    )
+    .optional()?)
+}
+
 /// Shape one audit row for the case history, omitting events the actor may not see.
-fn event_json(c: &Connection, actor: &Actor, ev: &Value, with_details: bool) -> AppResult<Option<Value>> {
+fn event_json(
+    c: &Connection,
+    actor: &Actor,
+    ev: &Value,
+    with_details: bool,
+) -> AppResult<Option<Value>> {
     let entity_type = ev["entity_type"].as_str().unwrap_or_default();
     let entity_id = ev["entity_id"].as_i64();
     let action = ev["action"].as_str().unwrap_or_default();
@@ -72,9 +102,36 @@ fn event_json(c: &Connection, actor: &Actor, ev: &Value, with_details: bool) -> 
     } else {
         false
     };
-    let hidden =
-        hidden_relation || touches_hidden_document(c, actor, entity_type, entity_id, action)?;
-    if hidden {
+    if entity_type == "party"
+        && policy::require_party(c, actor, entity_id.unwrap_or_default()).is_err()
+    {
+        return Ok(None);
+    }
+    if entity_type == "intake"
+        && super::intake::require_intake(c, actor, entity_id.unwrap_or_default()).is_err()
+    {
+        return Ok(None);
+    }
+    if entity_type == "dispatch" {
+        let iid: Option<i64> = c
+            .query_row(
+                "SELECT intake_id FROM dispatches WHERE id=?1",
+                [entity_id],
+                |r| r.get(0),
+            )
+            .optional()?
+            .flatten();
+        if let Some(iid) = iid {
+            if super::intake::require_intake(c, actor, iid).is_err() {
+                return Ok(None);
+            }
+        }
+    }
+    let hidden_document = touches_hidden_document(c, actor, entity_type, entity_id, action)?
+        || (entity_type == "decision"
+            && decision_event_version(c, ev)?
+                .is_none_or(|v| policy::require_version(c, actor, v).is_err()));
+    if hidden_relation || (hidden_document && entity_type != "decision") {
         return Ok(None);
     }
     let mut out = json!({
@@ -84,14 +141,18 @@ fn event_json(c: &Connection, actor: &Actor, ev: &Value, with_details: bool) -> 
         "user_id": ev["user_id"],
         "user_name": ev["user_name"],
         "action": ev["action"],
-        "summary": ev["summary"],
+        "summary": if hidden_document { json!("Restricted document decision event") } else { ev["summary"].clone() },
     });
     if with_details {
         out["entity_type"] = ev["entity_type"].clone();
         out["entity_id"] = ev["entity_id"].clone();
         out["case_id"] = ev["case_id"].clone();
         out["ip"] = ev["ip"].clone();
-        out["details"] = details;
+        out["details"] = if hidden_document {
+            json!({"document_version_id":decision_event_version(c,ev)?,"restricted":true,"document_title":"Restricted document"})
+        } else {
+            details
+        };
     }
     Ok(Some(out))
 }
@@ -129,54 +190,76 @@ fn history(
          FROM audit_events a LEFT JOIN users u ON u.id = a.user_id
          WHERE a.case_id = ?1
             OR (a.entity_type = 'case' AND a.entity_id = ?1)
+            OR (a.entity_type = 'intake' AND a.entity_id IN (SELECT id FROM intakes WHERE case_id=?1))
             OR (a.entity_type = 'document' AND a.entity_id IN (SELECT d.id FROM documents d WHERE d.case_id = ?1))
             OR (a.entity_type = 'document_version' AND a.entity_id IN (SELECT v.id FROM document_versions v JOIN documents d ON d.id=v.document_id WHERE d.case_id=?1))
             OR (a.entity_type = 'hearing' AND a.entity_id IN (SELECT h.id FROM hearings h WHERE h.case_id = ?1))
             OR (a.entity_type = 'decision' AND a.entity_id IN (SELECT d.id FROM decisions d WHERE d.case_id = ?1))
-            OR (a.entity_type = 'dispatch' AND a.entity_id IN (SELECT d.id FROM dispatches d WHERE d.case_id = ?1))
+            OR (a.entity_type = 'dispatch' AND a.entity_id IN (SELECT d.id FROM dispatches d WHERE d.case_id = ?1 OR d.intake_id IN (SELECT id FROM intakes WHERE case_id=?1)))
             OR (a.entity_type = 'task' AND a.entity_id IN (SELECT t.id FROM tasks t WHERE t.case_id = ?1))
          ORDER BY a.id",
         [case_id],
     )?;
     let mut events = Vec::with_capacity(rows.len());
     for ev in &rows {
-        let Some(event) = event_json(c, actor, ev, false)? else { continue };
+        let Some(mut event) = event_json(c, actor, ev, false)? else {
+            continue;
+        };
         if let Some(ids) = package_ids {
             let entity = ev["entity_type"].as_str().unwrap_or_default();
-            if matches!(entity, "document" | "document_version") {
-                let did = if entity == "document_version" {
+            let eid = ev["entity_id"].as_i64().unwrap_or_default();
+            let details: Value = serde_json::from_str(ev["details"].as_str().unwrap_or("{}"))?;
+            let material = match entity {
+                "document" => Some((eid, details["version_id"].as_i64())),
+                "document_version" => Some((
                     c.query_row(
                         "SELECT document_id FROM document_versions WHERE id=?1",
-                        [ev["entity_id"].as_i64()],
-                        |r| r.get::<_, i64>(0),
-                    )?
-                } else {
-                    ev["entity_id"].as_i64().unwrap_or_default()
-                };
-                let (visibility, doc_type): (String, String) = c.query_row(
-                    "SELECT visibility, doc_type FROM documents WHERE id=?1",
-                    [did],
-                    |r| Ok((r.get(0)?, r.get(1)?)),
-                )?;
-                if visibility == "judicial_note" || doc_type == "judicial_note" {
+                        [eid],
+                        |r| r.get(0),
+                    )?,
+                    Some(eid),
+                )),
+                "decision" => {
+                    let Some(vid) = decision_event_version(c, ev)? else {
+                        continue;
+                    };
+                    Some((
+                        c.query_row(
+                            "SELECT document_id FROM document_versions WHERE id=?1",
+                            [vid],
+                            |r| r.get(0),
+                        )?,
+                        Some(vid),
+                    ))
+                }
+                _ => None,
+            };
+            if let Some((did, vid)) = material {
+                if !included_documents.contains(&did) || vid.is_some_and(|v| !ids.contains(&v)) {
                     continue;
                 }
-                if visibility == "restricted" {
-                    let details: Value =
-                        serde_json::from_str(ev["details"].as_str().unwrap_or("{}"))?;
-                    let version_id = if entity == "document_version" {
-                        ev["entity_id"].as_i64()
-                    } else {
-                        details["version_id"].as_i64()
-                    };
-                    let included = if let Some(vid) = version_id {
-                        ids.contains(&vid)
-                    } else {
-                        included_documents.contains(&did)
-                    };
-                    if !included {
-                        continue;
-                    }
+                let excluded: bool=c.query_row("SELECT visibility='judicial_note' OR doc_type='judicial_note' FROM documents WHERE id=?1",[did],|r|r.get(0))?;
+                if excluded {
+                    continue;
+                }
+                event["summary"] = json!(if entity == "decision" {
+                    "Selected decision event"
+                } else {
+                    "Selected document event"
+                });
+            }
+            // A dispatch event can contain the titles of any of its attachments.
+            if entity == "dispatch" {
+                let attached = query_json(
+                    c,
+                    "SELECT document_version_id FROM dispatch_items WHERE dispatch_id=?1",
+                    [eid],
+                )?;
+                if attached
+                    .iter()
+                    .any(|v| !ids.contains(&v["document_version_id"].as_i64().unwrap_or_default()))
+                {
+                    continue;
                 }
             }
         }
@@ -240,7 +323,7 @@ async fn list(ctx: Ctx, Query(q): Query<AuditQuery>) -> JsonResult {
                 WHEN 'document_version' THEN (SELECT d.case_id FROM document_versions v JOIN documents d ON d.id=v.document_id WHERE v.id=a.entity_id)
                 WHEN 'hearing' THEN (SELECT case_id FROM hearings WHERE id=a.entity_id)
                 WHEN 'decision' THEN (SELECT case_id FROM decisions WHERE id=a.entity_id)
-                WHEN 'dispatch' THEN (SELECT case_id FROM dispatches WHERE id=a.entity_id)
+                WHEN 'dispatch' THEN (SELECT COALESCE(dp.case_id,(SELECT case_id FROM intakes WHERE id=dp.intake_id)) FROM dispatches dp WHERE id=a.entity_id)
                 WHEN 'task' THEN (SELECT case_id FROM tasks WHERE id=a.entity_id)
                 WHEN 'intake' THEN (SELECT case_id FROM intakes WHERE id=a.entity_id) END)";
             let vis = policy::case_visible_sql(&actor, scope);

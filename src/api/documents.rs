@@ -343,9 +343,7 @@ fn validate_upload(conn: &Connection, actor: &Actor, f: &UploadForm) -> AppResul
         return Err(AppError::validation("Source must be 'court', 'party' or 'external'.").with_details(json!({ "field": "source" })));
     }
     if let Some(pid) = f.source_party_id {
-        conn.query_row("SELECT id FROM parties WHERE id = ?1", [pid], |r| r.get::<_, i64>(0))
-            .optional()?
-            .ok_or_else(|| AppError::validation("Unknown source party.").with_details(json!({ "field": "source_party_id" })))?;
+        policy::require_party(conn, actor, pid)?;
     }
     let document_date = crate::time::parse_opt_date(f.document_date.as_deref())?;
     let received_date = crate::time::parse_opt_date(f.received_date.as_deref())?;

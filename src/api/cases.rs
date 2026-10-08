@@ -152,17 +152,12 @@ pub fn insert_party(tx: &Transaction, actor: &Actor, p: &NewParty) -> AppResult<
 pub fn add_participant(tx: &Transaction, actor: &Actor, case_id: i64, p: &ParticipantInput) -> AppResult<i64> {
     require_ref(tx, "participant_role", &p.role)?;
     let party_id = match (&p.party_id, &p.new_party) {
-        (Some(id), None) => tx
-            .query_row("SELECT id FROM parties WHERE id = ?1", [id], |r| r.get(0))
-            .optional()?
-            .ok_or_else(|| AppError::validation("Unknown party."))?,
+        (Some(id), None) => { policy::require_party(tx, actor, *id)?; *id },
         (None, Some(np)) => insert_party(tx, actor, np)?,
         _ => return Err(AppError::validation("Give either an existing party or a new party, not both.")),
     };
     if let Some(rep) = p.representative_party_id {
-        tx.query_row("SELECT id FROM parties WHERE id = ?1", [rep], |r| r.get::<_, i64>(0))
-            .optional()?
-            .ok_or_else(|| AppError::validation("Unknown representative."))?;
+        policy::require_party(tx, actor, rep)?;
         if optional(&p.representation_basis).is_none() {
             return Err(AppError::validation("State the basis of representation.").with_details(json!({ "field": "representation_basis" })));
         }
@@ -269,7 +264,7 @@ pub fn case_json(c: &Connection, actor: &Actor, id: i64) -> AppResult<Value> {
         "participants": query_json(c,
             "SELECT cp.id, cp.party_id, p.kind, p.name, p.contact_email, p.contact_phone, p.address, cp.role, cp.active,
                     cp.representative_party_id, rp.name AS representative_name, cp.representation_basis, cp.service_contact,
-                    cp.added_at, cp.ended_at, cp.end_reason
+                    cp.added_at, cp.ended_at, cp.end_reason, cp.version
              FROM case_participations cp JOIN parties p ON p.id = cp.party_id
              LEFT JOIN parties rp ON rp.id = cp.representative_party_id
              WHERE cp.case_id = ?1 ORDER BY cp.active DESC, cp.id", [id])?,
@@ -401,7 +396,8 @@ pub fn next_actions(c: &Connection, actor: &Actor, case_id: i64) -> AppResult<Ve
             _ => {}
         }
     }
-    for d in query_json(c, "SELECT title FROM decisions WHERE case_id = ?1 AND status = 'draft'", [case_id])? {
+    for mut d in query_json(c, "SELECT title,document_version_id FROM decisions WHERE case_id = ?1 AND status = 'draft'", [case_id])? {
+        if policy::require_version(c,actor,d["document_version_id"].as_i64().unwrap_or_default()).is_err() { d["title"]=json!("Restricted document"); }
         out.push(action("finalise_decision", format!("Finalise or withdraw the draft decision “{}”.", d["title"].as_str().unwrap_or_default()), format!("{base}?tab=decisions")));
     }
     if has_final {
@@ -449,6 +445,7 @@ struct UpdateReq {
     category: Option<String>,
     summary: Option<String>,
     responsible_user_id: Option<i64>,
+    assignment_reason: Option<String>,
     restricted: Option<bool>,
 }
 
@@ -457,7 +454,9 @@ async fn update(ctx: Ctx, Path(id): Path<i64>, JsonBody(req): JsonBody<UpdateReq
     let v = ctx
         .db
         .write(move |tx| {
-            let case = policy::require_case_perm(tx, &actor, id, perm::CASE_EDIT)?;
+            let case = policy::require_case(tx, &actor, id)?;
+            if req.responsible_user_id.is_some() { require_assign_perm(&actor,"clerk")?; }
+            if req.title.is_some() || req.category.is_some() || req.summary.is_some() || req.restricted.is_some() || req.responsible_user_id.is_none() { actor.require(perm::CASE_EDIT)?; }
             let before = query_one_json(tx, "SELECT title, category, summary, responsible_user_id, restricted, version FROM cases WHERE id = ?1", [id])?;
             if case.version != req.version {
                 return Err(AppError::version_conflict(before));
@@ -481,7 +480,10 @@ async fn update(ctx: Ctx, Path(id): Path<i64>, JsonBody(req): JsonBody<UpdateReq
                 params![id, title, req.category, req.summary, req.responsible_user_id, req.restricted, crate::time::now_utc()],
             )?;
             if let Some(uid) = req.responsible_user_id {
-                insert_assignment(tx, &actor, id, uid, "clerk", "Made responsible officer")?;
+                require_assign_perm(&actor, "clerk")?;
+                let why=reason(&req.assignment_reason)?;
+                insert_assignment(tx, &actor, id, uid, "clerk", &why)?;
+                audit::record(tx,Some(&actor),Event::new("case.assigned","case",id,"Responsible officer assigned").case(Some(id)).details(json!({"user_id":uid,"role":"clerk","reason":why})))?;
             }
             audit::record(
                 tx,
@@ -629,6 +631,12 @@ async fn close(ctx: Ctx, Path(id): Path<i64>, IdemKey(key): IdemKey, JsonBody(re
                     return Err(AppError::validation("Explain the basis for closing.").with_details(json!({ "field": "note" })));
                 }
                 let mut blockers = open_items(tx, id)?;
+                for blocker in &mut blockers {
+                    if blocker["kind"]=="decision" {
+                        let vid:i64=tx.query_row("SELECT document_version_id FROM decisions WHERE id=?1",[blocker["id"].as_i64()],|r|r.get(0))?;
+                        if policy::require_version(tx,&actor,vid).is_err() { blocker["label"]=json!("Restricted document"); }
+                    }
+                }
                 let mut acknowledged = Vec::new();
                 for ack in &req.acknowledge {
                     let position = blockers.iter().position(|item| item["kind"] == "unconfirmed_dispatch"
@@ -673,7 +681,7 @@ async fn close(ctx: Ctx, Path(id): Path<i64>, IdemKey(key): IdemKey, JsonBody(re
     Ok(Json(v))
 }
 
-#[derive(Deserialize)]
+#[derive(Deserialize, Serialize)]
 struct ReasonReq {
     reason: Option<String>,
 }
@@ -732,12 +740,13 @@ async fn add_relation(ctx: Ctx, Path(id): Path<i64>, JsonBody(req): JsonBody<Rel
     Ok(Json(v))
 }
 
-async fn participant_add(ctx: Ctx, Path(id): Path<i64>, JsonBody(req): JsonBody<ParticipantInput>) -> JsonResult {
+async fn participant_add(ctx: Ctx, Path(id): Path<i64>, IdemKey(key): IdemKey, JsonBody(req): JsonBody<ParticipantInput>) -> JsonResult {
     let actor = ctx.actor;
     let v = ctx
         .db
         .write(move |tx| {
             let case = policy::require_case_perm(tx, &actor, id, perm::CASE_EDIT)?;
+            idempotent(tx,&actor,&key,"participant.add",&json!({"case_id":id,"body":req}),|| {
             let pid = add_participant(tx, &actor, id, &req)?;
             let name: String = tx.query_row(
                 "SELECT p.name FROM case_participations cp JOIN parties p ON p.id = cp.party_id WHERE cp.id = ?1",
@@ -750,20 +759,22 @@ async fn participant_add(ctx: Ctx, Path(id): Path<i64>, JsonBody(req): JsonBody<
                 Event::new("case.participant_added", "case", id, format!("{name} added to {} as {}", case.number, req.role)).case(Some(id)),
             )?;
             case_json(tx, &actor, id)
+            })
         })
         .await?;
     Ok(Json(v))
 }
 
-async fn participant_end(ctx: Ctx, Path((id, pid)): Path<(i64, i64)>, JsonBody(req): JsonBody<ReasonReq>) -> JsonResult {
+async fn participant_end(ctx: Ctx, Path((id, pid)): Path<(i64, i64)>, IdemKey(key): IdemKey, JsonBody(req): JsonBody<ReasonReq>) -> JsonResult {
     let actor = ctx.actor;
     let v = ctx
         .db
         .write(move |tx| {
             let case = policy::require_case_perm(tx, &actor, id, perm::CASE_EDIT)?;
+            idempotent(tx,&actor,&key,"participant.end",&json!({"case_id":id,"participation_id":pid,"body":req}),|| {
             let why = reason(&req.reason)?;
             let n = tx.execute(
-                "UPDATE case_participations SET active = 0, ended_at = ?3, end_reason = ?4 WHERE id = ?1 AND case_id = ?2 AND active = 1",
+                "UPDATE case_participations SET version=version+1, active = 0, ended_at = ?3, end_reason = ?4 WHERE id = ?1 AND case_id = ?2 AND active = 1",
                 params![pid, id, crate::time::now_utc(), why],
             )?;
             if n == 0 {
@@ -777,6 +788,7 @@ async fn participant_end(ctx: Ctx, Path((id, pid)): Path<(i64, i64)>, JsonBody(r
                     .details(json!({ "participation_id": pid, "reason": why })),
             )?;
             case_json(tx, &actor, id)
+            })
         })
         .await?;
     Ok(Json(v))
