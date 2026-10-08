@@ -2647,3 +2647,224 @@ fn r3_followup_pdf_image_exception_requires_image_syntax() {
         );
     }
 }
+
+// Robustness inputs are generated here so no large or hostile fixtures are checked in.
+fn r5_action_fanout(count: usize, fanout: usize) -> Vec<u8> {
+    let mut pdf = b"%PDF-1.5\n".to_vec();
+    for id in 1..=count {
+        pdf.extend_from_slice(format!("{id} 0 obj <</S/GoTo/D[0/Fit]").as_bytes());
+        if id < count {
+            pdf.extend_from_slice(b"/Next[");
+            pdf.extend_from_slice(format!("{} 0 R ", id + 1).repeat(fanout).as_bytes());
+            pdf.extend_from_slice(b"]");
+        }
+        pdf.extend_from_slice(b">> endobj\n");
+    }
+    pdf.extend_from_slice(b"%%EOF");
+    pdf
+}
+
+#[test]
+fn r5_pdf_action_fanout_is_bounded() {
+    use std::time::{Duration, Instant};
+    // Kill the pre-fix exponential traversal rather than hanging the test runner.
+    const CHILD: &str = "TCR_R5_FANOUT_CHILD";
+    if std::env::var_os(CHILD).is_none() {
+        let mut child = Command::new(std::env::current_exe().unwrap())
+            .args(["--exact", "r5_pdf_action_fanout_is_bounded", "--nocapture"])
+            .env(CHILD, "1")
+            .spawn()
+            .unwrap();
+        let start = Instant::now();
+        loop {
+            if let Some(status) = child.try_wait().unwrap() {
+                assert!(status.success(), "fan-out child failed: {status}");
+                return;
+            }
+            if start.elapsed() > Duration::from_secs(5) {
+                child.kill().unwrap();
+                child.wait().unwrap();
+                panic!("PDF action fan-out exceeded watchdog");
+            }
+            std::thread::sleep(Duration::from_millis(10));
+        }
+    }
+    let app = TestApp::production();
+    let db = app.state.main_db.as_ref().unwrap();
+    for (count, fanout) in [(40, 2), (5, 1000)] {
+        let bytes = r5_action_fanout(count, fanout);
+        let start = Instant::now();
+        for _ in 0..2 {
+            let stored =
+                tuvalu_court::storage::store(db, &bytes, "fanout.pdf", 15 * 1024 * 1024).unwrap();
+            assert_eq!(stored.scan_status, "clean", "{:?}", stored.scan_note);
+            assert_eq!(
+                stored.scan_note.as_deref(),
+                Some("Format checks only, no antivirus (TCR_AV=off)")
+            );
+        }
+        assert!(
+            start.elapsed() < Duration::from_secs(1),
+            "{count} x {fanout}: {:?}",
+            start.elapsed()
+        );
+    }
+    // Distinct roots must share one budget, even with only shallow action chains.
+    let mut bytes = b"%PDF-1.5\n".to_vec();
+    for id in 1..=60 {
+        bytes.extend_from_slice(format!("{id} 0 obj <</S/GoTo/Next[").as_bytes());
+        bytes.extend_from_slice(&b"<</S/GoTo>> ".repeat(1000));
+        bytes.extend_from_slice(b"]>> endobj\n");
+    }
+    bytes.extend_from_slice(b"%%EOF");
+    let start = Instant::now();
+    let stored = tuvalu_court::storage::store(db, &bytes, "budget.pdf", 15 * 1024 * 1024).unwrap();
+    assert_eq!(stored.scan_status, "quarantined");
+    assert_eq!(
+        stored.scan_note.as_deref(),
+        Some("PDF action/reference work budget exceeded")
+    );
+    assert!(start.elapsed() < Duration::from_secs(3));
+}
+
+fn r5_zero_payload(actions: usize, size: usize) -> Vec<u8> {
+    let mut content = b"/S /x ".repeat(actions);
+    content.resize(content.len() + size, 0);
+    let encoded = miniz_oxide::deflate::compress_to_vec_zlib(&content, 6);
+    r3_stream("/Filter/FlateDecode", &encoded)
+}
+
+#[test]
+fn r5_pdf_name_scan_tails_and_fixed_verdict_are_bounded() {
+    use std::time::{Duration, Instant};
+    let app = TestApp::production();
+    let db = app.state.main_db.as_ref().unwrap();
+    let mut timings = Vec::new();
+    // Proportional versions of the reviewer's 900 MiB zero stream, within the decode budget.
+    for size in [8 * 1024 * 1024, 32 * 1024 * 1024] {
+        let bytes = r5_zero_payload(64, size);
+        let start = Instant::now();
+        let stored =
+            tuvalu_court::storage::store(db, &bytes, "tails.pdf", 15 * 1024 * 1024).unwrap();
+        let elapsed = start.elapsed();
+        assert_eq!(stored.scan_status, "clean", "{:?}", stored.scan_note);
+        assert!(
+            elapsed < Duration::from_secs(3),
+            "{size} bytes: {elapsed:?}"
+        );
+        timings.push(elapsed);
+    }
+    assert!(
+        timings[1] <= timings[0] * 6 + Duration::from_millis(100),
+        "{timings:?}"
+    );
+    let bytes = r5_zero_payload(70, 64 * 1024 * 1024);
+    let start = Instant::now();
+    let stored =
+        tuvalu_court::storage::store(db, &bytes, "many-actions.pdf", 15 * 1024 * 1024).unwrap();
+    assert_eq!(stored.scan_status, "quarantined");
+    assert_eq!(
+        stored.scan_note.as_deref(),
+        Some("PDF payload actions exceed inspection limit")
+    );
+    assert!(
+        start.elapsed() < Duration::from_millis(250),
+        "fixed verdict: {:?}",
+        start.elapsed()
+    );
+}
+
+#[test]
+fn r5_pdf_attachments_without_embeddedfile_type_are_quarantined() {
+    for body in [
+        "1 0 obj <</Type/Filespec/F(demo.txt)/EF<</F 2 0 R>>>> endobj\n2 0 obj <</Length 4>>stream\nDEMO\nendstream endobj",
+        "1 0 obj <</Type/Annot/Subtype/FileAttachment/FS 2 0 R>> endobj\n2 0 obj <</F(demo.txt)>> endobj",
+        "1 0 obj <</EF null>> endobj",
+        "1 0 obj <</Subtype 2 0 R>> endobj\n2 0 obj /FileAttachment endobj",
+    ] {
+        r3_followup_pdf_status(
+            format!("%PDF-1.5\n{body}\n%%EOF").as_bytes(),
+            "quarantined",
+            1_000_000,
+        );
+    }
+}
+
+#[cfg(debug_assertions)]
+static R5_INSPECTIONS: std::sync::LazyLock<parking_lot::Mutex<usize>> =
+    std::sync::LazyLock::new(|| parking_lot::Mutex::new(0));
+
+#[cfg(debug_assertions)]
+fn r5_assert_no_writer_during_inspection(db: &tuvalu_court::db::Db) {
+    let conn = db.open().unwrap();
+    conn.busy_timeout(std::time::Duration::ZERO).unwrap();
+    conn.execute_batch("BEGIN IMMEDIATE; ROLLBACK;")
+        .expect("storage inspection held the SQLite writer lock");
+    *R5_INSPECTIONS.lock() += 1;
+}
+
+#[cfg(debug_assertions)]
+#[tokio::test]
+async fn r5_import_inspects_before_opening_write_transaction() {
+    let _lock = HEAVY.lock().await;
+    let cfg = tuvalu_court::config::Config::for_tests(
+        Default::default(),
+        tuvalu_court::config::Mode::Production,
+    );
+    let (app, olga) = seeded_production(cfg).await;
+    let (_, number) = register_case(&olga, "DEMO format inspection lock").await;
+    let db = app.state.main_db.as_ref().unwrap();
+    let uid = db
+        .open()
+        .unwrap()
+        .query_row("SELECT id FROM users WHERE persona='elena'", [], |r| {
+            r.get(0)
+        })
+        .unwrap();
+    let mut c = olga.clone();
+    c.session = Some(auth::create_session(&db.open().unwrap(), uid, true, 12).unwrap());
+    let bytes = r5_zero_payload(64, 8 * 1024 * 1024);
+    let manifest = format!(
+        "case_number,filename,title,doc_type,visibility,document_date\n{number},import.pdf,DEMO format inspection,evidence,party_material,2026-10-08\n"
+    );
+    let archive = zip_files(&[
+        ("manifest.csv", manifest.as_bytes()),
+        ("import.pdf", &bytes),
+    ]);
+    let (s, b) = c
+        .upload("/api/import/files/preview", &[], "package.zip", &archive)
+        .await;
+    ok(s, &b);
+    let batch = b["batch_id"].as_i64().unwrap();
+    *R5_INSPECTIONS.lock() = 0;
+    tuvalu_court::storage::set_inspection_hook(db, Some(r5_assert_no_writer_during_inspection));
+    let path = format!("/api/import/{batch}/commit");
+    let (s, b) = c
+        .post_idem(&path, "DEMO inspection boundary", json!({}))
+        .await;
+    tuvalu_court::storage::set_inspection_hook(db, None);
+    ok(s, &b);
+    assert_eq!(b["summary"]["created"], 1);
+    assert_eq!(
+        *R5_INSPECTIONS.lock(),
+        1,
+        "import must inspect exactly once"
+    );
+    let vid = b["created"][0]["version_id"].as_i64().unwrap();
+    assert_eq!(
+        db.open()
+            .unwrap()
+            .query_row(
+                "SELECT scan_status FROM document_versions WHERE id=?1",
+                [vid],
+                |r| r.get::<_, String>(0)
+            )
+            .unwrap(),
+        "clean"
+    );
+    let (s, replay) = c
+        .post_idem(&path, "DEMO inspection boundary", json!({}))
+        .await;
+    ok(s, &replay);
+    assert_eq!(b, replay);
+}

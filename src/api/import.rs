@@ -666,6 +666,46 @@ async fn detail(ctx: Ctx, Path(id): Path<i64>) -> JsonResult {
 fn text<'a>(b: &'a Value, key: &str) -> &'a str {
     b[key].as_str().unwrap_or("")
 }
+// Source bytes are immutable; unpacking and CPU-bound format checks run on the
+// blocking read worker before BEGIN IMMEDIATE. All mutable policy is rechecked below.
+enum PreparedImport {
+    Cases(Vec<CaseRow>),
+    Files {
+        files: BTreeMap<String, Vec<u8>>,
+        input: Vec<FileRow>,
+        inspections: BTreeMap<String, storage::UploadInspection>,
+    },
+}
+fn prepare_commit(db: &Db, b: &Value) -> AppResult<Option<PreparedImport>> {
+    if b["status"] != "previewed" {
+        return Ok(None); // A committed batch may be an idempotency replay.
+    }
+    let bytes = storage::read(db, text(b, "storage_key"), text(b, "source_sha256"))?;
+    if b["kind"] == "cases_csv" {
+        return Ok(Some(PreparedImport::Cases(cases_rows(&bytes)?)));
+    }
+    let files = unpack(&bytes)?;
+    let input = file_rows(&files)?;
+    let old: Value = serde_json::from_str(text(b, "preview_json"))?;
+    let mut inspections = BTreeMap::new();
+    for (i, row) in input.iter().enumerate() {
+        if old["rows"][i]["action"] == "create" {
+            let data = files
+                .get(&row.filename)
+                .ok_or_else(|| invalid("Missing file."))?;
+            inspections.insert(
+                row.filename.clone(),
+                storage::inspect_upload(db, data, &row.filename, 15 * MB as u64)?,
+            );
+        }
+    }
+    Ok(Some(PreparedImport::Files {
+        files,
+        input,
+        inspections,
+    }))
+}
+
 async fn commit(ctx: Ctx, Path(id): Path<i64>, IdemKey(key): IdemKey) -> JsonResult {
     ctx.actor.require(perm::IMPORT_RUN)?;
     let permit = Arc::new(heavy_operation()?);
@@ -674,6 +714,18 @@ async fn commit(ctx: Ctx, Path(id): Path<i64>, IdemKey(key): IdemKey) -> JsonRes
     let keys = written.clone();
     let actor = ctx.actor;
     let db = ctx.db.clone();
+    let inspect_db = db.clone();
+    let inspect_actor = actor.clone();
+    let inspect_permit = permit.clone();
+    let (snapshot, mut prepared) = ctx
+        .db
+        .read(move |c| {
+            let _permit = inspect_permit;
+            let b = batch(c, &inspect_actor, id)?;
+            let prepared = prepare_commit(&inspect_db, &b)?;
+            Ok((b, prepared))
+        })
+        .await?;
     let value = ctx
         .db
         .write(move |tx| {
@@ -681,7 +733,21 @@ async fn commit(ctx: Ctx, Path(id): Path<i64>, IdemKey(key): IdemKey) -> JsonRes
             // Re-authorize the batch and its cases even when replaying a stored result.
             let b = batch(tx, &actor, id)?;
             idempotent(tx, &actor, &key, "import.commit", &id, || {
-                commit_rows(tx, &actor, &db, id, &b, &mut keys.lock())
+                for field in [
+                    "kind",
+                    "storage_key",
+                    "source_sha256",
+                    "preview_json",
+                    "source_options",
+                ] {
+                    if b[field] != snapshot[field] {
+                        return Err(AppError::conflict(
+                            "import_changed",
+                            "The import source changed after inspection.",
+                        ));
+                    }
+                }
+                commit_rows(tx, &actor, &db, id, &b, prepared.as_mut(), &mut keys.lock())
             })
         })
         .await;
@@ -727,6 +793,7 @@ fn commit_rows(
     db: &Db,
     id: i64,
     b: &Value,
+    prepared: Option<&mut PreparedImport>,
     written: &mut Vec<String>,
 ) -> AppResult<Value> {
     if b["status"] != "previewed" {
@@ -734,7 +801,7 @@ fn commit_rows(
             "This batch has already been committed.",
         ));
     }
-    let bytes = storage::read(db, text(b, "storage_key"), text(b, "source_sha256"))?;
+    let prepared = prepared.ok_or_else(|| AppError::internal("Missing prepared import."))?;
     let old: Value = serde_json::from_str(text(b, "preview_json"))?;
     let mut created = vec![];
     let mut skipped = old["summary"]["skip_existing"].as_u64().unwrap_or_default();
@@ -742,8 +809,10 @@ fn commit_rows(
     if b["kind"] == "cases_csv" {
         let options: Value = serde_json::from_str(text(b, "source_options"))?;
         let registry = options["registry_id"].as_i64();
-        let input = cases_rows(&bytes)?;
-        let current = case_preview(tx, actor, &input, registry)?;
+        let PreparedImport::Cases(input) = prepared else {
+            return Err(AppError::internal("Import kind changed."));
+        };
+        let current = case_preview(tx, actor, input, registry)?;
         // Reserve every retained series number before allocating legacy numbers, regardless
         // of source row order, so a generated number cannot collide with a later row.
         for (i, r) in input.iter().enumerate() {
@@ -812,9 +881,12 @@ fn commit_rows(
             created.push(json!({"case_id":cid,"number":number,"legacy_number":legacy}));
         }
     } else {
-        let files = unpack(&bytes)?;
-        let input = file_rows(&files)?;
-        let current = files_preview(tx, actor, &input, &files)?;
+        let PreparedImport::Files {
+            files, input, inspections,
+        } = prepared else {
+            return Err(AppError::internal("Import kind changed."));
+        };
+        let current = files_preview(tx, actor, input, files)?;
         {
             let mut added_bytes = 0u64;
             let used = storage::used_bytes(tx)?;
@@ -846,7 +918,10 @@ fn commit_rows(
                 if db.quota_bytes().is_some_and(|q| used + added_bytes > q) {
                     return Err(too_large());
                 }
-                let f = storage::prepare_upload(db, data, &r.filename, 15 * MB as u64)?;
+                let inspection = inspections
+                    .remove(&r.filename)
+                    .ok_or_else(|| AppError::internal("Missing file inspection."))?;
+                let f = storage::store_inspected_upload(db, data, inspection)?;
                 written.push(f.storage_key.clone());
                 tx.execute("INSERT INTO documents(case_id,title,doc_type,source,visibility,document_date,created_by,created_at)
                  VALUES(?1,?2,?3,'external',?4,?5,?6,?7)",params![cid,r.title,r.doc_type,r.visibility,(!r.document_date.is_empty()).then_some(&r.document_date),actor.user_id,now])?;

@@ -836,15 +836,20 @@ struct PdfNameScan {
     risky: bool,
     actions: Vec<(Vec<u8>, Vec<u8>)>,
     too_many_actions: bool,
+    open_tail: usize,
     capture_actions: bool,
     xml_names: bool,
 }
 impl PdfNameScan {
     fn decoded(&mut self, b: u8) {
-        for (_, tail) in &mut self.actions {
-            if tail.len() < 4096 {
-                tail.push(b);
-            }
+        for (_, tail) in &mut self.actions[self.open_tail..] {
+            tail.push(b);
+        }
+        // Captures are ordered by age, so full tails always form a prefix.
+        while self.actions.get(self.open_tail)
+            .is_some_and(|(_, tail)| tail.len() == 4096)
+        {
+            self.open_tail += 1;
         }
         if let Some((name, boundary, long)) = self.name.as_mut() {
             if !pdf_delimiter(b) {
@@ -912,6 +917,9 @@ impl PdfNameScan {
     }
     fn feed(&mut self, bytes: &[u8]) {
         for &b in bytes {
+            if self.risky || self.too_many_actions {
+                break;
+            }
             if !self.escape.is_empty() {
                 self.escape.push(b);
                 if self.escape.len() == 3 {
@@ -939,6 +947,23 @@ impl PdfNameScan {
         }
         self.escape.clear();
         self.decoded(b' ');
+    }
+}
+
+// Separate from decoded-byte limits: every traversal node and reference hop shares
+// this file-wide budget. Completed actions are memoised by reference and context;
+// active references remain distinct so cycles still fail closed.
+const PDF_ACTION_WORK: usize = 100_000;
+struct PdfActionWork {
+    left: usize,
+    complete: std::collections::BTreeSet<(u32, u32, bool)>,
+    active: std::collections::BTreeSet<(u32, u32, bool)>,
+}
+impl PdfActionWork {
+    fn step(&mut self) -> Result<(), &'static str> {
+        self.left = self.left.checked_sub(1)
+            .ok_or("PDF action/reference work budget exceeded")?;
+        Ok(())
     }
 }
 
@@ -1225,6 +1250,9 @@ impl PdfCheck {
                 if scan.risky {
                     return Err("PDF contains active content");
                 }
+                if scan.too_many_actions {
+                    return Err("PDF payload actions exceed inspection limit");
+                }
             }
         }
         if object {
@@ -1309,9 +1337,14 @@ impl PdfCheck {
         }
         Ok(())
     }
-    fn resolve<'a>(&'a self, mut value: &'a PdfValue) -> Result<&'a PdfValue, &'static str> {
+    fn resolve<'a>(
+        &'a self,
+        mut value: &'a PdfValue,
+        work: &mut PdfActionWork,
+    ) -> Result<&'a PdfValue, &'static str> {
         for _ in 0..64 {
             if let PdfValue::Ref(id, generation) = value {
+                work.step()?;
                 value = self
                     .objects
                     .get(&(*id, *generation))
@@ -1322,23 +1355,43 @@ impl PdfCheck {
         }
         Err("PDF action reference cycle or depth limit")
     }
-    fn action(&self, value: &PdfValue, additional: bool, depth: usize) -> Result<(), &'static str> {
+    fn action(
+        &self,
+        value: &PdfValue,
+        additional: bool,
+        depth: usize,
+        work: &mut PdfActionWork,
+    ) -> Result<(), &'static str> {
         if depth > 64 {
             return Err("PDF action reference cycle or depth limit");
         }
-        let value = self.resolve(value)?;
+        work.step()?;
+        if let PdfValue::Ref(id, generation) = value {
+            let key = (*id, *generation, additional);
+            if work.complete.contains(&key) {
+                return Ok(());
+            }
+            if !work.active.insert(key) {
+                return Err("PDF action reference cycle or depth limit");
+            }
+            let target = self.resolve(value, work)?;
+            self.action(target, additional, depth, work)?;
+            work.active.remove(&key);
+            work.complete.insert(key);
+            return Ok(());
+        }
         match value {
             PdfValue::Array(_) | PdfValue::String(_) | PdfValue::Name(_) if !additional => Ok(()), // destinations
             PdfValue::Atom(n) if n == b"null" => Ok(()),
             PdfValue::Dict(dict) if additional => {
                 for (_, v) in dict {
-                    self.action(v, false, depth + 1)?;
+                    self.action(v, false, depth + 1, work)?;
                 }
                 Ok(())
             }
             PdfValue::Dict(dict) => {
                 let s = pdf_field(dict, b"S").ok_or("PDF action subtype cannot be inspected")?;
-                let PdfValue::Name(s) = self.resolve(s)? else {
+                let PdfValue::Name(s) = self.resolve(s, work)? else {
                     return Err("PDF action subtype cannot be inspected");
                 };
                 if [
@@ -1356,16 +1409,16 @@ impl PdfCheck {
                 if s == b"GoToR" {
                     let file = pdf_field(dict, b"F")
                         .ok_or("PDF remote action file cannot be inspected")?;
-                    self.remote_file(file)?;
+                    self.remote_file(file, work)?;
                 }
                 if let Some(next) = pdf_field(dict, b"Next") {
-                    match self.resolve(next)? {
+                    match self.resolve(next, work)? {
                         PdfValue::Array(values) => {
                             for v in values {
-                                self.action(v, false, depth + 1)?;
+                                self.action(v, false, depth + 1, work)?;
                             }
                         }
-                        v => self.action(v, false, depth + 1)?,
+                        _ => self.action(next, false, depth + 1, work)?,
                     }
                 }
                 if ![
@@ -1390,8 +1443,8 @@ impl PdfCheck {
             _ => Err("PDF action cannot be inspected"),
         }
     }
-    fn remote_file(&self, file: &PdfValue) -> Result<(), &'static str> {
-        let file = self.resolve(file)?;
+    fn remote_file(&self, file: &PdfValue, work: &mut PdfActionWork) -> Result<(), &'static str> {
+        let file = self.resolve(file, work)?;
         let names: Vec<&PdfValue> = match file {
             PdfValue::String(_) => vec![file],
             PdfValue::Dict(d) => [b"F".as_slice(), b"UF", b"DOS", b"Mac", b"Unix"]
@@ -1404,7 +1457,7 @@ impl PdfCheck {
             return Err("PDF remote action file cannot be inspected");
         }
         for name in names {
-            let PdfValue::String(name) = self.resolve(name)? else {
+            let PdfValue::String(name) = self.resolve(name, work)? else {
                 return Err("PDF remote action file cannot be inspected");
             };
             let mut normalized = Vec::with_capacity(name.len());
@@ -1478,15 +1531,29 @@ impl PdfCheck {
         }
         Ok(())
     }
-    fn actions(&self, value: &PdfValue, depth: usize) -> Result<(), &'static str> {
+    fn actions(
+        &self,
+        value: &PdfValue,
+        depth: usize,
+        work: &mut PdfActionWork,
+    ) -> Result<(), &'static str> {
         if depth > 64 {
             return Err("PDF action nesting limit exceeded");
         }
+        work.step()?;
         match value {
             PdfValue::Dict(d) => {
+                if pdf_field(d, b"EF").is_some() {
+                    return Err("PDF contains attachments");
+                }
+                if let Some(subtype) = pdf_field(d, b"Subtype") {
+                    if pdf_name_is(Some(self.resolve(subtype, work)?), b"FileAttachment") {
+                        return Err("PDF contains attachments");
+                    }
+                }
                 if pdf_field(d, b"S").is_some() {
                     // /S is also used by non-action dictionaries (e.g. transparency).
-                    let s = self.resolve(pdf_field(d, b"S").unwrap())?;
+                    let s = self.resolve(pdf_field(d, b"S").unwrap(), work)?;
                     if let PdfValue::Name(n) = s {
                         if [
                             b"JavaScript".as_slice(),
@@ -1509,7 +1576,7 @@ impl PdfCheck {
                         ]
                         .contains(&n.as_slice())
                         {
-                            self.action(value, false, depth + 1)?;
+                            self.action(value, false, depth + 1, work)?;
                         }
                     }
                 }
@@ -1530,16 +1597,16 @@ impl PdfCheck {
                         seen_action = true;
                     }
                     if key == b"OpenAction" || (key == b"A" && (annotation || outline)) {
-                        self.action(v, false, depth + 1)?;
+                        self.action(v, false, depth + 1, work)?;
                     } else if key == b"AA" {
-                        self.action(v, true, depth + 1)?;
+                        self.action(v, true, depth + 1, work)?;
                     }
-                    self.actions(v, depth + 1)?;
+                    self.actions(v, depth + 1, work)?;
                 }
             }
             PdfValue::Array(a) | PdfValue::LimitedArray(a) => {
                 for v in a {
-                    self.actions(v, depth + 1)?;
+                    self.actions(v, depth + 1, work)?;
                 }
             }
             _ => {}
@@ -1555,8 +1622,13 @@ fn pdf_note_with_limit(bytes: &[u8], upload_limit: usize) -> Option<String> {
         allocated: 0,
     };
     let result = check.parse(bytes, 0).and_then(|()| {
+        let mut work = PdfActionWork {
+            left: PDF_ACTION_WORK,
+            complete: std::collections::BTreeSet::new(),
+            active: std::collections::BTreeSet::new(),
+        };
         for value in check.objects.values().chain(check.roots.iter()) {
-            check.actions(value, 0)?;
+            check.actions(value, 0, &mut work)?;
         }
         Ok(())
     });
@@ -1840,23 +1912,114 @@ pub fn prepare_upload(db: &Db, bytes: &[u8], filename: &str, max_bytes: u64) -> 
     store_inner(db, bytes, filename, max_bytes, false)
 }
 
-fn store_inner(db: &Db, bytes: &[u8], filename: &str, max_bytes: u64, scan_now: bool) -> AppResult<StoredFile> {
+// Per-database debug hook lets integration tests check the actual inspection boundary.
+#[cfg(debug_assertions)]
+type InspectionHooks = std::collections::BTreeMap<PathBuf, fn(&Db)>;
+#[cfg(debug_assertions)]
+static INSPECTION_HOOKS: std::sync::LazyLock<parking_lot::Mutex<InspectionHooks>> =
+    std::sync::LazyLock::new(|| parking_lot::Mutex::new(InspectionHooks::new()));
+
+#[cfg(debug_assertions)]
+#[doc(hidden)]
+pub fn set_inspection_hook(db: &Db, hook: Option<fn(&Db)>) {
+    let mut hooks = INSPECTION_HOOKS.lock();
+    if let Some(hook) = hook {
+        hooks.insert(db.path().to_path_buf(), hook);
+    } else {
+        hooks.remove(db.path());
+    }
+}
+
+/// A format/scanner verdict for immutable bytes, obtained before taking a DB writer lock.
+pub(crate) struct UploadInspection {
+    content_type: String,
+    filename: String,
+    scan_status: &'static str,
+    scan_note: Option<String>,
+}
+
+pub(crate) fn inspect_upload(
+    db: &Db,
+    bytes: &[u8],
+    filename: &str,
+    max_bytes: u64,
+) -> AppResult<UploadInspection> {
+    inspect_upload_inner(db, bytes, filename, max_bytes, false)
+}
+
+fn inspect_upload_inner(
+    db: &Db,
+    bytes: &[u8],
+    filename: &str,
+    max_bytes: u64,
+    scan_now: bool,
+) -> AppResult<UploadInspection> {
     if bytes.is_empty() {
         return Err(AppError::validation("The file is empty."));
     }
     if bytes.len() as u64 > max_bytes {
-        return Err(AppError::new(StatusCode::PAYLOAD_TOO_LARGE, "too_large", "The file is too large."));
+        return Err(AppError::new(
+            StatusCode::PAYLOAD_TOO_LARGE,
+            "too_large",
+            "The file is too large.",
+        ));
+    }
+    #[cfg(debug_assertions)]
+    {
+        let hook = INSPECTION_HOOKS.lock().get(db.path()).copied();
+        if let Some(hook) = hook {
+            hook(db);
+        }
     }
     let (kind, note) = inspect_with_limit(bytes, usize::try_from(max_bytes).unwrap_or(usize::MAX))?;
     let filename = sanitize_filename(filename);
-    let ext = filename.rsplit_once('.').map(|(_, e)| e.to_ascii_lowercase()).unwrap_or_default();
+    let ext = filename
+        .rsplit_once('.')
+        .map(|(_, e)| e.to_ascii_lowercase())
+        .unwrap_or_default();
     if !kind.extensions().contains(&ext.as_str()) {
         return Err(AppError::new(
             StatusCode::UNSUPPORTED_MEDIA_TYPE,
             "unsupported_type",
-            format!("The file content is {} but the name ends with '.{ext}'.", kind.mime()),
+            format!(
+                "The file content is {} but the name ends with '.{ext}'.",
+                kind.mime()
+            ),
         ));
     }
+    let (scan_status, scan_note) = if let Some(note) = note {
+        ("quarantined", Some(note))
+    } else if !scan_now
+        && db
+            .config()
+            .is_some_and(|c| c.mode == crate::config::Mode::Production && c.clamd.is_some())
+    {
+        (
+            "pending_scan",
+            Some("Awaiting ClamAV verdict; file cannot be opened".into()),
+        )
+    } else {
+        match crate::scan::verdict(db.config(), bytes) {
+            Ok(note) => ("clean", note),
+            Err(note) => ("quarantined", Some(note)),
+        }
+    };
+    Ok(UploadInspection {
+        content_type: kind.mime().to_string(),
+        filename,
+        scan_status,
+        scan_note,
+    })
+}
+
+fn store_inner(
+    db: &Db,
+    bytes: &[u8],
+    filename: &str,
+    max_bytes: u64,
+    scan_now: bool,
+) -> AppResult<StoredFile> {
+    let inspection = inspect_upload_inner(db, bytes, filename, max_bytes, scan_now)?;
     if let Some(quota) = db.quota_bytes() {
         let used = used_bytes(&db.open()?)?;
         if used + bytes.len() as u64 > quota {
@@ -1867,29 +2030,24 @@ fn store_inner(db: &Db, bytes: &[u8], filename: &str, max_bytes: u64, scan_now: 
             ));
         }
     }
-    let (scan_status, scan_note) = if let Some(note) = note {
-        ("quarantined", Some(note))
-    } else if !scan_now
-        && db
-            .config()
-            .is_some_and(|c| c.mode == crate::config::Mode::Production && c.clamd.is_some())
-    {
-        ("pending_scan", Some("Awaiting ClamAV verdict; file cannot be opened".into()))
-    } else {
-        match crate::scan::verdict(db.config(), bytes) {
-            Ok(note) => ("clean", note),
-            Err(note) => ("quarantined", Some(note)),
-        }
-    };
+    store_inspected_upload(db, bytes, inspection)
+}
+
+// The caller must use the same immutable bytes and check quota inside its transaction.
+pub(crate) fn store_inspected_upload(
+    db: &Db,
+    bytes: &[u8],
+    inspection: UploadInspection,
+) -> AppResult<StoredFile> {
     let raw = write_blob(db, bytes)?;
     Ok(StoredFile {
         storage_key: raw.0,
         sha256: raw.1,
         size_bytes: bytes.len() as i64,
-        content_type: kind.mime().to_string(),
-        filename,
-        scan_status,
-        scan_note,
+        content_type: inspection.content_type,
+        filename: inspection.filename,
+        scan_status: inspection.scan_status,
+        scan_note: inspection.scan_note,
     })
 }
 
