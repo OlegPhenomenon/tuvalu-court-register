@@ -107,3 +107,13 @@ open; each must be confirmed with the Office of the Judiciary before real use
 - Access rules, retention and destruction policy.
 - How legacy cases should be migrated, and whether an existing system or
   contractor must interoperate.
+
+## Closure evidence and planned work
+
+A closure document/decision/hearing reference and ordered court dates are registry validation
+rules for this application, not statements of Tuvalu law. Existing historical/imported closures
+are preserved; the migration adds nullable evidence fields without inventing missing evidence.
+New closure commands require evidence. Fresh DEMO seeds include a fictional settlement agreement
+and reference the finalised order for the other closed case.
+“Without a next step” describes current recorded work, rather than legal delay or the absence of
+an immediate button to press. Period dates apply to event metrics, while this metric is current.

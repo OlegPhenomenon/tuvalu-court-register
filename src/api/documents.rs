@@ -499,28 +499,35 @@ async fn upload_to_intake(
     upload_document(ctx, state.cfg.upload_max_bytes, None, Some(id), key, parsed).await
 }
 
-async fn upload_document(
-    ctx: Ctx,
-    max: u64,
-    case_id: Option<i64>,
-    intake_id: Option<i64>,
-    key: Option<String>,
-    parsed: ParsedUpload,
-) -> JsonResult {
+async fn upload_document(ctx: Ctx, max: u64, case_id: Option<i64>, intake_id: Option<i64>, key: Option<String>, parsed: ParsedUpload) -> JsonResult {
     let actor = ctx.actor.clone();
     let preflight_key = key.clone();
     let (mut parsed, case_id, request, replay) = ctx
         .db
         .read(move |c| {
             let case_id = if let Some(id) = intake_id {
-                check_upload_target_intake(c, &actor, id)?
+                actor.require(perm::INTAKE_MANAGE)?;
+                let intake = super::intake::require_intake(c, &actor, id)?;
+                let cid = intake["case_id"].as_i64();
+                if let Some(cid) = cid {
+                    policy::require_case(c, &actor, cid)?;
+                }
+                cid
             } else {
-                check_upload_target_case(c, &actor, case_id.unwrap_or_default())?;
+                policy::require_case_perm(c, &actor, case_id.unwrap_or_default(), perm::DOCUMENT_MANAGE)?;
                 case_id
             };
-            validate_upload(c, &actor, &parsed.form)?;
-            let request = upload_request_value(case_id, intake_id, &parsed);
+            // Bind the requested container, not its mutable registration/link state.
+            let request = upload_request_value(if intake_id.is_some() { None } else { case_id }, intake_id, &parsed);
             let replay = upload_replay(c, &actor, &preflight_key, "document.upload", &request)?;
+            if replay.is_none() {
+                if let Some(id) = intake_id {
+                    check_upload_target_intake(c, &actor, id)?;
+                } else {
+                    check_upload_target_case(c, &actor, case_id.unwrap_or_default())?;
+                }
+                validate_upload(c, &actor, &parsed.form)?;
+            }
             Ok((parsed, case_id, request, replay))
         })
         .await?;
@@ -534,13 +541,20 @@ async fn upload_document(
         .db
         .write(move |tx| {
             if let Some(id) = intake_id {
-                check_upload_target_intake(tx, &actor, id)?;
+                actor.require(perm::INTAKE_MANAGE)?;
+                super::intake::require_intake(tx, &actor, id)?;
             } else {
-                check_upload_target_case(tx, &actor, case_id.unwrap_or_default())?;
+                policy::require_case_perm(tx, &actor, case_id.unwrap_or_default(), perm::DOCUMENT_MANAGE)?;
             }
             let mut used = false;
             let value = idempotent(tx, &actor, &key, "document.upload", &request, || {
-                let doc_id = insert_document(tx, &actor, case_id, intake_id, &parsed.form, &file)?;
+                let target_case_id = if let Some(id) = intake_id {
+                    check_upload_target_intake(tx, &actor, id)?
+                } else {
+                    check_upload_target_case(tx, &actor, case_id.unwrap_or_default())?;
+                    case_id
+                };
+                let doc_id = insert_document(tx, &actor, target_case_id, intake_id, &parsed.form, &file)?;
                 used = true;
                 let doc = policy::require_document(tx, &actor, doc_id)?;
                 audit::record(
@@ -552,7 +566,7 @@ async fn upload_document(
                         doc_id,
                         format!("{} added", document_label(doc_id, &doc.visibility, &doc.title)),
                     )
-                    .case(case_id)
+                    .case(target_case_id)
                     .details(json!({ "filename": file.filename, "sha256": file.sha256,
                     "scan_status": file.scan_status, "intake_id": intake_id })),
                 )?;
@@ -608,10 +622,14 @@ async fn add_version(ctx: Ctx, State(state): State<AppState>, Path(id): Path<i64
     let (bytes, filename, request, replay) = ctx
         .db
         .read(move |c| {
-            check_version_target(c, &actor, id)?;
+            let doc = policy::require_document(c, &actor, id)?;
+            require_document_editor(&actor, &doc)?;
             let request = json!({ "document_id": id, "note": note, "filename": crate::storage::sanitize_filename(&filename),
             "sha256": crate::auth::sha256_hex(&bytes) });
             let replay = upload_replay(c, &actor, &preflight_key, "document.version", &request)?;
+            if replay.is_none() {
+                check_version_target(c, &actor, id)?;
+            }
             Ok((bytes, filename, request, replay))
         })
         .await?;
@@ -624,9 +642,11 @@ async fn add_version(ctx: Ctx, State(state): State<AppState>, Path(id): Path<i64
     let result = ctx
         .db
         .write(move |tx| {
-            let doc = check_version_target(tx, &actor, id)?;
+            let doc = policy::require_document(tx, &actor, id)?;
+            require_document_editor(&actor, &doc)?;
             let mut used = false;
             let value = idempotent(tx, &actor, &key, "document.version", &request, || {
+                check_version_target(tx, &actor, id)?;
                 let next: i64 = tx.query_row(
                     "SELECT COALESCE(MAX(version_no), 0) + 1 FROM document_versions WHERE document_id = ?1",
                     [id],
@@ -638,14 +658,9 @@ async fn add_version(ctx: Ctx, State(state): State<AppState>, Path(id): Path<i64
                 audit::record(
                     tx,
                     Some(&actor),
-                    Event::new(
-                        "document.version_added",
-                        "document",
-                        id,
-                        format!("Version {next} added to a document"),
-                    )
-                    .case(doc.case_id)
-                    .details(json!({ "version_no": next, "filename": file.filename, "sha256": file.sha256, "note": note })),
+                    Event::new("document.version_added", "document", id, format!("Version {next} added to a document"))
+                        .case(doc.case_id)
+                        .details(json!({ "version_no": next, "filename": file.filename, "sha256": file.sha256, "note": note })),
                 )?;
                 detail_json(tx, &actor, id)
             })?;

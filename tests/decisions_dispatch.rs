@@ -297,10 +297,11 @@ async fn decision_edits_withdrawal_and_close_blockers() {
         "invalid_transition",
     )
     .await;
+    let basis = settlement_document(&olga, &app, cid).await;
     posted(
         &olga,
         &format!("/api/cases/{cid}/close"),
-        json!({"basis":"settled","note":"Settled by parties"}),
+        json!({"basis":"settled","note":"Settled by parties","basis_document_version_id":basis}),
     )
     .await;
 }

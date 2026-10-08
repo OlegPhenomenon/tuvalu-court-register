@@ -8,7 +8,7 @@
 import { useRef, useState } from 'react';
 import type { FormEvent } from 'react';
 import { Link } from 'react-router-dom';
-import { api, ApiError } from '../../api';
+import { api, ApiError, newKey } from '../../api';
 import { useSession } from '../../session';
 import { fmtCourtLocal, fmtDate, fmtLocal } from '../../time';
 import { Button } from '../../components/Button';
@@ -102,6 +102,7 @@ function TaskForm({ caseId, caseData, hearings, task, onClose, onSaved }: {
   const [due, setDue] = useState(task?.due_date ?? '');
   const [hearingId, setHearingId] = useState(task?.hearing_id ? String(task.hearing_id) : '');
   const [busy, setBusy] = useState(false);
+  const [idemKey] = useState(newKey);
   const [error, setError] = useState<unknown>(null);
   const [attempted, setAttempted] = useState<Record<string, unknown> | undefined>();
 
@@ -128,8 +129,8 @@ function TaskForm({ caseId, caseData, hearings, task, onClose, onSaved }: {
     setBusy(true);
     setError(null);
     try {
-      if (editing) await api('PATCH', `/tasks/${task!.id}`, body);
-      else await api('POST', `/cases/${caseId}/tasks`, body);
+      if (editing) await api('PATCH', `/tasks/${task!.id}`, body, { idempotencyKey: idemKey });
+      else await api('POST', `/cases/${caseId}/tasks`, body, { idempotencyKey: idemKey });
       onSaved();
       onClose();
     } catch (err) {
@@ -224,6 +225,7 @@ export default function TasksTab({ caseId, caseData, reload }: CaseTabProps) {
   const allowed = caseData.allowed;
   const [modal, setModal] = useState<ModalState>(null);
   const [modalTick, setModalTick] = useState(0);
+  const [actionKey, setActionKey] = useState(newKey);
   const [busy, setBusy] = useState(false);
   const [actionError, setActionError] = useState<unknown>(null);
 
@@ -236,6 +238,7 @@ export default function TasksTab({ caseId, caseData, reload }: CaseTabProps) {
 
   const openModal = (m: NonNullable<ModalState>) => {
     setModalTick((t) => t + 1);
+    setActionKey(newKey());
     setActionError(null);
     setModal(m);
   };
@@ -250,7 +253,7 @@ export default function TasksTab({ caseId, caseData, reload }: CaseTabProps) {
     setBusy(true);
     setActionError(null);
     try {
-      await api('POST', path, body);
+      await api('POST', path, body, { idempotencyKey: actionKey });
       finish();
     } catch (e) {
       setActionError(e);
@@ -366,7 +369,7 @@ export default function TasksTab({ caseId, caseData, reload }: CaseTabProps) {
           confirmLabel="Mark done"
           busy={busy}
           error={actionError}
-          onConfirm={(r) => void act(`/tasks/${modal.task.id}/complete`, { result: r })}
+          onConfirm={(r) => void act(`/tasks/${modal.task.id}/complete`, { result: r, version: modal.task.version })}
           onClose={() => setModal(null)}
         />
       )}

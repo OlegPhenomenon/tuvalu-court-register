@@ -112,7 +112,8 @@ async fn c1_closing_requires_confirmation_or_individual_reason_and_preserves_oth
     ok(s, &b);
     let (s, task) = olga.post(&format!("/api/cases/{cid}/tasks"), json!({"title":"Finish the record"})).await;
     ok(s, &task);
-    let body = json!({"basis":"decided","note":"Decision recorded","acknowledge":[ack]});
+    let vid = settlement_document(&olga, &app, cid).await;
+    let body = json!({"basis":"settled","basis_document_version_id":vid,"note":"Settlement recorded","acknowledge":[ack]});
     let (s, b) = olga.post_idem(&path, "close-with-note", body.clone()).await;
     err(s, &b, StatusCode::CONFLICT, "open_items");
     assert_eq!(b["error"]["details"]["items"][0]["kind"], "task");
@@ -126,7 +127,7 @@ async fn c1_closing_requires_confirmation_or_individual_reason_and_preserves_oth
     assert_eq!(audit_count(&olga, &app, "case.closed", cid), 1);
     let (_, card) = olga.get(&format!("/api/cases/{cid}")).await;
     let note = card["case"]["closure_note"].as_str().unwrap();
-    assert!(note.starts_with("Decision recorded\nLeft unconfirmed: Notice → Alexei Fenwick"));
+    assert!(note.starts_with("Settlement recorded\nLeft unconfirmed: Notice → Alexei Fenwick"));
     assert!(note.ends_with(" — Recipient could not be contacted"));
     let details: String = olga
         .db(&app)
@@ -527,6 +528,6 @@ async fn next_action_links_templates_reports_and_dispatch_wording_match_the_cont
     assert!(rows["rows"].as_array().unwrap().iter().all(|r| r["id"] != cid));
     for row in rows["rows"].as_array().unwrap() {
         let (_, card) = olga.get(&format!("/api/cases/{}", row["id"])).await;
-        assert!(card["next_actions"].as_array().unwrap().is_empty());
+        assert!(card["next_actions"].as_array().unwrap().iter().any(|a| a["code"] == "plan_next_step"));
     }
 }

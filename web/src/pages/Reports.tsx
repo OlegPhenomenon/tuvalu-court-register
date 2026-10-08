@@ -28,6 +28,7 @@ function ReportsContent() {
   return <div className="reports-page">
     <PageHeader title="Reports" actions={<Button variant="secondary" onClick={() => window.print()}>Print</Button>} />
     <p>Counts include only cases you are allowed to see. Case age is shown as information, not as a breach of any rule.</p>
+    <p className="muted">“Without a next step” and staff workload describe current work. A scheduled hearing, open task, unsent dispatch or draft decision counts as a next step. Period dates apply to registration, closure and reopening events.</p>
     <form className="admin-filters" onSubmit={e => { e.preventDefault(); setMetric(null); setQuery(new URLSearchParams({ from, to, as_of: asOf }).toString()); summary.reload(); }}>
       <DateField label="Period from" value={from} onChange={setFrom} required max={to} />
       <DateField label="Period to" value={to} onChange={setTo} required min={from} />

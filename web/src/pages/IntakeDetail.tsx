@@ -265,7 +265,7 @@ export default function IntakeDetail() {
           missing_items: missingItems,
           method: method || null,
           address: address || null,
-        },
+        }, { idempotencyKey: idemKey },
       );
       setSentDispatchId(res.dispatch_id ?? null);
       setRequestInfoSent(true);
@@ -274,7 +274,7 @@ export default function IntakeDetail() {
 
   const submitMarkReady = () =>
     run(async () => {
-      await api('POST', `/intakes/${intake.id}/mark-ready`, { note: note || null });
+      await api('POST', `/intakes/${intake.id}/mark-ready`, { note: note || null }, { idempotencyKey: idemKey });
       setAction(null);
       reload();
     });
@@ -284,7 +284,7 @@ export default function IntakeDetail() {
       await api('POST', `/intakes/${intake.id}/mark-duplicate`, {
         duplicate_of_intake_id: dupTarget?.id,
         reason: dupReason,
-      });
+      }, { idempotencyKey: idemKey });
       setAction(null);
       reload();
     });
@@ -293,7 +293,7 @@ export default function IntakeDetail() {
     setReturnReason(reason);
     await run(async () => {
       try {
-        await api('POST', `/intakes/${intake.id}/return`, { reason });
+        await api('POST', `/intakes/${intake.id}/return`, { reason }, { idempotencyKey: idemKey });
         setAction(null);
         reload();
       } catch (error) {

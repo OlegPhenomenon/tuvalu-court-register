@@ -244,7 +244,8 @@ async fn closing_requires_basis_and_no_open_items_then_reopen() {
     let (s, b) = olga.post(&format!("/api/cases/{case_id}/close"), json!({"basis": "other"})).await;
     err(s, &b, StatusCode::BAD_REQUEST, "validation");
 
-    let (s, b) = olga.post(&format!("/api/cases/{case_id}/close"), json!({"basis": "settled", "note": "Parties settled"})).await;
+    let vid = settlement_document(&olga, &app, case_id).await;
+    let (s, b) = olga.post(&format!("/api/cases/{case_id}/close"), json!({"basis": "settled", "note": "Parties settled", "basis_document_version_id": vid})).await;
     ok(s, &b);
     let (_, card) = olga.get(&format!("/api/cases/{case_id}")).await;
     assert_eq!(card["case"]["status"], "closed");

@@ -85,12 +85,20 @@ struct IntakeInput {
 fn next_reference(tx: &Transaction, received_date: &str) -> AppResult<String> {
     let prefix = crate::db::setting(tx, "intake_reference_prefix", "IN")?;
     let year = crate::time::year_of(received_date)?;
-    let pattern = format!("{prefix}-{year}-%");
-    let max: Option<String> = tx
-        .query_row("SELECT MAX(reference) FROM intakes WHERE reference LIKE ?1", [&pattern], |r| r.get(0))
-        .optional()?
-        .flatten();
-    let n = max.and_then(|m| m.rsplit('-').next().and_then(|s| s.parse::<i64>().ok())).unwrap_or(0) + 1;
+    let stem = format!("{prefix}-{year}-");
+    // Parse the entire numeric suffix, rather than comparing padded references as text.
+    // The caller holds BEGIN IMMEDIATE, so concurrent allocations cannot pick the same number.
+    let mut stmt = tx.prepare("SELECT reference FROM intakes WHERE substr(reference, 1, length(?1)) = ?1")?;
+    let refs = stmt.query_map(params![stem], |r| r.get::<_, String>(0))?;
+    let mut highest = 0i64;
+    for reference in refs {
+        let reference = reference?;
+        let suffix = &reference[stem.len()..];
+        if !suffix.is_empty() && suffix.bytes().all(|b| b.is_ascii_digit()) {
+            highest = highest.max(suffix.parse::<i64>().map_err(|_| AppError::validation("Intake sequence is too large."))?);
+        }
+    }
+    let n = highest.checked_add(1).ok_or_else(|| AppError::validation("Intake sequence is exhausted."))?;
     Ok(format!("{prefix}-{year}-{n:04}"))
 }
 
@@ -336,20 +344,34 @@ async fn supplement(ctx: Ctx, Path(id): Path<i64>, IdemKey(key): IdemKey, JsonBo
     let v = ctx
         .db
         .write(move |tx| {
-            let parent = load_for_change(tx, &actor, id, OPEN_STATES)?;
+            require_intake(tx, &actor, id)?;
+            actor.require(perm::INTAKE_MANAGE)?;
             idempotent(tx, &actor, &key, "intake.supplement", &(id, &input), || {
+                let parent = load_for_change(tx, &actor, id, OPEN_STATES)?;
                 let (child, reference) = insert_intake(tx, &actor, &input, Some(id))?;
                 // The supplement is part of the original package: it stays 'received', is listed under
                 // its parent (not in the main list) and follows the parent when it is registered or linked.
                 if status_of(&parent) == "needs_information" {
                     set_status(tx, id, "received", Some("Supplementary material received"))?;
                 }
-                note(tx, &actor, id, "incoming", &format!("Supplement {reference} received: {}", input.description.trim()), None)?;
+                note(
+                    tx,
+                    &actor,
+                    id,
+                    "incoming",
+                    &format!("Supplement {reference} received: {}", input.description.trim()),
+                    None,
+                )?;
                 audit::record(
                     tx,
                     Some(&actor),
-                    Event::new("intake.supplemented", "intake", id, format!("Supplement {reference} added to {}", parent["reference"].as_str().unwrap_or_default()))
-                        .details(json!({ "supplement_intake_id": child })),
+                    Event::new(
+                        "intake.supplemented",
+                        "intake",
+                        id,
+                        format!("Supplement {reference} added to {}", parent["reference"].as_str().unwrap_or_default()),
+                    )
+                    .details(json!({ "supplement_intake_id": child })),
                 )?;
                 Ok(json!({ "id": child, "reference": reference }))
             })
@@ -358,144 +380,188 @@ async fn supplement(ctx: Ctx, Path(id): Path<i64>, IdemKey(key): IdemKey, JsonBo
     Ok(Json(v))
 }
 
-#[derive(Deserialize)]
+#[derive(Deserialize, Serialize)]
 struct RequestInfoReq {
     missing_items: String,
     method: Option<String>,
     address: Option<String>,
 }
 
-async fn request_info(ctx: Ctx, Path(id): Path<i64>, JsonBody(req): JsonBody<RequestInfoReq>) -> JsonResult {
+async fn request_info(ctx: Ctx, Path(id): Path<i64>, IdemKey(key): IdemKey, JsonBody(req): JsonBody<RequestInfoReq>) -> JsonResult {
     let actor = ctx.actor;
     let v = ctx
         .db
         .write(move |tx| {
-            let intake = load_for_change(tx, &actor, id, &["received", "ready_for_registration", "needs_information"])?;
-            let missing = required(&req.missing_items, "Missing items")?;
-            let method = optional(&req.method).unwrap_or_else(|| "post".into());
-            require_ref(tx, "dispatch_method", &method)?;
-            let reference = intake["reference"].as_str().unwrap_or_default().to_string();
-            let recipient = intake["sender_name"].as_str().unwrap_or_default().to_string();
-            let (subject, body) = render_template(
-                tx,
-                "information_request",
-                &[
-                    ("recipient", recipient.clone()),
-                    ("intake_reference", reference.clone()),
-                    ("received_date", intake["received_date"].as_str().unwrap_or_default().to_string()),
-                    ("missing_items", missing.clone()),
-                ],
-            )?;
-            // Prepared message only: a person reviews and sends it from Dispatch.
-            tx.execute(
-                "INSERT INTO dispatches (intake_id, kind, template_code, recipient_party_id, recipient_name, method, address,
+            require_intake(tx, &actor, id)?;
+            actor.require(perm::INTAKE_MANAGE)?;
+            idempotent(tx, &actor, &key, "intake.request_info", &(id, &req), || {
+                let intake = load_for_change(tx, &actor, id, &["received", "ready_for_registration", "needs_information"])?;
+                let missing = required(&req.missing_items, "Missing items")?;
+                let method = optional(&req.method).unwrap_or_else(|| "post".into());
+                require_ref(tx, "dispatch_method", &method)?;
+                let reference = intake["reference"].as_str().unwrap_or_default().to_string();
+                let recipient = intake["sender_name"].as_str().unwrap_or_default().to_string();
+                let (subject, body) = render_template(
+                    tx,
+                    "information_request",
+                    &[
+                        ("recipient", recipient.clone()),
+                        ("intake_reference", reference.clone()),
+                        ("received_date", intake["received_date"].as_str().unwrap_or_default().to_string()),
+                        ("missing_items", missing.clone()),
+                    ],
+                )?;
+                // Prepared message only: a person reviews and sends it from Dispatch.
+                tx.execute(
+                    "INSERT INTO dispatches (intake_id, kind, template_code, recipient_party_id, recipient_name, method, address,
                                          subject, body, purpose, status, prepared_by, prepared_at)
                  VALUES (?1, 'information_request', 'information_request', ?2, ?3, ?4, ?5, ?6, ?7, 'Request for missing information', 'draft', ?8, ?9)",
-                params![id, intake["sender_party_id"].as_i64(), recipient, method, optional(&req.address), subject, body, actor.user_id, crate::time::now_utc()],
-            )?;
-            let dispatch_id = tx.last_insert_rowid();
-            tx.execute("UPDATE intakes SET missing_items = ?2 WHERE id = ?1", params![id, missing])?;
-            set_status(tx, id, "needs_information", None)?;
-            note(tx, &actor, id, "outgoing", &format!("Requested: {missing}"), Some(dispatch_id))?;
-            audit::record(
-                tx,
-                Some(&actor),
-                Event::new("intake.information_requested", "intake", id, format!("Requested missing information for {reference}"))
+                    params![
+                        id,
+                        intake["sender_party_id"].as_i64(),
+                        recipient,
+                        method,
+                        optional(&req.address),
+                        subject,
+                        body,
+                        actor.user_id,
+                        crate::time::now_utc()
+                    ],
+                )?;
+                let dispatch_id = tx.last_insert_rowid();
+                tx.execute("UPDATE intakes SET missing_items = ?2 WHERE id = ?1", params![id, missing])?;
+                set_status(tx, id, "needs_information", None)?;
+                note(tx, &actor, id, "outgoing", &format!("Requested: {missing}"), Some(dispatch_id))?;
+                audit::record(
+                    tx,
+                    Some(&actor),
+                    Event::new(
+                        "intake.information_requested",
+                        "intake",
+                        id,
+                        format!("Requested missing information for {reference}"),
+                    )
                     .details(json!({ "missing_items": missing, "dispatch_id": dispatch_id })),
-            )?;
-            Ok(json!({ "ok": true, "dispatch_id": dispatch_id }))
+                )?;
+                Ok(json!({ "ok": true, "dispatch_id": dispatch_id }))
+            })
         })
         .await?;
     Ok(Json(v))
 }
 
-#[derive(Deserialize)]
+#[derive(Deserialize, Serialize)]
 struct NoteReq {
     note: Option<String>,
 }
 
-async fn mark_ready(ctx: Ctx, Path(id): Path<i64>, JsonBody(req): JsonBody<NoteReq>) -> JsonResult {
+async fn mark_ready(ctx: Ctx, Path(id): Path<i64>, IdemKey(key): IdemKey, JsonBody(req): JsonBody<NoteReq>) -> JsonResult {
     let actor = ctx.actor;
     let v = ctx
         .db
         .write(move |tx| {
-            let intake = load_for_change(tx, &actor, id, &["received", "needs_information"])?;
-            let n = optional(&req.note);
-            set_status(tx, id, "ready_for_registration", n.as_deref())?;
-            if let Some(n) = &n {
-                note(tx, &actor, id, "note", n, None)?;
-            }
-            audit::record(
-                tx,
-                Some(&actor),
-                Event::new("intake.ready", "intake", id, format!("{} checked and ready for registration", intake["reference"].as_str().unwrap_or_default())),
-            )?;
-            require_intake(tx, &actor, id)
+            require_intake(tx, &actor, id)?;
+            actor.require(perm::INTAKE_MANAGE)?;
+            idempotent(tx, &actor, &key, "intake.mark_ready", &(id, &req), || {
+                let intake = load_for_change(tx, &actor, id, &["received", "needs_information"])?;
+                let n = optional(&req.note);
+                set_status(tx, id, "ready_for_registration", n.as_deref())?;
+                if let Some(n) = &n {
+                    note(tx, &actor, id, "note", n, None)?;
+                }
+                audit::record(
+                    tx,
+                    Some(&actor),
+                    Event::new(
+                        "intake.ready",
+                        "intake",
+                        id,
+                        format!("{} checked and ready for registration", intake["reference"].as_str().unwrap_or_default()),
+                    ),
+                )?;
+                require_intake(tx, &actor, id)
+            })
         })
         .await?;
     Ok(Json(v))
 }
 
-#[derive(Deserialize)]
+#[derive(Deserialize, Serialize)]
 struct DuplicateReq {
     duplicate_of_intake_id: i64,
     reason: Option<String>,
 }
 
-async fn mark_duplicate(ctx: Ctx, Path(id): Path<i64>, JsonBody(req): JsonBody<DuplicateReq>) -> JsonResult {
+async fn mark_duplicate(ctx: Ctx, Path(id): Path<i64>, IdemKey(key): IdemKey, JsonBody(req): JsonBody<DuplicateReq>) -> JsonResult {
     let actor = ctx.actor;
     let v = ctx
         .db
         .write(move |tx| {
-            let intake = load_for_change(tx, &actor, id, OPEN_STATES)?;
-            let why = reason(&req.reason)?;
-            if req.duplicate_of_intake_id == id {
-                return Err(AppError::validation("A filing cannot duplicate itself."));
-            }
-            let original = require_intake(tx, &actor, req.duplicate_of_intake_id)?;
-            tx.execute("UPDATE intakes SET duplicate_of_intake_id = ?2 WHERE id = ?1", params![id, req.duplicate_of_intake_id])?;
-            set_status(tx, id, "duplicate", Some(&why))?;
-            audit::record(
-                tx,
-                Some(&actor),
-                Event::new(
-                    "intake.duplicate",
-                    "intake",
-                    id,
-                    format!(
-                        "{} marked as duplicate of {}",
-                        intake["reference"].as_str().unwrap_or_default(),
-                        original["reference"].as_str().unwrap_or_default()
-                    ),
-                )
-                .details(json!({ "reason": why, "original_intake_id": req.duplicate_of_intake_id })),
-            )?;
-            require_intake(tx, &actor, id)
+            require_intake(tx, &actor, id)?;
+            actor.require(perm::INTAKE_MANAGE)?;
+            idempotent(tx, &actor, &key, "intake.mark_duplicate", &(id, &req), || {
+                let intake = load_for_change(tx, &actor, id, OPEN_STATES)?;
+                let why = reason(&req.reason)?;
+                if req.duplicate_of_intake_id == id {
+                    return Err(AppError::validation("A filing cannot duplicate itself."));
+                }
+                let original = require_intake(tx, &actor, req.duplicate_of_intake_id)?;
+                tx.execute(
+                    "UPDATE intakes SET duplicate_of_intake_id = ?2 WHERE id = ?1",
+                    params![id, req.duplicate_of_intake_id],
+                )?;
+                set_status(tx, id, "duplicate", Some(&why))?;
+                audit::record(
+                    tx,
+                    Some(&actor),
+                    Event::new(
+                        "intake.duplicate",
+                        "intake",
+                        id,
+                        format!(
+                            "{} marked as duplicate of {}",
+                            intake["reference"].as_str().unwrap_or_default(),
+                            original["reference"].as_str().unwrap_or_default()
+                        ),
+                    )
+                    .details(json!({ "reason": why, "original_intake_id": req.duplicate_of_intake_id })),
+                )?;
+                require_intake(tx, &actor, id)
+            })
         })
         .await?;
     Ok(Json(v))
 }
 
-#[derive(Deserialize)]
+#[derive(Deserialize, Serialize)]
 struct ReasonReq {
     reason: Option<String>,
 }
 
-async fn return_intake(ctx: Ctx, Path(id): Path<i64>, JsonBody(req): JsonBody<ReasonReq>) -> JsonResult {
+async fn return_intake(ctx: Ctx, Path(id): Path<i64>, IdemKey(key): IdemKey, JsonBody(req): JsonBody<ReasonReq>) -> JsonResult {
     let actor = ctx.actor;
     let v = ctx
         .db
         .write(move |tx| {
-            let intake = load_for_change(tx, &actor, id, OPEN_STATES)?;
-            let why = reason(&req.reason)?;
-            set_status(tx, id, "returned_or_redirected", Some(&why))?;
-            audit::record(
-                tx,
-                Some(&actor),
-                Event::new("intake.returned", "intake", id, format!("{} returned or redirected", intake["reference"].as_str().unwrap_or_default()))
+            require_intake(tx, &actor, id)?;
+            actor.require(perm::INTAKE_MANAGE)?;
+            idempotent(tx, &actor, &key, "intake.return", &(id, &req), || {
+                let intake = load_for_change(tx, &actor, id, OPEN_STATES)?;
+                let why = reason(&req.reason)?;
+                set_status(tx, id, "returned_or_redirected", Some(&why))?;
+                audit::record(
+                    tx,
+                    Some(&actor),
+                    Event::new(
+                        "intake.returned",
+                        "intake",
+                        id,
+                        format!("{} returned or redirected", intake["reference"].as_str().unwrap_or_default()),
+                    )
                     .details(json!({ "reason": why })),
-            )?;
-            require_intake(tx, &actor, id)
+                )?;
+                require_intake(tx, &actor, id)
+            })
         })
         .await?;
     Ok(Json(v))

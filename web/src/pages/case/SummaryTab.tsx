@@ -24,6 +24,7 @@ import { CasePicker } from '../intake/pickers';
 import type { CaseHit } from '../intake/pickers';
 import type { Assignment, CaseData, CaseTabProps, OpenItem } from './types';
 import ExportDialog from './ExportDialog';
+import { useApi } from '../../components/useApi';
 
 function Detail({ term, children }: { term: string; children: ReactNode }) {
   return (
@@ -168,14 +169,20 @@ function EditCaseModal({ caseData, onClose, onSaved }: {
 
 /* ------------------------------ close form ------------------------------ */
 
-function CloseCaseModal({ caseId, onClose, onSaved }: {
+function CloseCaseModal({ caseId, caseVersion, registeredDate, onClose, onSaved }: {
   caseId: number;
+  caseVersion: number;
+  registeredDate: string;
   onClose: () => void;
   onSaved: () => void;
 }) {
   const { data: ref, error: refError, reload: reloadRef } = useRefData();
   const form = useRef<HTMLFormElement>(null);
   const [basis, setBasis] = useState('');
+  type Evidence = { kind: 'document' | 'decision' | 'hearing'; id: number; date: string; label: string };
+  const evidence = useApi<{ items: Evidence[] }>(`/cases/${caseId}/closing-bases`);
+  const [evidenceId, setEvidenceId] = useState('');
+  const selected = evidence.data?.items.find((i) => `${i.kind}:${i.id}` === evidenceId);
   const [note, setNote] = useState('');
   const [closedDate, setClosedDate] = useState(courtToday());
   // One key per opened form — a network retry replays, never double-closes.
@@ -198,6 +205,10 @@ function CloseCaseModal({ caseId, onClose, onSaved }: {
     setOpenItems(null);
     const body: Record<string, unknown> = {
       basis,
+      version: caseVersion,
+      basis_document_version_id: selected?.kind === 'document' ? selected.id : null,
+      basis_decision_id: selected?.kind === 'decision' ? selected.id : null,
+      basis_hearing_id: selected?.kind === 'hearing' ? selected.id : null,
       note: note || null,
       closed_date: closedDate || null,
     };
@@ -225,6 +236,7 @@ function CloseCaseModal({ caseId, onClose, onSaved }: {
 
   return (
     <Modal title="Close the case" open onClose={busy ? () => {} : onClose}>
+      <ErrorBanner error={evidence.error} onRetry={evidence.reload} />
       <ErrorBanner error={refError} onRetry={reloadRef} />
       <FormErrors error={error} form={form} />
       <form ref={form} onSubmit={submit}>
@@ -274,7 +286,7 @@ function CloseCaseModal({ caseId, onClose, onSaved }: {
         <SelectField
           label="Basis for closing"
           value={basis}
-          onChange={setBasis}
+          onChange={(value) => { setBasis(value); setEvidenceId(''); }}
           options={options(refList(ref, 'closure_basis'))}
           placeholder="Choose the basis"
           required
@@ -287,13 +299,19 @@ function CloseCaseModal({ caseId, onClose, onSaved }: {
           required={basis === 'other'}
           help={basis === 'other' ? 'Required when the basis is "other".' : undefined}
         />
-        <DateField label="Closed date" value={closedDate} onChange={setClosedDate} required />
+        <SelectField label="Document, decision or hearing outcome" value={evidenceId} onChange={setEvidenceId}
+          options={(evidence.data?.items ?? []).filter((i) => basis !== 'decided' || i.kind !== 'document').map((i) => ({
+            value: `${i.kind}:${i.id}`, label: `${i.label} (${fmtDate(i.date)})`,
+          }))} placeholder="Choose evidence for closing" required
+          help="Without a hearing, choose a document of this case or a finalised decision. After a hearing, choose its recorded outcome or decision." />
+        <DateField label="Closed date" value={closedDate} onChange={setClosedDate} required
+          min={selected && selected.date > registeredDate ? selected.date : registeredDate} max={courtToday()} />
         <p className="muted">
           Closed in the register means the registry stage is complete. It is not proof that the
           decision was enforced or that appeal rights have expired.
         </p>
         <div className="actions">
-          <Button type="submit" variant="danger" busy={busy} disabled={!basis || unacked.length > 0}>
+          <Button type="submit" variant="danger" busy={busy} disabled={!basis || !selected || evidence.loading || unacked.length > 0}>
             Close the case
           </Button>
           <Button type="button" variant="secondary" onClick={onClose}>Cancel</Button>
@@ -402,6 +420,7 @@ function AddRelationModal({ caseId, onClose, onSaved }: {
   const [other, setOther] = useState<CaseHit | null>(null);
   const [kind, setKind] = useState('');
   const [note, setNote] = useState('');
+  const [idemKey] = useState(newKey);
   const [busy, setBusy] = useState(false);
   const [error, setError] = useState<unknown>(null);
 
@@ -414,7 +433,7 @@ function AddRelationModal({ caseId, onClose, onSaved }: {
         to_case_id: other?.id,
         kind,
         note: note || null,
-      });
+      }, { idempotencyKey: idemKey });
       onSaved();
       onClose();
     } catch (err) {
@@ -463,6 +482,7 @@ export default function SummaryTab({ caseId, caseData, reload }: CaseTabProps) {
   // `modal` keys remount each dialog so every open gets fresh state/keys.
   const [modal, setModal] = useState<'edit' | 'close' | 'assign' | 'relate' | 'hold' | 'reopen' | null>(null);
   const [modalTick, setModalTick] = useState(0);
+  const [actionKey, setActionKey] = useState(newKey);
   const [endAssignment, setEndAssignment] = useState<Assignment | null>(null);
   const [busy, setBusy] = useState(false);
   const [actionError, setActionError] = useState<unknown>(null);
@@ -470,6 +490,7 @@ export default function SummaryTab({ caseId, caseData, reload }: CaseTabProps) {
 
   const openModal = (m: NonNullable<typeof modal>) => {
     setModalTick((t) => t + 1);
+    setActionKey(newKey());
     setActionError(null);
     setModal(m);
   };
@@ -508,7 +529,7 @@ export default function SummaryTab({ caseId, caseData, reload }: CaseTabProps) {
 
   const reopen = (reason: string) =>
     run(async () => {
-      await api('POST', `/cases/${caseId}/reopen`, { reason });
+      await api('POST', `/cases/${caseId}/reopen`, { reason, version: c.version }, { idempotencyKey: actionKey });
       setModal(null);
       reload();
     });
@@ -721,7 +742,7 @@ export default function SummaryTab({ caseId, caseData, reload }: CaseTabProps) {
         <EditCaseModal key={modalTick} caseData={caseData} onClose={() => setModal(null)} onSaved={reload} />
       )}
       {modal === 'close' && (
-        <CloseCaseModal key={modalTick} caseId={caseId} onClose={() => setModal(null)} onSaved={reload} />
+        <CloseCaseModal key={modalTick} caseId={caseId} caseVersion={c.version} registeredDate={c.registered_date} onClose={() => setModal(null)} onSaved={reload} />
       )}
       {modal === 'assign' && (
         <AssignModal

@@ -71,8 +71,13 @@ JSON `{"error":{"code":"snake_case","message":"Human readable","details":{}}}`.
 ### Mutations
 - CSRF: cookies are `SameSite=Strict; HttpOnly`; all non-GET requests must send header `X-TCR: 1`, else 403 `csrf`.
 - Optimistic locking: editable records have `version INTEGER`; PATCH bodies include `version`; mismatch → 409 `version_conflict` with current record.
-- Idempotency: `Idempotency-Key` header (client UUID) on register/close/finalise/queue-dispatch/schedule; stored in `operation_keys`;
-  replay returns stored result, never a second case number / decision / attempt.
+- Idempotency: `Idempotency-Key` header (client UUID), stored in `operation_keys` in the action transaction.
+  Intake create/request-info/mark-ready/supplement/return/mark-duplicate/link/register, task create/update/complete/cancel/carry-forward,
+  case close/reopen/relation, document upload/new-version, and finalise/queue-dispatch/schedule support it.
+  Keys bind the user, operation, target and request hash; a changed request with the same key returns 409 `idempotency_mismatch`.
+  Replays recheck current visibility and permissions, then return the original response before checking transition state.
+  Multipart hashes cover metadata, sanitized filename and file SHA-256; linking an intake does not change the command identity.
+  Each opened UI form/dialog keeps one key through retries; a new deliberate command uses a new key.
 - Every response for private data: `Cache-Control: no-store, private`.
 
 ## 3. Time
@@ -148,6 +153,17 @@ Intake documents (no case yet): `intake.manage` holders.
   human confirmation and legal service assessment are **separate** records.
 - Task: `open → done|cancelled(reason)|carried_forward(reason)`.
 
+Closing requires exactly one explicit evidence reference: `basis_document_version_id`, `basis_decision_id`, or `basis_hearing_id`.
+Without a held hearing, a basis document must belong to the case, be visible to the actor, clean and not a judicial note;
+a finalised decision with a visible, clean case document is also allowed. Basis `decided`, or a case with a held hearing,
+requires a finalised decision or a held hearing with a recorded outcome. `closed_date` is a court date, no earlier than
+registration and the evidence date, and no later than today. Undated documents use their received date, then court-local creation date.
+Evidence IDs are kept on the case and in the closure audit event; reopening keeps prior evidence and status history.
+`GET /cases/:id/closing-bases` (requires case.close) returns `{items:[{kind:"document"|"decision"|"hearing",id,date,label}]}`
+filtered through document policy. The closing dialog selects exact evidence and date and retains validation errors.
+Close/reopen and task completion accept `version`; when supplied, stale versions return 409 `version_conflict`. The UI sends it.
+Older command clients without a version remain compatible; ordinary PATCH always requires a version.
+
 Closing a case with open tasks, draft decisions, draft/queued/failed dispatches, draft/scheduled hearings or sent dispatches
 without a `human_handover` confirmation → 409 `open_items`, with `details.items: [{kind,id,label,status}]`.
 Sent dispatches have kind `unconfirmed_dispatch`; close accepts optional
@@ -181,7 +197,12 @@ Templates render `{hearing_local}` and `{previous_local}` as English court-local
 kind, recipient and document count instead of repeating the subject's court name; mailbox delivery adds the address.
 Mailbox attachments include `document_version_id`. Missing/unknown versions are redacted instead of causing a 404.
 Report drill-down rows keep codes and add `category_label`, `status_label`, `closure_basis_label` (when applicable);
-display/CSV columns use labels. `without_next_step` counts open visible cases with an empty computed `next_actions` list.
+display/CSV columns use labels. `without_next_step` is a current snapshot, independent of report period dates and UI prompts. It counts open visible cases
+with no scheduled hearing still ahead/in progress, open task, draft/queued/failed dispatch, or visible draft decision.
+The same predicate drives summary hint `plan_next_step`; a future hearing produces `scheduled_hearing`, and queued
+messages produce `queued_dispatch`. Counts, drill-down and CSV use the same filtered rows.
+Intake references use the numeric maximum of fully parsed suffixes for the configured prefix/year inside BEGIN IMMEDIATE;
+formatting uses at least four digits, including 9999 → 10000 → 10001. Existing references stay unchanged.
 
 ## 7. API surface (all JSON, prefix `/api`)
 ```

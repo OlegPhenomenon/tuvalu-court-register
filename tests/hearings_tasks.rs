@@ -658,7 +658,8 @@ async fn open_items_block_closing_until_resolved() {
         )
         .await;
     assert_eq!(s, StatusCode::OK);
-    let (s, b) = olga.post(&format!("/api/cases/{case_id}/close"), json!({"basis": "decided"})).await;
+    let vid = settlement_document(&olga, &app, case_id).await;
+    let (s, b) = olga.post(&format!("/api/cases/{case_id}/close"), json!({"basis": "settled", "basis_document_version_id": vid})).await;
     ok(s, &b);
 
     // No new hearings on a closed case.
