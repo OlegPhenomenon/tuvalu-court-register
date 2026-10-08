@@ -75,22 +75,21 @@ pub fn status(cfg: &Config) -> &'static str {
     }
 }
 
-/// None means leave queued, never claim delivery. Called under the outbox claim transaction.
-pub fn deliver(
+/// Compose outside a write transaction. Sending is a separate network-only step.
+pub fn prepare(
     db: &Db,
     conn: &Connection,
-    id: i64,
+    message_id: &str,
     address: &str,
     subject: &str,
     body: &str,
     items: &[Value],
-) -> AppResult<Option<&'static str>> {
+) -> AppResult<Prepared> {
     let Some(cfg) = db.config().filter(|c| c.mode == Mode::Production) else {
-        return Ok(Some("local mailbox (DEMO)"));
+        return Ok(Prepared::Local);
     };
-    if cfg.smtp_url.is_none() || cfg.mail_from.is_none() {
-        conn.execute("UPDATE dispatches SET failure_reason='Mail transport not configured' WHERE id=?1 AND failure_reason IS NOT 'Mail transport not configured'", [id])?;
-        return Ok(None);
+    if !configured(db) {
+        return Err(AppError::validation("Mail transport not configured"));
     }
     let transport = smtp(cfg)?;
     let mut parts = MultiPart::mixed().singlepart(SinglePart::plain(body.to_string()));
@@ -106,16 +105,17 @@ pub fn deliver(
         if scan != "clean" {
             return Err(AppError::validation("Attachment is not clean"));
         }
-        let bytes = storage::read(db, &key, &sha)?;
+        let bytes = storage::read(db, &key, &sha)
+            .map_err(|_| AppError::validation(format!("Attachment version {vid} is unreadable or failed its integrity check; review this dispatch before retrying")))?;
         parts = parts.singlepart(
             Attachment::new(name).body(
                 Body::new_with_encoding(bytes, ContentTransferEncoding::Base64)
                     .map_err(|_| AppError::internal("Attachment encoding failed"))?,
-                mime.parse().map_err(|_| AppError::validation("Invalid attachment type"))?,
+                mime.parse()
+                    .map_err(|_| AppError::validation("Invalid attachment type"))?,
             ),
         );
     }
-    let installation = crate::db::setting(conn, "installation_id", "court")?;
     let message = Message::builder()
         .from(
             cfg.mail_from
@@ -124,18 +124,53 @@ pub fn deliver(
                 .parse()
                 .map_err(|_| AppError::validation("Invalid sender"))?,
         )
-        .to(address.parse().map_err(|_| AppError::validation("Invalid recipient"))?)
+        .to(address
+            .parse()
+            .map_err(|_| AppError::validation("Invalid recipient"))?)
         // Stable across attempts, helping receiving systems recognise an ambiguous retry.
-        .message_id(Some(format!("<dispatch-{id}-{installation}@tuvalu-court.invalid>")))
+        .message_id(Some(message_id.to_string()))
         .subject(subject)
         .multipart(parts)
         .map_err(|_| AppError::validation("Could not compose email"))?;
-    NETWORK.block_on(async {
-        tokio::time::timeout(Duration::from_secs(cfg.smtp_timeout_secs), transport.send(message))
-            .await
-            .map_err(|_| AppError::validation("SMTP delivery timed out"))?
-            .map_err(|e| AppError::validation(format!("SMTP delivery failed: {e}")))?;
-        Ok(Some("sent via SMTP"))
+    Ok(Prepared::Smtp {
+        transport: Box::new(transport),
+        message: Box::new(message),
+        timeout: cfg.smtp_timeout_secs,
+    })
+}
+
+pub enum Prepared {
+    Local,
+    Smtp {
+        transport: Box<AsyncSmtpTransport<Tokio1Executor>>,
+        message: Box<Message>,
+        timeout: u64,
+    },
+}
+impl Prepared {
+    /// No connection or transaction is held during this operation.
+    pub fn send(self) -> AppResult<&'static str> {
+        let Self::Smtp {
+            transport,
+            message,
+            timeout,
+        } = self
+        else {
+            return Ok("local mailbox (DEMO)");
+        };
+        NETWORK.block_on(async {
+            tokio::time::timeout(Duration::from_secs(timeout), transport.send(*message))
+                .await
+                .map_err(|_| AppError::validation("SMTP delivery timed out"))?
+                .map_err(|e| AppError::validation(format!("SMTP delivery failed: {e}")))?;
+            Ok("sent via SMTP")
+        })
+    }
+}
+
+pub fn configured(db: &Db) -> bool {
+    db.config().is_none_or(|cfg| {
+        cfg.mode != Mode::Production || (cfg.smtp_url.is_some() && cfg.mail_from.is_some())
     })
 }
 

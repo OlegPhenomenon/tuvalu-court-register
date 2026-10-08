@@ -205,3 +205,10 @@ complete restore steps and container commands. CLI-created/reset users enrol TOT
 and change their temporary password before accessing records; normal password
 changes are available to every production user in Settings. Other sessions end
 on password change and TOTP remains enabled.
+
+Kamal maintenance commands start containers with the binary as ENTRYPOINT, so
+pass the subcommand, for example `kamal app exec -i 'verify-audit'`. SMTP delivery
+and import scanning run outside SQLite write transactions. Interrupted mail
+claims retry with a stable Message-ID; unreadable attachments require review.
+Restore confirmation stages plaintext under the destination's `.restore-tmp`,
+using destination disk space rather than the container's `/tmp` tmpfs.

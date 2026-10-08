@@ -74,7 +74,7 @@ pub async fn check(endpoint: &str, bytes: &[u8], timeout_ms: u64) -> Result<(), 
     .map_err(|_| "Scanner timed out".to_string())?
 }
 
-/// Used from the blocking storage/legacy-import unit of work. No clean result is published before this returns.
+/// Synchronous standalone storage check. Transactional upload/import paths use prepare_upload + finish.
 pub fn verdict(cfg: Option<&Config>, bytes: &[u8]) -> Result<Option<String>, String> {
     let Some(cfg) = cfg.filter(|c| c.mode == Mode::Production) else {
         return Ok(Some("DEMO: format checks only, no antivirus".into()));
@@ -90,7 +90,7 @@ pub fn verdict(cfg: Option<&Config>, bytes: &[u8]) -> Result<Option<String>, Str
     Ok(Some("Format checks and ClamAV: clean verdict".into()))
 }
 
-/// Complete one committed HTTP upload. Pending versions after a process crash remain unavailable;
+/// Complete one committed HTTP upload or imported version. Pending versions after a process crash remain unavailable;
 /// they can be submitted as a new version after the scanner recovers.
 pub async fn finish(db: crate::db::Db, key: String) -> AppResult<Option<(i64, String, Option<String>)>> {
     use rusqlite::{OptionalExtension, params};

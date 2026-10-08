@@ -334,14 +334,14 @@ pub async fn password_gate(
 ) -> axum::response::Response {
     use axum::response::IntoResponse;
     let path = request.uri().path().strip_prefix("/api").unwrap_or(request.uri().path());
-    let allowed = matches!(path, "/auth/me" | "/auth/logout" | "/auth/password" | "/auth/totp" | "/auth/totp/setup" | "/auth/totp/enable");
+    let allowed = matches!(path, "/auth/mode" | "/auth/login" | "/auth/me" | "/auth/logout" | "/auth/password" | "/auth/totp" | "/auth/totp/setup" | "/auth/totp/enable");
     if !state.is_demo() && !allowed && let Some(token) = cookie_value(request.headers(), SESSION_COOKIE) {
         let resolved = state.resolve_db(request.headers());
         let result = async move {
             let (db, _) = resolved?;
             db.read(move |c| Ok(c.query_row(
                 "SELECT u.must_change_password FROM sessions s JOIN users u ON u.id=s.user_id
-                 WHERE s.token_hash=?1 AND s.revoked_at IS NULL AND s.expires_at>?2 AND u.active=1",
+                 WHERE s.token_hash=?1 AND s.mfa_ok=1 AND s.revoked_at IS NULL AND s.expires_at>?2 AND u.active=1",
                 params![sha256_hex(token.as_bytes()), crate::time::now_utc()], |r| r.get::<_,bool>(0))
                 .optional()?.unwrap_or(false))).await
         }.await;

@@ -124,12 +124,22 @@ an immediate button to press. Period dates apply to event metrics, while this me
   creation and show the installation id and resolved directory. Restore checks
   identity from the existing database inside the authenticated backup and requires
   confirmation before writing an explicit empty destination. The id is preserved.
+  Confirmation stages plaintext on destination disk under `.restore-tmp`, with
+  normal success/error cleanup; forced termination may leave unpublished staging.
 - Production requires clamd or explicit `TCR_AV=off`. Pending/scanner-error files
   are unavailable, including through export, dispatch, mailbox links and imports.
   Built-in format checks and antivirus reduce risk, without guaranteeing safety.
+  Imports commit pending versions before scanning outside SQLite writer transactions.
+  PDF dictionaries use token parsing and every FlateDecode stream is bounded and inspected.
 - New/reset passwords are temporary: all records APIs are blocked until own-password
   change. Own changes require fresh TOTP when enabled, revoke other sessions and
   retain MFA. Technical admins cannot reset protected judicial accounts.
+  The password gate starts after completed MFA; login/mode/TOTP remain available
+  when a user reloads before entering their code.
+- Outbox claims persist an `in_flight` attempt before attachment reads/SMTP, which
+  run without SQLite write transactions. Expired claims fail as ambiguous and
+  retry with a stable Message-ID. Unreadable attachments require human review and
+  do not block later dispatches; SMTP acceptance loss can still mean duplicate receipt.
 
 - Responsible-officer replacement ends the previous active clerk assignment, even if that assignment originally
   came from registration. Another role or general case-view permission can preserve access; registration by

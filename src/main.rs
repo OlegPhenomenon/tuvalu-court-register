@@ -112,7 +112,7 @@ fn run(mut args: Vec<String>) -> AppResult<()> {
             use std::io::{IsTerminal, Write};
             if rest.iter().any(|a| a != "--yes") { return Err(AppError::validation("Restore accepts only --yes after its paths.")); }
             // Restore reads an existing, initialised DB from the authenticated backup, never creates a source DB.
-            let installation = tuvalu_court::backup::installation_id(&PathBuf::from(input), &PathBuf::from(keyfile))?;
+            let installation = tuvalu_court::backup::installation_id(&PathBuf::from(input), &PathBuf::from(keyfile), &PathBuf::from(target))?;
             let target_path = PathBuf::from(target);
             let resolved = if target_path.is_absolute() { target_path } else { std::env::current_dir()?.join(target_path) };
             println!("Restore data directory: {}\nInstallation from backup: {installation}", resolved.display());
