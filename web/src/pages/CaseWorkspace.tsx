@@ -94,7 +94,13 @@ export default function CaseWorkspace() {
       <Tabs
         tabs={TABS.map(({ key, label }) => ({ key, label }))}
         active={active}
-        onChange={(key) => setParams({ tab: key })}
+        onChange={(key) =>
+          setParams((prev) => {
+            const p = new URLSearchParams(prev);
+            p.set('tab', key);
+            return p;
+          })
+        }
       />
       <div role="tabpanel" aria-label={tab.label}>
         <Component key={caseId} caseId={caseId} caseData={data} reload={reload} />

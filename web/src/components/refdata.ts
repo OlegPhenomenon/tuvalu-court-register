@@ -19,6 +19,8 @@ export interface StaffUser {
   display_name: string;
   title: string | null;
   is_judge: number | boolean;
+  /** False for system administrators who hold no case-work permission — never offer them for assignment. */
+  assignable?: boolean;
 }
 export interface Registry {
   id: number;

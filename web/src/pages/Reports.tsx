@@ -2,7 +2,7 @@ import { useState } from 'react';
 import { Link } from 'react-router-dom';
 import { downloadUrl } from '../api';
 import { useSession } from '../session';
-import { courtToday, fmtDate, fmtLocal } from '../time';
+import { courtToday, fmtCourtLocal, fmtDate, fmtLocal } from '../time';
 import { PageHeader } from '../components/PageHeader';
 import { Card } from '../components/Card';
 import { Button } from '../components/Button';
@@ -44,7 +44,16 @@ function ReportsContent() {
       <ErrorBanner error={items.error} onRetry={items.reload} />
       {items.loading ? <p role="status">Loading records…</p> : !items.error && items.data && <DataTable<Record<string, string | number | null>> rows={items.data.rows} empty="No matching records." columns={items.data.columns.map((c, index) => ({ key: c.key, header: c.header, render: row => {
         const raw = row[c.key];
-        const value = raw == null ? '—' : typeof raw === 'string' && /^\d{4}-\d{2}-\d{2}T/.test(raw) ? fmtLocal(raw) : typeof raw === 'string' && /^\d{4}-\d{2}-\d{2}$/.test(raw) ? fmtDate(raw) : String(raw);
+        // The API adds human labels next to codes (category → category_label, …).
+        const labelled = row[`${c.key}_label`];
+        const value = typeof labelled === 'string' && labelled ? labelled
+          : raw == null ? '—'
+          : typeof raw === 'string' && /^\d{4}-\d{2}-\d{2}T/.test(raw)
+            // `*_local` columns carry a court-local wall clock (no zone) — never
+            // read them as browser-local; other T-strings are UTC instants.
+            ? (c.key.endsWith('_local') || !/(Z|[+-]\d{2}:?\d{2})$/.test(raw) ? fmtCourtLocal(raw) : fmtLocal(raw))
+          : typeof raw === 'string' && /^\d{4}-\d{2}-\d{2}$/.test(raw) ? fmtDate(raw)
+          : String(raw);
         return index === 0 && typeof row.link === 'string' ? <Link to={row.link}>{value}</Link> : value;
       } }))} />}
     </Card>}

@@ -106,7 +106,6 @@ function TopBar() {
 }
 
 function DemoControls() {
-  const { refresh } = useSession();
   const menuRef = useRef<HTMLDetailsElement>(null);
   const [personas, setPersonas] = useState<Persona[] | null>(null);
   const [personaError, setPersonaError] = useState(false);
@@ -124,15 +123,16 @@ function DemoControls() {
 
   const switchPersona = async (key: string) => {
     await api('POST', '/demo/login', { persona: key });
-    menuRef.current?.removeAttribute('open');
-    await refresh();
+    // A full reload lands the new person on the work queue — no screen (and no
+    // restricted data) of the previous persona stays visible.
+    window.location.assign('/');
   };
 
   const reset = async () => {
     setBusy(true);
     try {
       await api('POST', '/demo/reset');
-      window.location.reload();
+      window.location.assign('/');
     } finally {
       setBusy(false);
     }

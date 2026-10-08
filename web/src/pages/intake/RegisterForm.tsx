@@ -294,7 +294,7 @@ export function RegisterForm({
         label="Responsible officer"
         value={v.responsible_user_id ? String(v.responsible_user_id) : ''}
         onChange={(s) => setV((prev) => ({ ...prev, responsible_user_id: s ? Number(s) : null }))}
-        options={staffOptions(ref?.staff)}
+        options={staffOptions((ref?.staff ?? []).filter((s) => s.assignable !== false))}
         placeholder="You (the registering clerk)"
       />
       <CasePicker

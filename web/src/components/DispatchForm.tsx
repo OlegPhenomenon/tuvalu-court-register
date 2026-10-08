@@ -16,6 +16,7 @@
 import { useEffect, useMemo, useRef, useState } from 'react';
 import type { FormEvent } from 'react';
 import { api } from '../api';
+import { fmtCourtLocal, fmtLocal } from '../time';
 import { Button } from './Button';
 import { ErrorBanner } from './ErrorBanner';
 import { CheckboxField, SelectField, TextArea, TextField } from './fields';
@@ -122,7 +123,7 @@ function useCaseVersions(caseId: number | null, needed: boolean) {
   return { versions, error, retry: () => setTick((t) => t + 1) };
 }
 
-export function DispatchForm({ caseId, participants, kind, dispatch, onClose, onSaved }: {
+export function DispatchForm({ caseId, participants, kind, dispatch, preselectDecisionId, preselectPartyId, onClose, onSaved }: {
   /** Create mode: the owning case. */
   caseId?: number;
   /** Create mode: active case participants to pick the recipient from. */
@@ -131,6 +132,10 @@ export function DispatchForm({ caseId, participants, kind, dispatch, onClose, on
   kind?: 'notice' | 'copies';
   /** Edit mode: the draft dispatch being edited. */
   dispatch?: DispatchRecord;
+  /** Create copies mode: pre-check the version bound to this decision (?decision=). */
+  preselectDecisionId?: number;
+  /** Create mode: pre-choose the recipient participant by party id (?party=). */
+  preselectPartyId?: number;
   onClose: () => void;
   /** `fresh` = updated record returned by the server. */
   onSaved: (fresh?: DispatchRecord) => void;
@@ -171,6 +176,34 @@ export function DispatchForm({ caseId, participants, kind, dispatch, onClose, on
     isNotice && caseId !== undefined ? `/cases/${caseId}/hearings` : null,
   );
   const { versions, error: versionsError, retry: retryVersions } = useCaseVersions(editCaseId, isCopies);
+
+  // ?party={party_id} — pre-choose the recipient once, without locking the field.
+  const preselectedParty = useRef(false);
+  useEffect(() => {
+    if (editing || preselectedParty.current || preselectPartyId == null) return;
+    preselectedParty.current = true;
+    const p = (participants ?? []).find((x) => x.party_id === preselectPartyId && x.active);
+    if (p) {
+      setPartyId(String(p.id));
+      setAddress(p.service_contact ?? '');
+    }
+  }, [editing, participants, preselectPartyId]);
+
+  // ?decision={id} — resolve the decision to its bound document version and
+  // pre-check it once the versions list arrives (only if it is sendable here).
+  const decisions = useApi<{ items: { id: number; document_version_id: number }[] }>(
+    !editing && isCopies && preselectDecisionId != null && caseId !== undefined
+      ? `/cases/${caseId}/decisions`
+      : null,
+  );
+  useEffect(() => {
+    if (preselectDecisionId == null || !versions) return;
+    const vid = decisions.data?.items.find((d) => d.id === preselectDecisionId)?.document_version_id;
+    if (vid != null && versions.some((v) => v.version_id === vid)) {
+      setSelected((s) => (s.includes(vid) ? s : [vid, ...s]));
+    }
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [versions, decisions.data]);
 
   const chosen = (participants ?? []).find((p) => String(p.id) === partyId);
   const pickRecipient = (value: string) => {
@@ -358,9 +391,9 @@ export function DispatchForm({ caseId, participants, kind, dispatch, onClose, on
                 onChange={setHearingId}
                 options={(hearings.data?.items ?? []).map((h) => ({
                   value: String(h.id),
-                  label: `${h.hearing_type_label ?? h.hearing_type} — ${h.starts_local ?? h.starts_at}${
-                    h.room_name ? `, ${h.room_name}` : ''
-                  } (${STATUS_WORD[h.status] ?? h.status})`,
+                  label: `${h.hearing_type_label ?? h.hearing_type} — ${
+                    h.starts_local ? fmtCourtLocal(h.starts_local) : fmtLocal(h.starts_at)
+                  }${h.room_name ? `, ${h.room_name}` : ''} (${STATUS_WORD[h.status] ?? h.status})`,
                 }))}
                 placeholder="No hearing linked"
               />

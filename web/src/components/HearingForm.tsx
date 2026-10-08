@@ -14,7 +14,7 @@ import type { FormEvent } from 'react';
 import { Link } from 'react-router-dom';
 import { api, ApiError, newKey } from '../api';
 import { useSession } from '../session';
-import { fmtDate, fmtLocal } from '../time';
+import { fmtCourtLocal, fmtDate, fmtLocal } from '../time';
 import { Button } from './Button';
 import { ErrorBanner } from './ErrorBanner';
 import { DateTimeField, SelectField, TextArea } from './fields';
@@ -80,15 +80,22 @@ export interface HearingConflict {
 
 /* ------------------------------ shared helpers ------------------------------ */
 
-/** Court-local "YYYY-MM-DDTHH:MM" → "19 Nov 2026, 09:00" (pure string math). */
+/** Court-local "YYYY-MM-DDTHH:MM" → "Thu 19 Nov 2026, 09:00" (pure string math). */
 export function fmtSlot(local: string | null | undefined): string {
   if (!local || local.length < 16) return '—';
-  return `${fmtDate(local.slice(0, 10))}, ${local.slice(11, 16)}`;
+  return fmtCourtLocal(local);
 }
 
 /** Display a hearing's start–end: "Thu 19 Nov 2026, 09:00 – 10:00". */
 export function hearingTimeRange(h: Hearing): string {
-  return `${fmtLocal(h.starts_at)} – ${h.ends_local.slice(11, 16)}`;
+  const start = h.starts_local ? fmtCourtLocal(h.starts_local) : fmtLocal(h.starts_at);
+  return `${start} – ${h.ends_local.slice(11, 16)}`;
+}
+
+/** Short hearing reference for links: "Hearing — Thu 19 Nov 2026, 09:00" (never an internal id). */
+export function hearingLabel(h: Pick<Hearing, 'starts_local' | 'starts_at'>): string {
+  const when = h.starts_local ? fmtCourtLocal(h.starts_local) : h.starts_at ? fmtLocal(h.starts_at) : '';
+  return when ? `Hearing — ${when}` : 'Hearing';
 }
 
 /** Select options for the judges currently assigned to the case. */
@@ -122,7 +129,7 @@ export function ConflictDetails({ conflicts, hidden }: { conflicts: HearingConfl
         <ul>
           {conflicts.map((c) => (
             <li key={c.hearing_id}>
-              <Link to={`/cases/${c.case_id}?tab=hearings`}>{c.case_number}</Link>{' '}
+              <Link to={`/cases/${c.case_id}?tab=hearings&hearing=${c.hearing_id}`}>{c.case_number}</Link>{' '}
               {fmtSlot(c.starts_local)} – {c.ends_local.slice(11, 16)}
               {c.room_name ? `, ${c.room_name}` : ''}
               {c.judge_name ? `, ${c.judge_name}` : ''}

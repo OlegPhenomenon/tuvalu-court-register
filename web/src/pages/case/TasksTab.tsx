@@ -10,7 +10,7 @@ import type { FormEvent } from 'react';
 import { Link } from 'react-router-dom';
 import { api, ApiError } from '../../api';
 import { useSession } from '../../session';
-import { fmtDate, fmtLocal } from '../../time';
+import { fmtCourtLocal, fmtDate, fmtLocal } from '../../time';
 import { Button } from '../../components/Button';
 import { Card } from '../../components/Card';
 import { DataTable } from '../../components/DataTable';
@@ -190,7 +190,7 @@ function TaskForm({ caseId, caseData, hearings, task, onClose, onSaved }: {
               onChange={setHearingId}
               options={hearings.map((h) => ({
                 value: String(h.id),
-                label: `${h.hearing_type_label} — ${fmtLocal(h.starts_at)}`,
+                label: `${h.hearing_type_label} — ${h.starts_local ? fmtCourtLocal(h.starts_local) : fmtLocal(h.starts_at)}`,
               }))}
               placeholder="Not linked to a hearing"
             />
@@ -297,8 +297,8 @@ export default function TasksTab({ caseId, caseData, reload }: CaseTabProps) {
         const h = t.hearing_id ? hearingById.get(t.hearing_id) : undefined;
         if (!h) return '—';
         return (
-          <Link to={`?tab=hearings`}>
-            {h.hearing_type_label} — {fmtLocal(h.starts_at)}
+          <Link to={`?tab=hearings&hearing=${h.id}`}>
+            {h.hearing_type_label} — {h.starts_local ? fmtCourtLocal(h.starts_local) : fmtLocal(h.starts_at)}
           </Link>
         );
       },
