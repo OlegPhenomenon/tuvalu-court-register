@@ -6,11 +6,10 @@ After=network.target
 
 [Service]
 Type=simple
-User=tuvalu-court
-Group=tuvalu-court
+User=tuvalu
+Group=tuvalu
 EnvironmentFile=/etc/tuvalu-court.env
-Environment=TCR_DATA_DIR=/var/lib/tuvalu-court
-ExecStart=/opt/tuvalu-court/tuvalu-court serve
+ExecStart=/opt/tuvalu-court/tuvalu-court --env-file /etc/tuvalu-court.env serve
 Restart=on-failure
 RestartSec=3
 StateDirectory=tuvalu-court

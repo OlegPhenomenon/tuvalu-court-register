@@ -19,7 +19,8 @@ pub fn routes() -> Router<AppState> {
 }
 
 const MAILBOX_SQL: &str = "SELECT m.id, m.dispatch_id, c.number AS case_number, m.attempt_no,
-    m.to_address, m.subject, m.body, m.attachments, m.delivered_at
+    m.to_address, m.subject, m.body, m.attachments, m.delivered_at,
+    COALESCE((SELECT transport FROM mail_delivery_log l WHERE l.mailbox_id=m.id),'local mailbox') AS transport
     FROM mailbox m JOIN dispatches d ON d.id = m.dispatch_id
     LEFT JOIN cases c ON c.id = d.case_id LEFT JOIN intakes i ON i.id = d.intake_id";
 

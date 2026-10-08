@@ -454,13 +454,20 @@ fn upload_replay(conn: &Connection, actor: &Actor, key: &Option<String>, op: &st
         None => false,
     };
     if exists {
-        return idempotent::<Value, _>(conn, actor, key, op, request, || Err(AppError::internal("Missing upload replay"))).map(Some);
+        let mut value = idempotent::<Value, _>(conn, actor, key, op, request, || Err(AppError::internal("Missing upload replay")))?;
+        if let Some(versions) = value["versions"].as_array_mut() {
+            for version in versions {
+                let (status,note):(String,Option<String>) = conn.query_row("SELECT scan_status,scan_note FROM document_versions WHERE id=?1", [version["id"].as_i64()], |r|Ok((r.get(0)?,r.get(1)?)))?;
+                version["scan_status"] = json!(status); version["scan_note"] = json!(note);
+            }
+        }
+        return Ok(Some(value));
     }
     Ok(None)
 }
 
 async fn store_upload(db: crate::db::Db, bytes: Vec<u8>, filename: String, max: u64) -> AppResult<StoredFile> {
-    tokio::task::spawn_blocking(move || crate::storage::store(&db, &bytes, &filename, max))
+    tokio::task::spawn_blocking(move || crate::storage::prepare_upload(&db, &bytes, &filename, max))
         .await
         .map_err(|e| AppError::internal(e.to_string()))?
 }
@@ -469,10 +476,20 @@ async fn store_upload(db: crate::db::Db, bytes: Vec<u8>, filename: String, max: 
 async fn finish_upload(db: crate::db::Db, storage_key: String, result: AppResult<(Value, bool)>) -> JsonResult {
     if !matches!(&result, Ok((_, true))) {
         tokio::task::spawn_blocking(move || crate::storage::discard(&db, &storage_key))
-            .await
-            .map_err(|e| AppError::internal(e.to_string()))?;
+            .await.map_err(|e| AppError::internal(e.to_string()))?;
+        return Ok(Json(result?.0));
     }
-    Ok(Json(result?.0))
+    let mut value = result?.0;
+    let scan_db = db.clone();
+    // Detached task continues to a verdict even if the uploading connection disappears.
+    let verdict = tokio::spawn(async move { crate::scan::finish(scan_db, storage_key).await })
+        .await.map_err(|e| AppError::internal(e.to_string()))??;
+    if let Some((id,status,note)) = verdict && let Some(versions) = value["versions"].as_array_mut() {
+        for version in versions.iter_mut().filter(|v|v["id"].as_i64()==Some(id)) {
+            version["scan_status"] = json!(status); version["scan_note"] = json!(note);
+        }
+    }
+    Ok(Json(value))
 }
 
 async fn upload_to_case(
@@ -936,7 +953,7 @@ async fn download(ctx: Ctx, Path(id): Path<i64>, Query(q): Query<DownloadQuery>)
             Ok((doc, v))
         })
         .await?;
-    if v["scan_status"].as_str() == Some("quarantined") {
+    if v["scan_status"].as_str() != Some("clean") {
         return Err(AppError::conflict(
             "quarantined",
             "This file failed the safety check and cannot be opened.",

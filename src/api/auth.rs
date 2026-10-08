@@ -28,10 +28,10 @@ pub fn routes() -> Router<AppState> {
 
 /// The `/auth/me` payload, also returned after persona switch / second factor.
 pub fn me_json(conn: &Connection, actor: &Actor, state: &AppState) -> AppResult<Value> {
-    let (title, persona, enrolled): (Option<String>, Option<String>, bool) = conn.query_row(
-        "SELECT title, persona, totp_secret IS NOT NULL FROM users WHERE id = ?1",
+    let (title, persona, enrolled, must_change): (Option<String>, Option<String>, bool, bool) = conn.query_row(
+        "SELECT title, persona, totp_secret IS NOT NULL, must_change_password FROM users WHERE id = ?1",
         [actor.user_id],
-        |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?)),
+        |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?, r.get(3)?)),
     )?;
     Ok(json!({
         "user": {
@@ -47,6 +47,7 @@ pub fn me_json(conn: &Connection, actor: &Actor, state: &AppState) -> AppResult<
         "court_name": crate::db::setting(conn, "court_name", "Court Registry")?,
         "court_timezone": crate::time::COURT_TZ_NAME,
         "mfa_enrolled": enrolled,
+        "must_change_password": must_change,
     }))
 }
 
@@ -251,6 +252,7 @@ async fn totp_enable(State(state): State<AppState>, dctx: DbCtx, headers: Header
 struct PasswordReq {
     current: String,
     new: String,
+    code: Option<String>,
 }
 
 async fn change_password(State(state): State<AppState>, ctx: Ctx, headers: HeaderMap, JsonBody(req): JsonBody<PasswordReq>) -> AppResult<Response> {
@@ -267,19 +269,33 @@ async fn change_password(State(state): State<AppState>, ctx: Ctx, headers: Heade
     if !auth::verify_password(&req.current, &current_hash) {
         return Err(AppError::new(axum::http::StatusCode::UNAUTHORIZED, "bad_credentials", "The current password is wrong."));
     }
+    if req.new == req.current { return Err(AppError::validation("Choose a different password.")); }
     let new_hash = auth::hash_password(&req.new)?;
     let hours = state.cfg.session_hours;
     let actor = ctx.actor.clone();
     let token = ctx
         .db
         .write(move |tx| {
+            let (hash, secret, last): (String, Option<String>, Option<i64>) = tx.query_row(
+                "SELECT password_hash, totp_secret, totp_last_step FROM users WHERE id=?1", [actor.user_id],
+                |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?)))?;
+            if hash != current_hash { return Err(AppError::conflict("credentials_changed", "Your credentials changed. Sign in again.")); }
+            auth::check_login_allowed(tx, &actor.username, actor.ip.as_deref())?;
+            if let Some(secret) = secret {
+                let Some(step) = req.code.as_deref().and_then(|code| auth::verify_totp(&secret, code, last)) else {
+                    auth::record_login_attempt(tx, &actor.username, actor.ip.as_deref(), false)?;
+                    return Ok(None);
+                };
+                tx.execute("UPDATE users SET totp_last_step=?2 WHERE id=?1", params![actor.user_id, step])?;
+            }
             tx.execute("UPDATE users SET password_hash = ?2, must_change_password = 0 WHERE id = ?1", params![actor.user_id, new_hash])?;
             auth::revoke_user_sessions(tx, actor.user_id)?;
             let t = rotate(tx, &old, actor.user_id, hours)?;
             audit::record(tx, Some(&actor), Event::new("user.password_changed", "user", actor.user_id, "Password changed; other sessions ended"))?;
-            Ok(t)
+            Ok(Some(t))
         })
-        .await?;
+        .await?
+        .ok_or_else(|| AppError::new(axum::http::StatusCode::UNAUTHORIZED, "bad_code", "A fresh sign-in code is required."))?;
     Ok(with_cookie(json!({ "ok": true }), session_cookie(&state, &token)))
 }
 

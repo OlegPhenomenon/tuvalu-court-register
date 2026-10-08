@@ -549,6 +549,9 @@ async fn admin_settings_validation() {
 // ------------------------------------------------------------------ production mode
 
 async fn login_and_enrol(c: &mut Client, username: &str, password: &str) -> Value {
+    // Restart sign-in explicitly; temporary-password sessions permit logout but block another login.
+    let (s, b) = c.raw(Method::POST, "/api/auth/logout", Some(json!({}))).await;
+    ok(s, &b);
     let (s, b) = c
         .raw(
             Method::POST,
@@ -561,7 +564,7 @@ async fn login_and_enrol(c: &mut Client, username: &str, password: &str) -> Valu
     ok(s, &setup);
     let secret = setup["secret"].as_str().unwrap();
     let code = tuvalu_court::auth::current_totp(secret).unwrap();
-    let (s, _) = c
+    let (s, me) = c
         .raw(
             Method::POST,
             "/api/auth/totp/enable",
@@ -569,6 +572,12 @@ async fn login_and_enrol(c: &mut Client, username: &str, password: &str) -> Valu
         )
         .await;
     assert_eq!(s, StatusCode::OK);
+    if me["must_change_password"] == true {
+        let step = tuvalu_court::time::now().unix_timestamp() as u64 / 30 + 1;
+        let code = format!("{:06}", tuvalu_court::auth::totp_at(&tuvalu_court::auth::base32_decode(secret).unwrap(), step));
+        let (s, changed) = c.raw(Method::POST, "/api/auth/password", Some(json!({"current":password,"new":format!("{password}-changed"),"code":code}))).await;
+        ok(s, &changed);
+    }
     b
 }
 

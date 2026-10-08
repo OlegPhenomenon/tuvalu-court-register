@@ -14,12 +14,14 @@ const MIGRATIONS: &[&str] = &[
     include_str!("migrations/0007_access.sql"),
     include_str!("migrations/0008_audit_judicial.sql"),
     include_str!("migrations/0009_audit_workflow.sql"),
+    include_str!("migrations/0010_audit_install.sql"),
 ];
 
 /// Handle to one court database (production DB or one demo sandbox) and its private file store.
 #[derive(Clone, Debug)]
 pub struct Db {
     inner: Arc<DbInner>,
+    runtime: Option<Arc<crate::config::Config>>,
 }
 
 #[derive(Debug)]
@@ -32,8 +34,14 @@ struct DbInner {
 
 impl Db {
     pub fn new(db_path: PathBuf, files_dir: PathBuf, quota_bytes: Option<u64>) -> Self {
-        Self { inner: Arc::new(DbInner { db_path, files_dir, quota_bytes }) }
+        Self { inner: Arc::new(DbInner { db_path, files_dir, quota_bytes }), runtime: None }
     }
+
+    pub fn with_config(mut self, cfg: Arc<crate::config::Config>) -> Self {
+        self.runtime = Some(cfg);
+        self
+    }
+    pub fn config(&self) -> Option<&crate::config::Config> { self.runtime.as_deref() }
 
     pub fn path(&self) -> &Path {
         &self.inner.db_path
@@ -116,10 +124,18 @@ pub fn open_conn(path: &Path) -> AppResult<Connection> {
 pub fn migrate(conn: &mut Connection) -> AppResult<()> {
     let applied: i64 = conn.query_row("PRAGMA user_version", [], |r| r.get(0))?;
     for (i, sql) in MIGRATIONS.iter().enumerate().skip(applied as usize) {
+        // Installation migration rebuilds a CHECK constraint without renaming FK targets.
+        let rebuild = sql.contains("-- rebuild document_versions");
+        if rebuild { conn.execute_batch("PRAGMA foreign_keys=OFF;")?; }
         let tx = conn.transaction_with_behavior(TransactionBehavior::Immediate)?;
         tx.execute_batch(sql)?;
         tx.execute_batch(&format!("PRAGMA user_version = {}", i + 1))?;
         tx.commit()?;
+        if rebuild {
+            conn.execute_batch("PRAGMA foreign_keys=ON;")?;
+            let broken = conn.prepare("PRAGMA foreign_key_check")?.exists([])?;
+            if broken { return Err(AppError::internal("Migration failed foreign-key verification")); }
+        }
     }
     Ok(())
 }

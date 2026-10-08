@@ -31,6 +31,7 @@ export interface Session {
   mode: 'demo' | 'production';
   court_name: string;
   mfa_enrolled: boolean;
+  must_change_password: boolean;
 }
 
 export interface Persona {

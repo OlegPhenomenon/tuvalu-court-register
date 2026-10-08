@@ -2,7 +2,7 @@
 
 Source requirements: the project brief (Russian, not published in this repository; authoritative for behaviour; C01–C18).
 Stack override vs spec §13: **Rust (axum) + SQLite + React (Vite, TypeScript)** instead of Rails/Postgres.
-Everything outside the court (e-mail, signatures, OCR) is local/mocked. UI language: **English**.
+Production e-mail uses configured SMTP; antivirus uses configured ClamAV. Signatures and OCR have no external integration. Demo e-mail is always local. UI language: **English**.
 All demo names/numbers are fictional and carry `DEMO`.
 
 ## 1. Runtime shape
@@ -11,7 +11,7 @@ All demo names/numbers are fictional and carry `DEMO`.
   (embedded from `web/dist` via `rust-embed`; SPA fallback to `index.html`).
 - SQLite via `rusqlite` (bundled), WAL, `foreign_keys=ON`, `busy_timeout=5000`.
   A connection is opened per unit of work (cheap); no pool.
-- Background worker = tokio task inside the same process (outbox: queued dispatches → local mailbox).
+- Background worker = tokio task inside the same process (outbox: queued dispatches → SMTP in production; local mailbox in demo).
 - Files: private directory `<data>/files/<aa>/<sha256-hex>-<random>`; never served statically.
 - Low footprint is a requirement: no heavy deps (no ORM, no chrono-tz, no OpenSSL). Release profile: `lto="thin"`, `strip=true`, `opt-level="s"`.
 
@@ -29,7 +29,7 @@ All demo names/numbers are fictional and carry `DEMO`.
 ## 2. Code layout (backend)
 
 ```
-src/main.rs            CLI: `serve` (default), `migrate`, `create-admin`, `backup`, `restore`, `seed-demo`
+src/main.rs            CLI: `serve` (default), `create-user`, `grant`, `revoke`, `gen-key`, `backup`, `restore`, `verify-audit`
 src/config.rs          Config from env
 src/db.rs              Db handle {db_path, files_dir}; read()/write() helpers; migrations runner
 src/migrations/*.sql   Schema (0001_init.sql is the full schema)
@@ -41,6 +41,8 @@ src/audit.rs           append-only audit (hash chained)
 src/sandbox.rs         demo sandbox manager
 src/storage.rs         file store: validate type by magic bytes, sha256, quarantine
 src/worker.rs          outbox processing
+src/mail.rs            TLS SMTP transport, retry backoff and local sent log
+src/scan.rs            bounded ClamAV INSTREAM check, fail-closed verdict
 src/seed.rs            demo seed data (the DEMO_DATA)
 src/api/mod.rs         router composition; each module exposes `pub fn routes() -> Router<AppState>`
 src/api/{auth,intake,cases,parties,hearings,tasks,documents,decisions,dispatch,mailbox,reports,search,
@@ -280,7 +282,7 @@ GET/POST /cases/:id/documents   POST /documents/:id/versions (multipart)   GET /
 GET  /document-versions/:id/download   PATCH /documents/:id (visibility, version)   POST/DELETE /documents/:id/grants
 GET/POST /cases/:id/decisions   POST /decisions/:id/{finalise,amend}
 GET/POST /cases/:id/dispatches  GET /dispatches?status=   POST /dispatches/:id/{preview,queue,confirm,assess,cancel}
-GET  /mailbox                          local e-mail viewer (demo/production: nothing leaves the server)
+GET  /mailbox                          demo local e-mail viewer / production SMTP sent log
 GET  /reports/summary?from=&to=   GET /reports/:kind/cases (drill-down)   GET /reports/:kind.csv
 GET  /search?q=                        cases + document titles, only accessible
 POST /import/cases/preview (multipart CSV)   POST /import/:batch/commit   GET /import
@@ -318,3 +320,53 @@ Mailbox, Reports, Import, Audit, Settings, Demo landing + persona switcher banne
 Integration tests in `tests/` hit the router with a temp data dir: every state transition, every access denial (case, restricted doc,
 judicial note, ended assignment + old URL, admin without case access, search/report counts), concurrency (parallel registration →
 distinct numbers; parallel conflicting hearing confirmation → one wins), idempotent replay, backup → restore round trip.
+
+## Installation, transport and file checks
+
+Server and CLI load `--env-file <path>` or `TCR_ENV_FILE` using literal env-file
+values (file values override shell values). Maintenance reads an existing
+initialised production database and prints its canonical data directory and
+random `installation_id`, created by migration and preserved across backups.
+Restore instead reads the initialised DB inside the authenticated backup, prints
+the explicit destination and archive installation id, and requires `--yes` or
+interactive entry of that id. It never initialises an accidental source `./data`.
+
+`TCR_SMTP_URL=smtp://user:pass@host:587` requires STARTTLS; `smtps://…:465` uses
+implicit TLS. `TCR_MAIL_FROM` is required for SMTP delivery; absent configuration
+leaves dispatches queued with `Mail transport not configured`, exposed through
+Settings and dispatch status. `TCR_SMTP_TIMEOUT_SECS` defaults to 20 (1–120).
+The transport uses lettre async SMTP, rustls/ring and bundled webpki roots.
+Demo ignores SMTP configuration and warns when SMTP env vars are set. SMTP sends
+the exact queued immutable versions, records a new attempt for each failure and
+retry, and retains one local mailbox sent log with transport `sent via SMTP`.
+Transport failures retry after 60 seconds with exponential backoff capped at
+64 minutes; access/attachment failures require human review. Stable Message-ID
+is retained across retries. SMTP cannot guarantee exactly-once delivery when
+acknowledgement is lost or the process crashes after remote acceptance.
+Technical receipt, human handover and legal service assessment remain separate.
+
+`TCR_CLAMD=tcp://host:3310` or `unix:/absolute/socket` uses bounded INSTREAM, with
+`TCR_SCAN_TIMEOUT_MS` default 10000 (10–120000). Production refuses startup with
+no scanner unless `TCR_AV=off` is explicitly set. Demo always uses format checks
+only. Settings and version `scan_note` show when no antivirus is used. HTTP
+uploads commit a `pending_scan` row before contacting clamd, then record verdict
+and audit atomically; pending bytes cannot be retrieved. Only explicit scanner
+OK permits `clean`; infection, errors, timeouts and interrupted scans become
+`quarantined`. Pending scans after restart are quarantined. File imports run the
+same checks before publication. Download/preview, exports, dispatches, SMTP and
+mailbox attachment links require a clean version; storage reads also enforce the
+verdict. Full technical backups preserve unavailable versions and their verdicts.
+PDF names decode `#xx`; active actions and bounded FlateDecode/object streams
+are inspected. PNG validates IHDR, chunk CRCs and IEND; JPEG validates segments
+and EOI; DOCX checks bounded XML, macros, ActiveX and OLE content. These checks
+reduce risk and do not prove absolute safety.
+
+`GET /auth/me` includes `must_change_password`. While true, middleware denies
+every other API route with 403 `password_change_required`, except me, logout,
+password change and TOTP verification/enrolment. The UI forces the password form.
+`POST /auth/password {current,new,code?}` requires the current password, a
+different new password of at least 12 characters, and a fresh TOTP code when
+enrolled. It clears the flag, rotates the current session, revokes all other
+sessions and preserves TOTP. CLI-created and admin-reset accounts set the flag.
+Every production user can change their own password in Settings. Protected-account
+reset rules remain enforced server-side.

@@ -30,6 +30,10 @@ volumes:
 env:
   clear:
     TCR_MODE: demo
+    # DEMO always stays mail-local; AV is off by design, built-in format checks remain.
+    TCR_AV: "off"
+    TCR_SMTP_TIMEOUT_SECS: "20"
+    TCR_SCAN_TIMEOUT_MS: "10000"
     TCR_DATA_DIR: /data
     TCR_BIND: 0.0.0.0:8088
     TCR_COOKIE_SECURE: "true"

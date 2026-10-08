@@ -1,7 +1,6 @@
 /**
- * Mailbox (C09): the LOCAL e-mail viewer. Method `email` dispatches are
- * delivered here by the outbox worker — nothing leaves the server, no real
- * recipient is ever contacted. Reading pane shows the message as preformatted
+ * Mailbox (C09): local DEMO messages and production SMTP sent log.
+ * Reading pane shows the message as preformatted
  * text (never HTML); attachment downloads go through
  * /api/document-versions/{id}/download, which re-checks access on every hit.
  */
@@ -14,6 +13,7 @@ import { ErrorBanner } from '../components/ErrorBanner';
 import { PageHeader } from '../components/PageHeader';
 import { useApi } from '../components/useApi';
 import { fmtLocal } from '../time';
+import { useSession } from '../session';
 import './dispatch.css';
 
 interface MailAttachment {
@@ -37,6 +37,7 @@ interface MailMessage {
   body: string;
   attachments: MailAttachment[];
   delivered_at: string;
+  transport: string;
 }
 
 function fmtSize(bytes: number): string {
@@ -46,6 +47,7 @@ function fmtSize(bytes: number): string {
 }
 
 export default function Mailbox() {
+  const { session } = useSession();
   const [params] = useSearchParams();
   const dispatchFilter = params.get('dispatch');
   const path = dispatchFilter ? `/mailbox?dispatch_id=${dispatchFilter}` : '/mailbox';
@@ -63,8 +65,7 @@ export default function Mailbox() {
       <PageHeader title="Mailbox" />
       <div className="banner mailbox-banner" role="note">
         <p>
-          <strong>Nothing leaves this server.</strong> Messages that would have been e-mailed appear
-          here.
+          {session.mode === 'demo' ? 'DEMO — local mailbox only. Nothing leaves this server.' : 'Sent log: production messages are sent via the configured SMTP transport. Technical delivery still requires separate human confirmation and assessment.'}
         </p>
       </div>
       {dispatchFilter && (
@@ -95,7 +96,7 @@ export default function Mailbox() {
                   to {m.to_address || '—'}
                   {m.case_number ? ` · ${m.case_number}` : ''}
                 </span>
-                <span className="mailbox-item-meta">{fmtLocal(m.delivered_at)}</span>
+                <span className="mailbox-item-meta">{fmtLocal(m.delivered_at)} · {m.transport}</span>
               </button>
             ))}
           </div>

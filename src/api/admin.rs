@@ -1204,6 +1204,9 @@ async fn template_update(
 
 fn settings_json(conn: &Connection, demo: bool) -> AppResult<Value> {
     Ok(json!({
+        "installation_id": crate::db::setting(conn, "installation_id", "")?,
+        "mail_transport": crate::db::setting(conn, "mail_transport", "DEMO: local mailbox only")?,
+        "file_scanner": crate::db::setting(conn, "file_scanner", "DEMO: format checks only, no antivirus")?,
         "court_name": crate::db::setting(conn, "court_name", "Court Registry")?,
         "hearing_buffer_minutes": crate::db::setting(conn, "hearing_buffer_minutes", "0")?.parse::<i64>().unwrap_or(0),
         "intake_reference_prefix": crate::db::setting(conn, "intake_reference_prefix", "IN")?,

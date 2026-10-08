@@ -9,6 +9,8 @@ pub mod config;
 pub mod db;
 pub mod error;
 pub mod outbox;
+pub mod mail;
+pub mod scan;
 pub mod policy;
 pub mod sandbox;
 pub mod seed;

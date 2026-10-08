@@ -412,6 +412,26 @@ fn verify_entry_count(path: &Path, start: u64, expected: usize) -> AppResult<()>
     }
     Ok(())
 }
+/// Resolve installation identity from an authenticated backup before CLI confirmation.
+pub fn installation_id(input: &Path, keyfile: &Path) -> AppResult<String> {
+    let scratch = Scratch::new(&std::env::temp_dir())?;
+    let packed = scratch.0.join("backup.zip");
+    decrypt(input, &packed, &cipher(keyfile)?)?;
+    let mut zip = ZipArchive::new(File::open(&packed)?).map_err(zip_err)?;
+    let mut source = zip.by_name("db.sqlite").map_err(zip_err)?;
+    let path = scratch.0.join("db.sqlite");
+    std::io::copy(&mut source, &mut private_file(&path)?)?;
+    let conn = Connection::open_with_flags(&path, rusqlite::OpenFlags::SQLITE_OPEN_READ_ONLY)?;
+    let version: i64 = conn.query_row("PRAGMA user_version", [], |r| r.get(0))?;
+    let id = crate::db::setting(&conn, "installation_id", "")?;
+    if version == 0 { return Err(invalid("Backup does not contain an initialised database.")); }
+    // Older archives predate persistent ids: confirm their authenticated DB fingerprint.
+    // Startup migration creates the persistent random installation id after restore.
+    if id.is_empty() { return Ok(format!("legacy-{}", &file_hash(&path)?.0[..32])); }
+    if id.len() != 32 || !id.bytes().all(|b| b.is_ascii_hexdigit()) { return Err(invalid("Invalid backup installation id.")); }
+    Ok(id)
+}
+
 pub fn restore(input: &Path, keyfile: &Path, target_dir: &Path) -> AppResult<String> {
     if target_dir.exists() && (!target_dir.is_dir() || fs::read_dir(target_dir)?.next().is_some()) {
         return Err(invalid("Restore requires a new or empty target directory."));

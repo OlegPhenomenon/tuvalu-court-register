@@ -16,8 +16,9 @@ open; each must be confirmed with the Office of the Judiciary before real use
    single-writer transactions plus database constraints/triggers, not from
    Postgres-specific features. Consequence: single-node deployment only; high
    availability would require re-platforming the storage layer.
-2. **No external services.** E-mail, e-signature and OCR are all local/absent —
-   nothing depends on a paid third-party API or LLM.
+2. **Court-operated integrations.** Production uses configurable SMTP and ClamAV;
+   no paid API or LLM is required. Demo mail stays local and uses format checks
+   only. E-signature validation and OCR have no external integration.
 
 ## Calendar, numbering, formats
 
@@ -59,13 +60,13 @@ open; each must be confirmed with the Office of the Judiciary before real use
 11. **Demo-only early outcomes.** Production refuses to record a hearing
     outcome before its start time; demo mode allows it so visitors can finish
     the walkthrough on fictional dates (`src/api/hearings.rs`).
-12. **Dispatch = local mailbox.** Notices and copy packages are drafted from
-    templates, reviewed by a person, queued to an internal outbox and delivered
-    to a **local mailbox viewer** (`/api/mailbox`). Nothing leaves the server;
-    "sent" means "placed in the local mailbox". Human confirmation of hand
-    delivery and the legal assessment of service are separate manual records.
-    Wiring real e-mail would require adding an SMTP sender behind the same
-    outbox.
+12. **Dispatch transport depends on mode.** Demo always uses the local mailbox.
+    Production sends via configured TLS SMTP and keeps a local sent log; missing
+    configuration leaves email queued. Transport failures retry with backoff;
+    attachment versions never change after queueing. SMTP acknowledgement loss
+    can make delivery ambiguous, so stable Message-ID is helpful but is not a
+    guarantee of exactly-once receipt. Human handover and legal service assessment
+    remain separate manual records.
 13. **No retention/destruction policy** (spec §10). Production never deletes
     cases, intakes or audit rows automatically; the retention schedule is the
     court's decision. Demo sandbox expiry applies to fictional data only.
@@ -117,3 +118,15 @@ New closure commands require evidence. Fresh DEMO seeds include a fictional sett
 and reference the finalised order for the other closed case.
 “Without a next step” describes current recorded work, rather than legal delay or the absence of
 an immediate button to press. Period dates apply to event metrics, while this metric is current.
+## Installation and credentials
+
+- Server/maintenance use the same env file. Commands refuse accidental database
+  creation and show the installation id and resolved directory. Restore checks
+  identity from the existing database inside the authenticated backup and requires
+  confirmation before writing an explicit empty destination. The id is preserved.
+- Production requires clamd or explicit `TCR_AV=off`. Pending/scanner-error files
+  are unavailable, including through export, dispatch, mailbox links and imports.
+  Built-in format checks and antivirus reduce risk, without guaranteeing safety.
+- New/reset passwords are temporary: all records APIs are blocked until own-password
+  change. Own changes require fresh TOTP when enabled, revoke other sessions and
+  retain MFA. Technical admins cannot reset protected judicial accounts.

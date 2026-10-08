@@ -326,6 +326,34 @@ impl FromRequestParts<AppState> for Ctx {
     }
 }
 
+/// Global gate, including handlers that use DbCtx instead of the authenticated extractor.
+pub async fn password_gate(
+    axum::extract::State(state): axum::extract::State<AppState>,
+    request: axum::extract::Request,
+    next: axum::middleware::Next,
+) -> axum::response::Response {
+    use axum::response::IntoResponse;
+    let path = request.uri().path().strip_prefix("/api").unwrap_or(request.uri().path());
+    let allowed = matches!(path, "/auth/me" | "/auth/logout" | "/auth/password" | "/auth/totp" | "/auth/totp/setup" | "/auth/totp/enable");
+    if !state.is_demo() && !allowed && let Some(token) = cookie_value(request.headers(), SESSION_COOKIE) {
+        let resolved = state.resolve_db(request.headers());
+        let result = async move {
+            let (db, _) = resolved?;
+            db.read(move |c| Ok(c.query_row(
+                "SELECT u.must_change_password FROM sessions s JOIN users u ON u.id=s.user_id
+                 WHERE s.token_hash=?1 AND s.revoked_at IS NULL AND s.expires_at>?2 AND u.active=1",
+                params![sha256_hex(token.as_bytes()), crate::time::now_utc()], |r| r.get::<_,bool>(0))
+                .optional()?.unwrap_or(false))).await
+        }.await;
+        match result {
+            Ok(true) => return AppError::new(StatusCode::FORBIDDEN, "password_change_required", "Change your temporary password before using court records.").into_response(),
+            Err(e) => return e.into_response(),
+            _ => {}
+        }
+    }
+    next.run(request).await
+}
+
 /// `Idempotency-Key` request header (optional).
 pub struct IdemKey(pub Option<String>);
 
