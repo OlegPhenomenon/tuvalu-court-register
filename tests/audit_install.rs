@@ -1129,7 +1129,6 @@ async fn f19_t34_t36_own_password_requires_totp_and_gate_covers_api_routes() {
         "/api/queue",
         "/api/ref",
         "/api/admin/settings",
-        "/api/auth/mode",
         "/api/health",
         "/api/demo/personas",
     ] {
@@ -1312,7 +1311,7 @@ fn f10_f16_t33_t34_upgrade_preserves_old_versions_and_legacy_backups() {
     let backup = app.dir.join("old.tcrb");
     tuvalu_court::backup::gen_key(&key).unwrap();
     tuvalu_court::backup::backup(&db, &backup, &key).unwrap();
-    assert!(tuvalu_court::backup::installation_id(&backup, &key).unwrap().starts_with("legacy-"));
+    assert!(tuvalu_court::backup::installation_id(&backup, &key, &app.dir.join("identity-stage")).unwrap().starts_with("legacy-"));
     db.init().unwrap();
     assert_eq!(
         conn.query_row("SELECT COUNT(*) FROM document_versions", [], |r| r.get::<_, i64>(0))
@@ -1327,4 +1326,416 @@ fn f10_f16_t33_t34_upgrade_preserves_old_versions_and_legacy_backups() {
     assert!(!conn.prepare("PRAGMA foreign_key_check").unwrap().exists([]).unwrap());
     assert_eq!(tuvalu_court::db::setting(&conn, "installation_id", "").unwrap().len(), 32);
     assert_eq!(tuvalu_court::audit::verify_chain(&conn).unwrap().1, None);
+}
+
+#[tokio::test]
+async fn f19_reload_before_totp_can_restart_login() {
+    let app = TestApp::production();
+    let _enrolled = enrolled(&app).await;
+    let db = app.state.main_db.as_ref().unwrap();
+    let conn = db.open().unwrap();
+    conn.execute("UPDATE users SET totp_last_step=NULL", [])
+        .unwrap();
+    let secret: String = conn
+        .query_row(
+            "SELECT totp_secret FROM users WHERE username='demostaff'",
+            [],
+            |r| r.get(0),
+        )
+        .unwrap();
+    let mut c = app.anon();
+    let login = json!({"username":"demostaff","password":"temporary-pass-99"});
+    let (s, b) = c
+        .raw(Method::POST, "/api/auth/login", Some(login.clone()))
+        .await;
+    ok(s, &b);
+    err(
+        c.get("/api/auth/me").await.0,
+        &c.get("/api/auth/me").await.1,
+        StatusCode::UNAUTHORIZED,
+        "mfa_required",
+    );
+    let (s, b) = c.get("/api/auth/mode").await;
+    ok(s, &b);
+    let (s, b) = c.raw(Method::POST, "/api/auth/login", Some(login)).await;
+    ok(s, &b);
+    assert!(b["mfa_required"].as_bool().unwrap());
+    let (s, b) = c
+        .raw(
+            Method::POST,
+            "/api/auth/totp",
+            Some(json!({"code":auth::current_totp(&secret).unwrap()})),
+        )
+        .await;
+    ok(s, &b);
+    let (s, b) = c.get("/api/cases").await;
+    err(s, &b, StatusCode::FORBIDDEN, "password_change_required");
+    ok(c.get("/api/auth/mode").await.0, &Value::Null);
+}
+
+#[test]
+fn f10_pdf_dictionary_tokenizer_evasions() {
+    let app = TestApp::production();
+    let db = app.state.main_db.as_ref().unwrap();
+    let active = miniz_oxide::deflate::compress_to_vec_zlib(
+        &b"1 0 <</Type/Catalog/OpenAction<</S/JavaScript/J#53(evil)>> >>".repeat(20),
+        6,
+    );
+    for extra in [
+        "%endobj\n",
+        "/Note(endobj)",
+        "/Note(stream\\(nested\\))",
+        "/Meta<</Note(endobj)>>",
+        "/Note<656e646f626a>",
+    ] {
+        let mut bytes = format!("%PDF-1.5\n1 0 obj <</Type/ObjStm/N 1/First 4/Filter/FlateDecode{extra}/Length {}>>stream\n",active.len()).into_bytes();
+        bytes.extend(&active);
+        bytes.extend(b"\nendstream\nendobj\n%%EOF");
+        let stored = tuvalu_court::storage::store(db, &bytes, "active.pdf", 1_000_000).unwrap();
+        assert_eq!(
+            stored.scan_status, "quarantined",
+            "evasion: {extra}; {:?}",
+            stored.scan_note
+        );
+    }
+    for bytes in [
+        &b"%PDF-1.5\n1 0 obj <</Note(unterminated>> endobj\n%%EOF"[..],
+        &b"%PDF-1.5\n1 0 obj <</Length 4/Filter/Unknown>>stream\nabcd\nendstream\nendobj\n%%EOF"[..],
+        &b"%PDF-1.5\n1 0 obj <</Type/ObjStm/Filter/Unknown/Length 4>>stream\nabcd\nendstream\nendobj\n%%EOF"[..],
+    ] {
+        assert_eq!(tuvalu_court::storage::store(db,bytes,"bad.pdf",1_000_000).unwrap().scan_status,"quarantined");
+    }
+}
+
+#[test]
+fn f16_kamal_commands_route_through_image_entrypoint() {
+    let docs = include_str!("../docs/OPERATIONS.md");
+    assert!(include_str!("../Dockerfile").contains("ENTRYPOINT [\"/usr/local/bin/tuvalu-court\"]"));
+    for line in docs.lines().filter(|l| l.starts_with("kamal app exec")) {
+        assert!(
+            !line.contains("'/usr/local/bin/tuvalu-court"),
+            "new-container exec repeats ENTRYPOINT: {line}"
+        );
+        let command = line
+            .split('\'')
+            .nth(1)
+            .unwrap()
+            .split_whitespace()
+            .next()
+            .unwrap();
+        assert!(
+            [
+                "create-user",
+                "grant",
+                "revoke",
+                "gen-key",
+                "backup",
+                "restore",
+                "verify-audit"
+            ]
+            .contains(&command)
+        );
+    }
+}
+
+#[test]
+fn f16_restore_confirmation_uses_destination_disk_and_cleans_up() {
+    let app = TestApp::production();
+    let db = app.state.main_db.as_ref().unwrap();
+    let key = app.dir.join("restore.key");
+    let archive = app.dir.join("restore.tcrb");
+    let target = app.dir.join("restored");
+    tuvalu_court::backup::gen_key(&key).unwrap();
+    tuvalu_court::backup::backup(db, &archive, &key).unwrap();
+    let output = Command::new(env!("CARGO_BIN_EXE_tuvalu-court"))
+        .args([
+            "restore",
+            archive.to_str().unwrap(),
+            key.to_str().unwrap(),
+            target.to_str().unwrap(),
+            "--yes",
+        ])
+        .env("TCR_MODE", "production")
+        .env("TCR_AV", "off")
+        .env_remove("TCR_ENV_FILE")
+        .env("TMPDIR", app.dir.join("unavailable-system-temp"))
+        .output()
+        .unwrap();
+    success(&output);
+    assert!(target.join("court.sqlite").is_file());
+    assert!(!target.join(".restore-tmp").exists());
+    assert!(!app.dir.join("unavailable-system-temp").exists());
+    let failed = app.dir.join("failed-restore");
+    let mut damaged = std::fs::read(&archive).unwrap();
+    *damaged.last_mut().unwrap() ^= 1;
+    let bad = app.dir.join("damaged.tcrb");
+    std::fs::write(&bad, damaged).unwrap();
+    let output = Command::new(env!("CARGO_BIN_EXE_tuvalu-court"))
+        .args([
+            "restore",
+            bad.to_str().unwrap(),
+            key.to_str().unwrap(),
+            failed.to_str().unwrap(),
+            "--yes",
+        ])
+        .env("TCR_MODE", "production")
+        .env("TCR_AV", "off")
+        .env_remove("TCR_ENV_FILE")
+        .output()
+        .unwrap();
+    assert!(!output.status.success());
+    assert!(!failed.join(".restore-tmp").exists());
+    assert!(!failed.join("court.sqlite").exists());
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn f09_stalled_smtp_does_not_block_http_writes() {
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let mut cfg = tuvalu_court::config::Config::for_tests(
+        Default::default(),
+        tuvalu_court::config::Mode::Production,
+    );
+    cfg.smtp_url = Some(format!(
+        "smtp://localhost:{}",
+        listener.local_addr().unwrap().port()
+    ));
+    cfg.mail_from = Some("registry@example.invalid".into());
+    cfg.smtp_timeout_secs = 3;
+    let (app, c) = seeded_production(cfg).await;
+    let (cid, _) = register_case(&c, "DEMO stalled mail").await;
+    let id = queue_notice(&c, cid, vec![]).await;
+    let db = app.state.main_db.clone().unwrap();
+    let job = tokio::task::spawn_blocking(move || outbox::process(&db));
+    let (socket, _) = listener.accept().await.unwrap();
+    let conn = app.state.main_db.as_ref().unwrap().open().unwrap();
+    let (status, inventory, message_id): (String, String, String) = conn
+        .query_row(
+            "SELECT status,attachments_json,message_id FROM delivery_attempts WHERE dispatch_id=?1",
+            [id],
+            |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?)),
+        )
+        .unwrap();
+    assert_eq!(status, "in_flight");
+    assert_eq!(inventory, "[]");
+    assert!(message_id.starts_with(&format!("<dispatch-{id}-")));
+    assert_eq!(process(&app).await, 0, "another worker stole a live claim");
+    let write = tokio::time::timeout(std::time::Duration::from_millis(800), c.post("/api/intakes",json!({"sender_name":"DEMO Concurrent","channel":"counter","received_date":today(),"description":"DEMO writer during SMTP"}))).await;
+    let result = job.await.unwrap().unwrap();
+    drop(socket);
+    assert_eq!(result, 1);
+    let (s, b) = write.expect("HTTP write blocked behind SMTP transaction");
+    ok(s, &b);
+    assert_eq!(
+        c.get(&format!("/api/dispatches/{id}")).await.1["status"],
+        "failed"
+    );
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn f09_expired_claim_recovers_once_with_same_message_id() {
+    let (port, messages, server) = fake_smtp(false, false).await;
+    let mut cfg = tuvalu_court::config::Config::for_tests(
+        Default::default(),
+        tuvalu_court::config::Mode::Production,
+    );
+    cfg.smtp_url = Some(format!("smtps://demo:demo%40password@localhost:{port}"));
+    cfg.mail_from = Some("registry@example.invalid".into());
+    cfg.smtp_ca_pem = Some(include_bytes!("fixtures/smtp-cert.pem").to_vec());
+    let (app, c) = seeded_production(cfg).await;
+    let (cid, _) = register_case(&c, "DEMO recovered claim").await;
+    let id = queue_notice(&c, cid, vec![]).await;
+    let db = app.state.main_db.as_ref().unwrap();
+    let conn = db.open().unwrap();
+    let message_id = format!("<dispatch-{id}-DEMO-original-identity@tuvalu-court.invalid>");
+    conn.execute("INSERT INTO delivery_attempts(dispatch_id,attempt_no,status,at,claim,message_id,attachments_json,dispatch_version)
+        SELECT id,1,'in_flight','2000-01-01T00:00:00Z','DEMO crashed claim',?2,'[]',version FROM dispatches WHERE id=?1",
+        rusqlite::params![id,message_id]).unwrap();
+    assert_eq!(
+        process(&app).await,
+        0,
+        "recovery must respect retry backoff"
+    );
+    let (_, b) = c.get(&format!("/api/dispatches/{id}")).await;
+    assert_eq!(b["status"], "failed");
+    assert_eq!(b["attempts"][0]["status"], "failed");
+    assert!(
+        b["attempts"][0]["detail"]
+            .as_str()
+            .unwrap()
+            .contains("ambiguous")
+    );
+    conn.execute(
+        "UPDATE mail_retries SET retry_at='2000-01-01T00:00:00Z' WHERE dispatch_id=?1",
+        [id],
+    )
+    .unwrap();
+    let (first, second) = tokio::join!(process(&app), process(&app));
+    assert_eq!(first + second, 1);
+    assert_eq!(process(&app).await, 0);
+    let ids: Vec<String> = conn
+        .prepare(
+            "SELECT message_id FROM delivery_attempts WHERE dispatch_id=?1 ORDER BY attempt_no",
+        )
+        .unwrap()
+        .query_map([id], |r| r.get(0))
+        .unwrap()
+        .collect::<Result<_, _>>()
+        .unwrap();
+    assert_eq!(ids, vec![message_id.clone(), message_id.clone()]);
+    for _ in 0..20 {
+        if !messages.lock().is_empty() {
+            break;
+        }
+        tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+    }
+    assert_eq!(messages.lock().len(), 1);
+    assert!(String::from_utf8_lossy(&messages.lock()[0]).contains(&message_id));
+    assert_eq!(
+        conn.query_row(
+            "SELECT COUNT(*) FROM mailbox WHERE dispatch_id=?1",
+            [id],
+            |r| r.get::<_, i64>(0)
+        )
+        .unwrap(),
+        1
+    );
+    assert_eq!(conn.execute("UPDATE delivery_attempts SET status='sent' WHERE claim='DEMO crashed claim' AND status='in_flight'",[]).unwrap(),0);
+    server.abort();
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn f09_corrupt_attachment_fails_only_its_dispatch() {
+    for corrupt in [false, true] {
+        let (port, messages, server) = fake_smtp(false, false).await;
+        let mut cfg = tuvalu_court::config::Config::for_tests(
+            Default::default(),
+            tuvalu_court::config::Mode::Production,
+        );
+        cfg.smtp_url = Some(format!("smtps://demo:demo%40password@localhost:{port}"));
+        cfg.mail_from = Some("registry@example.invalid".into());
+        cfg.smtp_ca_pem = Some(include_bytes!("fixtures/smtp-cert.pem").to_vec());
+        let (app, c) = seeded_production(cfg).await;
+        let (cid, _) = register_case(&c, "DEMO broken attachment").await;
+        let db = app.state.main_db.as_ref().unwrap();
+        let uid: i64 = db
+            .open()
+            .unwrap()
+            .query_row("SELECT id FROM users WHERE persona='olga'", [], |r| {
+                r.get(0)
+            })
+            .unwrap();
+        let (_, vid) = insert_document(
+            db,
+            cid,
+            "DEMO missing bytes",
+            "evidence",
+            "administrative",
+            uid,
+        );
+        let bad = queue_notice(&c, cid, vec![vid]).await;
+        let good = queue_notice(&c, cid, vec![]).await;
+        let conn = db.open().unwrap();
+        let key: String = conn
+            .query_row(
+                "SELECT storage_key FROM document_versions WHERE id=?1",
+                [vid],
+                |r| r.get(0),
+            )
+            .unwrap();
+        let path = db.files_dir().join(&key);
+        if corrupt {
+            std::fs::write(path, b"DEMO corrupt").unwrap();
+        } else {
+            std::fs::remove_file(path).unwrap();
+        }
+        let work = db.clone();
+        let result = tokio::task::spawn_blocking(move || outbox::process(&work))
+            .await
+            .unwrap();
+        assert!(result.is_ok(), "attachment aborted whole batch: {result:?}");
+        assert_eq!(result.unwrap(), 2);
+        let (_, b) = c.get(&format!("/api/dispatches/{bad}")).await;
+        assert_eq!(b["status"], "failed");
+        assert!(b["failure_reason"].as_str().unwrap().contains("Attachment"));
+        assert!(b["reviewed_at"].is_null(), "attachment failure must require another preview");
+        let (s,b)=c.post(&format!("/api/dispatches/{bad}/retry"),json!({})).await;
+        err(s,&b,StatusCode::CONFLICT,"review_required");
+        assert_eq!(
+            c.get(&format!("/api/dispatches/{good}")).await.1["status"],
+            "sent"
+        );
+        assert_eq!(
+            conn.query_row(
+                "SELECT COUNT(*) FROM mail_retries WHERE dispatch_id=?1",
+                [bad],
+                |r| r.get::<_, i64>(0)
+            )
+            .unwrap(),
+            0
+        );
+        assert_eq!(process(&app).await, 0);
+        for _ in 0..20 {
+            if !messages.lock().is_empty() {
+                break;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+        }
+        assert_eq!(messages.lock().len(), 1);
+        server.abort();
+    }
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn f10_import_scan_does_not_block_http_writes() {
+    use tokio::io::AsyncWriteExt;
+    let _lock = HEAVY.lock().await;
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let mut cfg = tuvalu_court::config::Config::for_tests(
+        Default::default(),
+        tuvalu_court::config::Mode::Production,
+    );
+    cfg.clamd = Some(format!("tcp://{}", listener.local_addr().unwrap()));
+    cfg.scan_timeout_ms = 3000;
+    let (app, olga) = seeded_production(cfg).await;
+    let (_, number) = register_case(&olga, "DEMO import contention").await;
+    let db = app.state.main_db.as_ref().unwrap();
+    let uid: i64 = db
+        .open()
+        .unwrap()
+        .query_row("SELECT id FROM users WHERE persona='elena'", [], |r| {
+            r.get(0)
+        })
+        .unwrap();
+    let mut c = olga.clone();
+    c.session = Some(auth::create_session(&db.open().unwrap(), uid, true, 12).unwrap());
+    let manifest = format!(
+        "case_number,filename,title,doc_type,visibility,document_date\n{number},import.pdf,DEMO import,evidence,party_material,2026-10-08\n"
+    );
+    let archive = zip_files(&[
+        ("manifest.csv", manifest.as_bytes()),
+        ("import.pdf", &pdf("DEMO imported bytes")),
+    ]);
+    let (s, b) = c
+        .upload("/api/import/files/preview", &[], "package.zip", &archive)
+        .await;
+    ok(s, &b);
+    let batch = b["batch_id"].as_i64().unwrap();
+    let importer = c.clone();
+    let job = tokio::spawn(async move {
+        importer
+            .post_idem(
+                &format!("/api/import/{batch}/commit"),
+                "DEMO stalled import",
+                json!({}),
+            )
+            .await
+    });
+    let (mut socket, _) = listener.accept().await.unwrap();
+    let write=tokio::time::timeout(std::time::Duration::from_millis(800),olga.post("/api/intakes",json!({"sender_name":"DEMO Concurrent","channel":"counter","received_date":today(),"description":"DEMO writer during scan"}))).await;
+    // Release clamd before asserting so the original request and blocking pool always finish.
+    socket.write_all(b"stream: OK\0").await.unwrap();
+    let (s, b) = job.await.unwrap();
+    ok(s, &b);
+    let (s, b) = write.expect("HTTP write blocked behind import scanner transaction");
+    ok(s, &b);
 }

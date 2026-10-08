@@ -194,8 +194,9 @@ Case cards and closure audit details redact evidence IDs when the viewer cannot 
 ## Installation checks added after audit
 
 New and reset accounts must change their temporary password after TOTP.
-`/auth/me` exposes the flag; server middleware blocks all other API use except
-me/logout/password/TOTP enrolment and verification with `password_change_required`.
+`/auth/me` exposes the flag; the password gate applies only to fully authenticated
+sessions (`mfa_ok=1`). Mode discovery, login, me, logout, password change and TOTP
+enrolment/verification remain available; other API use is blocked with `password_change_required`.
 Own-password changes require the current password and fresh TOTP (if enrolled),
 preserve TOTP, rotate the current session and revoke other sessions. Technical
 admins cannot reset judges or protected accounts.
@@ -205,11 +206,14 @@ explicitly set `TCR_AV=off`. Configured scanner errors and timeouts fail closed.
 Uploads are pending until a verdict; only explicit OK allows clean. Startup
 quarantines interrupted pending checks. Download, inline preview, export, dispatch,
 SMTP attachments and mailbox links cannot retrieve pending/quarantined bytes.
-Imports use the same checks; full backups retain verdicts. Built-in checks include
-escaped PDF names and bounded FlateDecode streams, PNG CRC/structure, JPEG
+Imports commit pending versions before contacting clamd outside the writer
+transaction; full backups retain verdicts. Built-in checks include PDF dictionary
+tokenisation (comments, escaped/nested strings, hex strings, nested dictionaries,
+escaped names) and bounded inflation of every FlateDecode stream, PNG CRC/structure, JPEG
 segments/EOI and DOCX macros/ActiveX/OLE. Neither these checks nor antivirus prove
 absolute file safety; unsupported PDF stream encodings are quarantined when they
-prevent object-stream inspection.
+prevent object-stream inspection or leave no inspectable document structure.
+Unparsable dictionaries are quarantined.
 
 SMTP requires STARTTLS or implicit TLS with rustls/ring and bundled webpki roots;
 credentials never appear in Settings. Demo ignores SMTP configuration. Production
@@ -217,8 +221,19 @@ without complete SMTP configuration keeps email queued. Successful deliveries
 retain the exact queued version inventory in a local log marked sent via SMTP;
 this does not assert legally sufficient service.
 
+Delivery claims and `in_flight` attempts commit before file reads or SMTP. The
+worker rechecks current access and hearing/decision bindings immediately before
+sending, then records the result in a claim-keyed transaction. Attempts older
+than twice the SMTP timeout fail as ambiguous and retry with the same Message-ID.
+An unreadable or checksum-failing attachment requires human review and never
+blocks later dispatches. SMTP runs without a SQLite write transaction.
+
 Maintenance commands load the server env file, print data directory and installation
 id, and refuse an absent/uninitialised source database. Restore reads the existing
 DB inside an authenticated backup and requires explicit confirmation before writing
 a new/empty destination. Installation ids survive restore. Keep env files, data,
 backups and keys private; see `docs/OPERATIONS.md` for absolute-path commands.
+Confirmation and restore stage plaintext under the destination's private
+`.restore-tmp`, with cleanup on normal success/error, never in system `/tmp`.
+After a forced process termination, that unpublished destination staging area
+may need manual removal.

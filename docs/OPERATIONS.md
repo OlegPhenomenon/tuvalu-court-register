@@ -71,8 +71,9 @@ sudo -u tuvalu /opt/tuvalu-court/tuvalu-court --env-file /etc/tuvalu-court.env r
 Names above are fictional examples; create the installation's accounts using
 its approved staff list. Passwords (at least 12 characters) are read from stdin,
 never command arguments. First login: password → TOTP enrolment → forced change
-of temporary password, with a fresh TOTP code. All other API routes remain
-blocked until the change. Settings includes **Change my password** for every
+of temporary password, with a fresh TOTP code. After MFA, records APIs remain
+blocked until the change. Mode discovery, login, logout, me, TOTP and password
+change stay available, including after a reload before TOTP. Settings includes **Change my password** for every
 production user. Password changes revoke other sessions and preserve TOTP.
 Technical administrators cannot reset judges or protected accounts.
 
@@ -91,11 +92,22 @@ SMTP acknowledgement loss or a crash after server acceptance can make delivery
 ambiguous; a stable Message-ID helps receivers recognise repeats but cannot
 provide universal exactly-once email delivery.
 
+The worker commits an `in_flight` attempt with its claim, stable Message-ID and
+exact attachment inventory before preparing or sending mail. SMTP runs outside
+SQLite write transactions; other writes remain available during a mail outage.
+It rechecks claim ownership, permissions and hearing/decision currency immediately
+before sending. On startup or the next worker tick, an attempt older than twice
+`TCR_SMTP_TIMEOUT_SECS` becomes failed with an ambiguous-delivery reason and
+enters the normal backoff retry using the same Message-ID. A missing, unreadable
+or corrupt attachment fails only its dispatch, with no automatic retry; review
+the file and preview the dispatch before deliberately retrying.
+
 Uploads appear as `pending_scan` while clamd runs. Infection, scanner error,
 timeout or interrupted scan produces `quarantined`. Pending/quarantined files
 cannot be downloaded, previewed, exported or attached to outgoing mail. A server
 restart quarantines interrupted scans; submit a new version when the scanner is
-healthy. File imports use the same format and scanner checks. Format checks and
+healthy. File imports commit pending versions, then use the same scanner path
+outside the import transaction. Format checks and
 antivirus reduce risk; neither proves a file absolutely safe.
 
 ## Backup, restore, upgrade and audit
@@ -126,6 +138,12 @@ head are verified before publication. The restored installation keeps its id.
 For backups predating installation ids, confirmation uses a `legacy-…` fingerprint
 of the authenticated database; startup migration then creates its persistent
 random installation id. No older backup format is discarded.
+
+Confirmation and restore stage plaintext only under the destination's private
+`.restore-tmp`, removed on success or error; they do not decrypt archives into
+the container's `/tmp` tmpfs. Allow disk space there for the decrypted archive
+and verified database/files. If the process is killed, remove the destination's
+unpublished `.restore-tmp` before retrying into an empty destination.
 
 ```sh
 sudo -u tuvalu /opt/tuvalu-court/tuvalu-court --env-file /etc/tuvalu-court.env restore /var/lib/tuvalu-court/pre-upgrade.tcrb /var/lib/tuvalu-court/backup.key /var/lib/tuvalu-court/restored --yes
@@ -181,16 +199,21 @@ secret. Never store SMTP credentials in `env.clear`. Build on the workstation.
 ```sh
 kamal setup
 kamal deploy
-kamal app exec -i '/usr/local/bin/tuvalu-court create-user demoadmin "DEMO Registry Administrator" --perm admin.users --perm admin.settings'
-kamal app exec -i '/usr/local/bin/tuvalu-court grant democlerk case.view_all'
-kamal app exec -i '/usr/local/bin/tuvalu-court revoke democlerk case.view_all'
-kamal app exec -i '/usr/local/bin/tuvalu-court gen-key /data/backup.key'
-kamal app exec -i '/usr/local/bin/tuvalu-court backup /data/court.tcrb /data/backup.key'
-kamal app exec -i '/usr/local/bin/tuvalu-court restore /data/court.tcrb /data/backup.key /data/restored --yes'
+kamal app exec -i 'create-user demoadmin "DEMO Registry Administrator" --perm admin.users --perm admin.settings'
+kamal app exec -i 'grant democlerk case.view_all'
+kamal app exec -i 'revoke democlerk case.view_all'
+kamal app exec -i 'gen-key /data/backup.key'
+kamal app exec -i 'backup /data/court.tcrb /data/backup.key'
+kamal app exec -i 'restore /data/court.tcrb /data/backup.key /data/restored --yes'
 # Set TCR_DATA_DIR=/data/restored in the deployment env and redeploy.
 kamal deploy
-kamal app exec -i '/usr/local/bin/tuvalu-court verify-audit'
+kamal app exec -i 'verify-audit'
 ```
+
+These commands start a new container. Its image ENTRYPOINT is already
+`/usr/local/bin/tuvalu-court`, so pass only the subcommand. With `--reuse`,
+Kamal uses `docker exec` instead and requires the full binary path. See
+[Kamal's execution implementation](https://github.com/basecamp/kamal/blob/main/lib/kamal/commands/app/execution.rb).
 
 Kamal exec inherits deployed env and runs as the image's unprivileged `court`
 user, with the same `/data` volume. These maintenance commands require production;

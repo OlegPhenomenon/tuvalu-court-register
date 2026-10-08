@@ -688,7 +688,25 @@ async fn commit(ctx: Ctx, Path(id): Path<i64>, IdemKey(key): IdemKey) -> JsonRes
             storage::discard(&ctx.db, key);
         }
     }
-    Ok(Json(value?))
+    let value = value?;
+    // The import rows and idempotency response commit before any scanner network I/O.
+    // Replays also finish any pending versions from an interrupted request.
+    for row in value["created"].as_array().into_iter().flatten() {
+        if let Some(version) = row["version_id"].as_i64() {
+            let key = ctx
+                .db
+                .read(move |c| {
+                    Ok(c.query_row(
+                        "SELECT storage_key FROM document_versions WHERE id=?1",
+                        [version],
+                        |r| r.get::<_, String>(0),
+                    )?)
+                })
+                .await?;
+            crate::scan::finish(ctx.db.clone(), key).await?;
+        }
+    }
+    Ok(Json(value))
 }
 
 fn commit_rows(
@@ -816,7 +834,7 @@ fn commit_rows(
                 if db.quota_bytes().is_some_and(|q| used + added_bytes > q) {
                     return Err(too_large());
                 }
-                let f = storage::store(db, data, &r.filename, 15 * MB as u64)?;
+                let f = storage::prepare_upload(db, data, &r.filename, 15 * MB as u64)?;
                 written.push(f.storage_key.clone());
                 tx.execute("INSERT INTO documents(case_id,title,doc_type,source,visibility,document_date,created_by,created_at)
                  VALUES(?1,?2,?3,'external',?4,?5,?6,?7)",params![cid,r.title,r.doc_type,r.visibility,(!r.document_date.is_empty()).then_some(&r.document_date),actor.user_id,now])?;

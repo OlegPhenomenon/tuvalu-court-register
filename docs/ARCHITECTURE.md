@@ -306,7 +306,7 @@ version or decision event, and dispatch events with unselected attachments. Sele
 summaries; amendment/supersession ids of unselected decisions are omitted. The user's ability to read a document
 does not automatically select it for a recipient. Default selection remains clean administrative/party material.
 
-Technical full backup/restore is **CLI only** (`tuvalu-court backup --out f.tcrb --key keyfile`), encrypted
+Technical full backup/restore is **CLI only** (`tuvalu-court backup f.tcrb keyfile`), encrypted
 (ChaCha20-Poly1305, key file kept outside repo), manifest with counts + sha256 of every file, verified on restore into an empty data dir.
 
 ## 8. Frontend (`web/`)
@@ -330,6 +330,9 @@ random `installation_id`, created by migration and preserved across backups.
 Restore instead reads the initialised DB inside the authenticated backup, prints
 the explicit destination and archive installation id, and requires `--yes` or
 interactive entry of that id. It never initialises an accidental source `./data`.
+Confirmation and restore stage plaintext in the destination's private `.restore-tmp`,
+cleaned on success/error, rather than system `/tmp`. Confirmation removes a newly
+created empty destination before returning; forced termination may leave staging to remove.
 
 `TCR_SMTP_URL=smtp://user:pass@host:587` requires STARTTLS; `smtps://…:465` uses
 implicit TLS. `TCR_MAIL_FROM` is required for SMTP delivery; absent configuration
@@ -344,6 +347,14 @@ Transport failures retry after 60 seconds with exponential backoff capped at
 is retained across retries. SMTP cannot guarantee exactly-once delivery when
 acknowledgement is lost or the process crashes after remote acceptance.
 Technical receipt, human handover and legal service assessment remain separate.
+Migration 0012 adds durable `in_flight` attempts with a unique claim, stable
+Message-ID, exact version inventory and dispatch version. Claim, final currency
+check and result each use short transactions; attachment preparation and SMTP
+run outside them. Final checks include current permissions and F07/F08 bindings.
+Startup/tick recovery fails claims older than twice the SMTP timeout as ambiguous
+and schedules backoff. Completion matches its claim, so recovered workers cannot
+overwrite a later attempt. Unreadable/corrupt attachments fail only that dispatch
+and require human review before retrying.
 
 `TCR_CLAMD=tcp://host:3310` or `unix:/absolute/socket` uses bounded INSTREAM, with
 `TCR_SCAN_TIMEOUT_MS` default 10000 (10–120000). Production refuses startup with
@@ -352,18 +363,22 @@ only. Settings and version `scan_note` show when no antivirus is used. HTTP
 uploads commit a `pending_scan` row before contacting clamd, then record verdict
 and audit atomically; pending bytes cannot be retrieved. Only explicit scanner
 OK permits `clean`; infection, errors, timeouts and interrupted scans become
-`quarantined`. Pending scans after restart are quarantined. File imports run the
-same checks before publication. Download/preview, exports, dispatches, SMTP and
+`quarantined`. Pending scans after restart are quarantined. File imports likewise
+commit pending rows before scanning outside the import transaction. Download/preview, exports, dispatches, SMTP and
 mailbox attachment links require a clean version; storage reads also enforce the
 verdict. Full technical backups preserve unavailable versions and their verdicts.
-PDF names decode `#xx`; active actions and bounded FlateDecode/object streams
-are inspected. PNG validates IHDR, chunk CRCs and IEND; JPEG validates segments
+PDF dictionaries are tokenised with comments, escaped/nested literal strings,
+hex strings, nested dictionaries and `#xx` names. Every FlateDecode stream is
+inflated within per-stream/total limits. Malformed dictionaries and unsupported
+object-stream filters fail closed, as do opaque streams without inspectable
+document structure. PNG validates IHDR, chunk CRCs and IEND; JPEG validates segments
 and EOI; DOCX checks bounded XML, macros, ActiveX and OLE content. These checks
 reduce risk and do not prove absolute safety.
 
-`GET /auth/me` includes `must_change_password`. While true, middleware denies
-every other API route with 403 `password_change_required`, except me, logout,
-password change and TOTP verification/enrolment. The UI forces the password form.
+`GET /auth/me` includes `must_change_password`. After completed MFA, while true,
+middleware denies other API routes with 403 `password_change_required`, except
+mode discovery, login, me, logout, password change and TOTP verification/enrolment.
+The UI forces the password form.
 `POST /auth/password {current,new,code?}` requires the current password, a
 different new password of at least 12 characters, and a fresh TOTP code when
 enrolled. It clears the flag, rotates the current session, revokes all other
