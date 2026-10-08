@@ -281,6 +281,25 @@ th { font-size: 0.85rem; color: var(--muted); font-weight: 600; white-space: now
 .field--check .check-row { display: flex; align-items: center; gap: 0.5rem; }
 .field--check input[type="checkbox"] { width: 1.1rem; height: 1.1rem; }
 
+/* ---------- Filters ---------- */
+
+/* Compact filter bar for list pages: full-width search on the first row, the
+   remaining fields on a wrapping grid, action buttons inline at the end.
+   Stacks to a single column on narrow screens. */
+.filters {
+  display: grid;
+  grid-template-columns: repeat(auto-fill, minmax(12rem, 1fr));
+  gap: 0 1rem;
+  align-items: end;
+}
+.filters .field { max-width: none; }
+.filters__search { grid-column: 1 / -1; }
+.filters .actions { margin-top: 0; margin-bottom: 1rem; }
+
+@media (max-width: 600px) {
+  .filters { grid-template-columns: 1fr; }
+}
+
 /* ---------- Banner ---------- */
 
 .banner {

@@ -143,13 +143,15 @@ export default function Cases() {
       </div>}
       <ErrorBanner error={refError} onRetry={reloadRef} />
       <Card>
-        <form onSubmit={apply} aria-label="Search and filter cases">
-          <TextField
-            label="Search"
-            value={form.q}
-            onChange={set('q')}
-            placeholder="Number, title or party name"
-          />
+        <form className="filters" onSubmit={apply} aria-label="Search and filter cases">
+          <div className="filters__search">
+            <TextField
+              label="Search"
+              value={form.q}
+              onChange={set('q')}
+              placeholder="Number, title or party name"
+            />
+          </div>
           <SelectField label="Status" value={form.status} onChange={set('status')} options={statusOptions} />
           <SelectField
             label="Category"
