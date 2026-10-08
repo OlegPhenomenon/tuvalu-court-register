@@ -1,7 +1,7 @@
 # Test results
 
-Recorded 8 October 2026 on `main` at commit `2ff9141` (code identical to `5d4b6db`; `2ff9141` only re-records
-`docs/demo/`). The requirement-by-requirement checklist is [`ACCEPTANCE.md`](ACCEPTANCE.md).
+Recorded 8 October 2026 on `main` at commit `6148772` (fixes after the re-audit of `6ace6b8`). The
+requirement-by-requirement checklist is [`ACCEPTANCE.md`](ACCEPTANCE.md).
 
 Tool versions: rustc/cargo 1.98.1, clippy 0.1.98, Node 23.10.0, npm 11.19.0, TypeScript 5.9.3, Vite 8.3.3,
 Docker 29.4.3 (linux/arm64), Python 3.10.11. Host: macOS 26 (arm64).
@@ -13,7 +13,7 @@ Docker 29.4.3 (linux/arm64), Python 3.10.11. Host: macOS 26 (arm64).
 | `cargo build` | finished, 0 warnings |
 | `cargo clippy --all-targets` | 0 warnings, 0 errors (`clippy.toml`: argument limit 8) |
 | `cd web && npm run typecheck` | `tsc --noEmit`, no errors |
-| `cd web && npm run build` | `dist/assets/index-*.css 18.8 kB`, `index-*.js 492 kB (gzip 141 kB)`, built |
+| `cd web && npm run build` | `dist/assets/index-*.css 18.8 kB`, `index-*.js 497 kB (gzip 142 kB)`, built |
 
 ## Automated tests (`cargo test`)
 
@@ -36,12 +36,13 @@ Per test binary, as printed by cargo:
 | `tests/hearings_tasks.rs` | ok. 22 passed; 0 failed |
 | `tests/import_export.rs` | ok. 13 passed; 0 failed |
 | `tests/intake_cases.rs` | ok. 11 passed; 0 failed |
+| `tests/reaudit_regressions.rs` | ok. 11 passed; 0 failed |
 | `tests/reports_search.rs` | ok. 4 passed; 0 failed |
 | Doc-tests | ok. 0 passed; 0 failed |
 
-219 tests passed, 0 failed. (One test in `audit_install.rs` re-runs the test binary as a child process to check
+230 tests passed, 0 failed. (One test in `audit_install.rs` re-runs the test binary as a child process to check
 command-line behaviour; that child prints an extra `1 passed; 45 filtered out` line, which is not a separate test.)
-The suite was run three times in a row without a failure.
+The suite was run three times in a row without a failure (`cargo test --locked`).
 
 ### Regression tests for an independent review
 
@@ -56,13 +57,17 @@ check), e.g. `f04_t29_…`, `f07_…`, so results can be traced:
 | Closure evidence and dates, safe retries of committing commands, next-step summary, intake numbering beyond 9999 | `tests/audit_workflow.rs` | F11, F13, F15, F17 |
 | SMTP transport (fake TLS ESMTP server: failure, retry, stall, crash recovery), file checks and clamd hook (fake clamd: clean, infected, error, timeout), every file channel, maintenance commands on the real binary, restore, temporary-password gate | `tests/audit_install.rs` | F09, F10, F16, F19 |
 | One new filing through intake → registration → adjournment → decision → copy → closure → reports | `tests/acceptance_t37.rs` | — |
+| Re-audit of `6ace6b8`: retries after a revoked grant (decision create/finalise, dispatch) return no stored metadata and create nothing; a retry with unchanged access returns the same record; party-create retries show current contacts; `case.view_all` alone cannot change or create party records while `party.edit` can correct them; a hidden draft cannot be edited, withdrawn or finalised, a hidden finalised decision cannot be amended; the author with access still replaces the file | `tests/reaudit_regressions.rs` | R01, R02, R03 |
+
+The first five tests in `tests/reaudit_regressions.rs` are the re-auditor's proposals, unchanged. On `6ace6b8` nine
+of the eleven tests fail (all five proposals included); the two positive controls pass on both commits.
 
 PDF checks are also exercised on committed realistic fixtures (`tests/fixtures/pdf/`, generated on macOS with an
 embedded TrueType font, a Flate image and text output) which must stay `clean`.
 
 ## Clean installation, backup and restore (Docker)
 
-`scripts/clean-install-check.sh` at `2ff9141`: **RESULT: PASS** (exit 0, 0 FAIL lines). Steps:
+`scripts/clean-install-check.sh` at `6148772`: **RESULT: PASS** (exit 0, 111 PASS lines, 0 FAIL lines). Steps:
 
 1. Build the image from the repository `Dockerfile` (16 MB, linux/arm64).
 2. Maintenance commands against an uninitialised volume (`create-user`, `grant`, `backup`, `verify-audit`) refuse
@@ -85,7 +90,7 @@ embedded TrueType font, a Flate image and text output) which must stay `clean`.
 Container memory after each phase (`docker stats`): about 1.2–1.3 MiB; cgroup peak about 22 MiB including the
 maintenance commands run inside it.
 
-## Browser runs (headless Chromium, fresh demo instance)
+## Browser runs (Chromium, fresh demo instance; rows not marked "Re-audit" were run at `2ff9141`)
 
 | Check | Result |
 |---|---|
@@ -103,9 +108,12 @@ maintenance commands run inside it.
 | Data and session after page reload and after server restart | PASS |
 | 390×844: no horizontal page overflow on main screens; dialogs fit with the close button visible; compact header | PASS |
 | Keyboard only: visible focus, sensible order, Enter/Escape, focus trapped in dialogs and restored on close, arrow keys on case tabs | PASS |
+| Re-audit (`6148772`): clerk with generic decision permissions sees a judge's restricted draft as "Restricted document" with no edit/withdraw/finalise actions and an explanation; PATCH, withdraw and finalise return 403 and the draft is unchanged | PASS |
+| Re-audit: registry head reduced to `case.view_all` sees participants and contacts without "Edit contact"; PATCH and POST `/parties` return 403, contact unchanged; with `party.edit` the button appears and a correction saves | PASS |
+| Re-audit: new filing → registration (UI) → judge assignment → judge uploads a ruling, drafts and finalises it → clerk closes the case on that decision | PASS |
 
-Evidence: [`docs/demo/main-scenario.mp4`](docs/demo/main-scenario.mp4) (2:53) and the screenshots in
-[`docs/demo/`](docs/demo).
+Evidence: [`docs/demo/main-scenario.mp4`](docs/demo/main-scenario.mp4) (2:53, recorded at `2ff9141`) and the
+screenshots in [`docs/demo/`](docs/demo).
 
 ## Not covered here
 
