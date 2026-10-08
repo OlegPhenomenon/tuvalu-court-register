@@ -840,7 +840,7 @@ async fn demo_seed_dataset_is_complete_and_consistent() {
         .unwrap()
         .map(|r| tuvalu_court::time::utc_to_local(&r.unwrap()))
         .collect();
-    assert_eq!(local_starts, ["2026-11-17T09:00", "2026-11-19T09:00"]);
+    assert_eq!(local_starts, ["2026-11-10T14:00", "2026-11-12T14:00"]);
     let renotify: i64 = conn
         .query_row("SELECT COUNT(*) FROM tasks WHERE case_id = ?1 AND kind = 'renotify' AND status = 'open'", [case3], |r| r.get(0))
         .unwrap();

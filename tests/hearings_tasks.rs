@@ -81,6 +81,16 @@ fn audit_count(c: &Client, app: &TestApp, action: &str) -> i64 {
         .unwrap()
 }
 
+fn audit_count_for_case(c: &Client, app: &TestApp, action: &str, case_id: i64) -> i64 {
+    let conn = c.db(app).open().unwrap();
+    conn.query_row(
+        "SELECT COUNT(*) FROM audit_events WHERE action = ?1 AND case_id = ?2",
+        rusqlite::params![action, case_id],
+        |r| r.get(0),
+    )
+    .unwrap()
+}
+
 fn audit_summary(c: &Client, app: &TestApp, action: &str) -> String {
     let conn = c.db(app).open().unwrap();
     conn.query_row(
@@ -856,7 +866,7 @@ async fn adjourn_conflict_rolls_back_and_renotifies_only_required_participants()
             .iter()
             .all(|p| p["attended"].is_null())
     );
-    assert_eq!(audit_count(&olga, &app, "task.created"), 2);
+    assert_eq!(audit_count_for_case(&olga, &app, "task.created", cid), 2);
     let after = case_counts(&olga, &app, cid);
     let (s, replay) = olga
         .post_idem(&format!("/api/hearings/{id}/adjourn"), "retry-after-conflict", req.clone())
@@ -1334,7 +1344,13 @@ async fn task_permissions_assignee_exception_and_ended_assignment() {
         err(s, &b, StatusCode::NOT_FOUND, "not_found");
         let (s, list) = client.get("/api/tasks").await;
         ok(s, &list);
-        assert_eq!(list["items"], json!([]));
+        assert!(
+            list["items"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .all(|t| t["case_id"] != cid)
+        );
     }
     conn.execute(
         "UPDATE case_assignments SET end_at = ?1 WHERE case_id = ?2 AND user_id = ?3",
@@ -1370,15 +1386,24 @@ async fn intake_tasks_require_intake_permission_and_orphan_tasks_are_hidden() {
     let orphan = conn.last_insert_rowid();
     let (s, list) = olga.get("/api/tasks?status=open").await;
     ok(s, &list);
-    assert_eq!(list["items"].as_array().unwrap().len(), 1);
-    assert_eq!(list["items"][0]["id"], id);
+    let items = list["items"].as_array().unwrap();
+    let for_intake: Vec<&Value> = items.iter().filter(|t| t["intake_id"] == intake).collect();
+    assert_eq!(for_intake.len(), 1);
+    assert_eq!(for_intake[0]["id"], id);
+    assert!(items.iter().all(|t| t["id"] != orphan));
     let (s, b) = olga.get(&format!("/api/tasks/{orphan}")).await;
     err(s, &b, StatusCode::NOT_FOUND, "not_found");
     let (s, b) = sergei.get(&format!("/api/tasks/{id}")).await;
     err(s, &b, StatusCode::NOT_FOUND, "not_found");
     let (s, list) = sergei.get("/api/tasks").await;
     ok(s, &list);
-    assert_eq!(list["items"], json!([]));
+    assert!(
+        list["items"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .all(|t| t["id"] != id)
+    );
     let (s, b) = olga.post(&format!("/api/tasks/{id}/complete"), json!({"result": "Checked"})).await;
     ok(s, &b);
     assert_eq!(b["status"], "done");

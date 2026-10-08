@@ -773,7 +773,7 @@ pub fn seed_cases(tx: &Transaction, db: &Db) -> AppResult<()> {
         Some(&ldate(9)),
     )?;
 
-    // 3. Civil case whose 17 Nov 2026 hearing was adjourned to 19 Nov 2026.
+    // 3. Civil case whose 10 Nov 2026 hearing was adjourned to 12 Nov 2026.
     let paleki = party(
         tx,
         &a_olga,
@@ -843,8 +843,8 @@ pub fn seed_cases(tx: &Transaction, db: &Db) -> AppResult<()> {
         case3,
         "hearing",
         "adjourned",
-        &crate::time::local_to_utc("2026-11-17T09:00")?,
-        &crate::time::local_to_utc("2026-11-17T10:00")?,
+        &crate::time::local_to_utc("2026-11-10T14:00")?,
+        &crate::time::local_to_utc("2026-11-10T15:00")?,
         room2,
         viktor,
         None,
@@ -859,11 +859,11 @@ pub fn seed_cases(tx: &Transaction, db: &Db) -> AppResult<()> {
         case3,
         "hearing",
         "scheduled",
-        &crate::time::local_to_utc("2026-11-19T09:00")?,
-        &crate::time::local_to_utc("2026-11-19T10:00")?,
+        &crate::time::local_to_utc("2026-11-12T14:00")?,
+        &crate::time::local_to_utc("2026-11-12T15:00")?,
         room2,
         viktor,
-        Some("Adjourned from 17 Nov 2026"),
+        Some("Adjourned from 10 Nov 2026"),
     )?;
     tx.execute(
         "UPDATE hearings SET previous_hearing_id = ?2 WHERE id = ?1",
@@ -885,7 +885,7 @@ pub fn seed_cases(tx: &Transaction, db: &Db) -> AppResult<()> {
             "hearing.adjourned",
             "hearing",
             old_h,
-            "Hearing of 17 Nov 2026 adjourned to 19 Nov 2026",
+            "Hearing of 10 Nov 2026 adjourned to 12 Nov 2026",
         )
         .case(Some(case3))
         .details(json!({
@@ -900,9 +900,9 @@ pub fn seed_cases(tx: &Transaction, db: &Db) -> AppResult<()> {
             &a_olga,
             case3,
             "renotify",
-            &format!("Send the new hearing date (19 Nov 2026, 09:00) to {name}"),
+            &format!("Send the new hearing date (12 Nov 2026, 14:00) to {name}"),
             sergei,
-            Some("2026-11-18"),
+            Some("2026-11-11"),
         )?;
     }
     // 4. Closed family case: hearing held, decision finalised, copies delivered.

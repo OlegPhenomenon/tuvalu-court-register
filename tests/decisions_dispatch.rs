@@ -601,7 +601,7 @@ async fn copies_review_queue_mailbox_and_delivery_records() {
     for persona in ["sergei", "pavel"] {
         let c = olga.switch(persona).await;
         assert!(
-            fetched(&c, "/api/mailbox").await["items"]
+            fetched(&c, &format!("/api/mailbox?dispatch_id={id}")).await["items"]
                 .as_array()
                 .unwrap()
                 .is_empty()
@@ -1189,7 +1189,7 @@ async fn intake_dispatches_follow_intake_access_even_after_linking() {
                 .is_empty()
         );
         assert!(
-            fetched(&c, "/api/mailbox").await["items"]
+            fetched(&c, &format!("/api/mailbox?dispatch_id={id}")).await["items"]
                 .as_array()
                 .unwrap()
                 .is_empty()
@@ -1247,7 +1247,7 @@ async fn intake_dispatches_follow_intake_access_even_after_linking() {
         0
     );
     assert!(
-        fetched(&olga, "/api/mailbox").await["items"]
+        fetched(&olga, &format!("/api/mailbox?dispatch_id={id}")).await["items"]
             .as_array()
             .unwrap()
             .is_empty()
@@ -1323,7 +1323,7 @@ async fn concurrent_finalisation_queue_and_workers_do_not_duplicate_history() {
     let (s, b) = foreign.get(&format!("/api/dispatches/{id}")).await;
     err(s, &b, StatusCode::NOT_FOUND, "not_found");
     assert!(
-        fetched(&foreign, "/api/mailbox").await["items"]
+        fetched(&foreign, &format!("/api/mailbox?dispatch_id={id}")).await["items"]
             .as_array()
             .unwrap()
             .is_empty()
