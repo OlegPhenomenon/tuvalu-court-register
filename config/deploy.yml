@@ -1,0 +1,39 @@
+# Kamal deployment of the public demo: tuvalu.shelfcompass.com
+# Shared host runs kamal-proxy (TLS via Let's Encrypt) for several demos.
+#   export KAMAL_REGISTRY_PASSWORD=$(gh auth token)   # needs write:packages for ghcr.io
+#   kamal deploy
+service: tuvalu
+image: olegphenomenon/tuvalu-court-register
+servers:
+  web:
+    - 188.34.152.24
+proxy:
+  ssl: true
+  host: tuvalu.shelfcompass.com
+  app_port: 8088
+  healthcheck:
+    path: /api/health
+    interval: 3
+    timeout: 5
+registry:
+  server: ghcr.io
+  username: olegphenomenon
+  password:
+    - KAMAL_REGISTRY_PASSWORD
+builder:
+  arch: arm64
+  # Build on the operator's arm64 Mac; the small server should not do a Rust release build.
+  local: true
+  dockerfile: Dockerfile
+volumes:
+  - tuvalu_data:/data
+env:
+  clear:
+    TCR_MODE: demo
+    TCR_DATA_DIR: /data
+    TCR_BIND: 0.0.0.0:8088
+    TCR_COOKIE_SECURE: "true"
+    TCR_SANDBOX_TTL_HOURS: "72"
+    TCR_MAX_SANDBOXES: "200"
+    TCR_SANDBOX_QUOTA_MB: "25"
+    RUST_LOG: info
