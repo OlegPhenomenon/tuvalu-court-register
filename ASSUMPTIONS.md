@@ -90,7 +90,10 @@ open; each must be confirmed with the Office of the Judiciary before real use
     (`case_number,filename,title,doc_type,visibility,document_date`) plus the
     files. Traversal paths, symlinks, duplicate entries and declared-size
     over-expansion are rejected; the archive cannot write outside its staging
-    area.
+    area. Limits: 20 MB ZIP, 15 MB per file, 40 MB expanded, 500 entries. A
+    package with restricted or judicial-note rows belongs to its uploader: only
+    they can commit it, and other importers see those rows as restricted until
+    the created document is open to them.
 17. **Case export (user package)** = a zip containing only the document
     versions the requesting user is permitted to see, plus `manifest.json`
     (`tcr-case-export/1`) with the case's permitted chronology. It is **not** a

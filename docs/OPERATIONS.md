@@ -297,7 +297,7 @@ Demo visitors reset only their own sandbox. Expired sandboxes are swept; at
 capacity only sandboxes idle for more than two hours are evicted. To remove an
 installation, stop it and explicitly delete its data; no maintenance command does
 that automatically. The proxy upload limit must exceed `TCR_UPLOAD_MAX_MB` plus
-multipart overhead (the nginx example accommodates the 50 MB import cap).
+multipart overhead (the nginx example's 52 MB comfortably covers the 20 MB import package).
 
 ## Responsible officers and contact corrections
 

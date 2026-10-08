@@ -591,7 +591,7 @@ fn files_preview(
         } else {
             false
         };
-        rows.push(json!({"row":i+2,"case_number":r.case_number,"filename":r.filename,"title":r.title,"action":if !problems.is_empty(){"error"}else if existing{"skip_existing"}else{"create"},"problems":problems,"missing":if r.document_date.is_empty(){vec!["document_date"]}else{vec![]}}));
+        rows.push(json!({"row":i+2,"case_number":r.case_number,"filename":r.filename,"title":r.title,"visibility":r.visibility,"action":if !problems.is_empty(){"error"}else if existing{"skip_existing"}else{"create"},"problems":problems,"missing":if r.document_date.is_empty(){vec!["document_date"]}else{vec![]}}));
     }
     Ok(preview_value(rows))
 }
@@ -655,9 +655,79 @@ fn batch(c: &Connection, actor: &Actor, id: i64) -> AppResult<Value> {
         [id],
     )
 }
+fn is_public(row: &Value) -> bool {
+    matches!(row["visibility"].as_str(), Some("administrative" | "party_material"))
+}
+fn owns(actor: &Actor, b: &Value) -> bool {
+    b["created_by"].as_i64() == Some(actor.user_id)
+}
+/// A document package with restricted or judicial-note rows (or rows previewed before
+/// visibility was recorded) belongs to its uploader: committing it would make the
+/// committer the creator, and so a reader, of material they were never given.
+fn confidential(b: &Value) -> AppResult<bool> {
+    if b["kind"] != "files_zip" {
+        return Ok(false);
+    }
+    let preview: Value = serde_json::from_str(text(b, "preview_json"))?;
+    Ok(preview["rows"].as_array().is_some_and(|rows| rows.iter().any(|r| !is_public(r))))
+}
+/// Preview and result as this actor may see them. Case visibility is already enforced by
+/// `batch`; for someone else's document package, a row's title and filename are shown only
+/// when its document is ordinary material or the document it created is open to the actor now.
+fn batch_view(c: &Connection, actor: &Actor, b: &Value) -> AppResult<(Value, Option<Value>)> {
+    let mut preview: Value = serde_json::from_str(b["preview_json"].as_str().unwrap_or("null"))?;
+    let mut result = b["result_json"]
+        .as_str()
+        .map(serde_json::from_str::<Value>)
+        .transpose()?;
+    if b["kind"] != "files_zip" || owns(actor, b) {
+        return Ok((preview, result));
+    }
+    // Preview row number -> whether the document created from it is visible now.
+    let mut created_rows = BTreeMap::new();
+    for item in result
+        .as_mut()
+        .and_then(|r| r["created"].as_array_mut())
+        .into_iter()
+        .flatten()
+    {
+        let open = item["document_id"]
+            .as_i64()
+            .is_some_and(|d| policy::require_document(c, actor, d).is_ok());
+        if let Some(row) = item["row"].as_i64() {
+            created_rows.insert(row, open);
+        }
+        if !open {
+            *item = json!({"case_id": item["case_id"], "restricted": true});
+        }
+    }
+    for row in preview["rows"].as_array_mut().into_iter().flatten() {
+        let shown = match row["row"].as_i64().and_then(|n| created_rows.get(&n)) {
+            Some(open) => *open,
+            // Not created (skipped, error or not yet committed): follow the manifest visibility.
+            // Rows previewed before visibility was recorded count as confidential.
+            None => is_public(row),
+        };
+        if !shown {
+            row["title"] = Value::Null;
+            row["filename"] = Value::Null;
+            row["restricted"] = json!(true);
+        }
+    }
+    Ok((preview, result))
+}
 async fn detail(ctx: Ctx, Path(id): Path<i64>) -> JsonResult {
     ctx.actor.require(perm::IMPORT_RUN)?;
-    let v=ctx.db.read(move |c| { let b=batch(c,&ctx.actor,id)?; Ok(json!({"batch_id":id,"kind":b["kind"],"filename":b["filename"],"status":b["status"],"preview":serde_json::from_str::<Value>(b["preview_json"].as_str().unwrap_or("null"))?,"result":b["result_json"].as_str().map(serde_json::from_str::<Value>).transpose()?})) }).await?;
+    let v = ctx
+        .db
+        .read(move |c| {
+            let b = batch(c, &ctx.actor, id)?;
+            let (preview, result) = batch_view(c, &ctx.actor, &b)?;
+            let can_commit = b["status"] == "previewed" && (owns(&ctx.actor, &b) || !confidential(&b)?);
+            Ok(json!({"batch_id":id,"kind":b["kind"],"filename":b["filename"],"status":b["status"],
+                "own":owns(&ctx.actor, &b),"can_commit":can_commit,"preview":preview,"result":result}))
+        })
+        .await?;
     Ok(Json(v))
 }
 fn text<'a>(b: &'a Value, key: &str) -> &'a str {
@@ -744,12 +814,17 @@ async fn commit(ctx: Ctx, Path(id): Path<i64>, IdemKey(key): IdemKey) -> JsonRes
                         ));
                     }
                 }
+                if !owns(&actor, &b) && confidential(&b)? {
+                    return Err(AppError::forbidden(
+                        "This package contains restricted material; only the person who uploaded it can commit it.",
+                    ));
+                }
                 commit_rows(tx, &actor, &db, id, &b, prepared.as_mut(), &mut keys.lock())
             }, |_| {
-                // Same source as GET /import/{id}: the committed batch result (ids and numbers only),
-                // served after `batch` re-checked that every linked case is still visible.
-                let result = b["result_json"].as_str().ok_or_else(|| AppError::internal("Committed import has no result."))?;
-                Ok(serde_json::from_str(result)?)
+                // Same view as GET /import/{id}: the committed result re-rendered for this actor,
+                // after `batch` re-checked that every linked case is still visible.
+                let (_, result) = batch_view(tx, &actor, &b)?;
+                result.ok_or_else(|| AppError::internal("Committed import has no result."))
             })
         })
         .await;
@@ -943,7 +1018,7 @@ fn commit_rows(
                     .case(Some(cid))
                     .details(json!({"batch_id":id})),
                 )?;
-                created.push(json!({"case_id":cid,"document_id":did,"version_id":vid}));
+                created.push(json!({"row":i+2,"case_id":cid,"document_id":did,"version_id":vid}));
             }
         }
     }

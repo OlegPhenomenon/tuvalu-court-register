@@ -16,11 +16,11 @@ import './admin.css';
 
 const CASE_HEADER = 'number,category,title,registered_date,status,responsible_username,closed_date,closure_basis,parties';
 const FILE_HEADER = 'case_number,filename,title,doc_type,visibility,document_date';
-type PreviewRow = { row: number; number?: string; target_number?: string | null; legacy_number?: string | null; case_number?: string; filename?: string; title?: string; action: 'create' | 'skip_existing' | 'error'; problems: string[]; missing: string[] };
+type PreviewRow = { row: number; number?: string; target_number?: string | null; legacy_number?: string | null; case_number?: string; filename?: string | null; title?: string | null; restricted?: boolean; action: 'create' | 'skip_existing' | 'error'; problems: string[]; missing: string[] };
 type Preview = { batch_id?: number; summary: { create: number; skip_existing: number; error: number }; rows: PreviewRow[] };
-type Result = { batch_id: number; status: string; summary: { created: number; skip_existing: number; error: number }; created: { case_id: number; number?: string; document_id?: number; version_id?: number }[] };
+type Result = { batch_id: number; status: string; summary: { created: number; skip_existing: number; error: number }; created: { case_id: number; number?: string; document_id?: number; version_id?: number; restricted?: boolean }[] };
 type Batch = { id: number; kind: string; filename: string; status: string; created_at: string; committed_at: string | null };
-type Detail = { batch_id: number; kind: string; filename: string; status: string; preview: Preview; result: Result | null };
+type Detail = { batch_id: number; kind: string; filename: string; status: string; own: boolean; can_commit: boolean; preview: Preview; result: Result | null };
 function template(header: string, filename: string) {
   const url = URL.createObjectURL(new Blob([`${header}\r\n`], { type: 'text/csv;charset=utf-8' }));
   const link = document.createElement('a'); link.href = url; link.download = filename;
@@ -33,7 +33,7 @@ function PreviewTable({ preview }: { preview: Preview }) {
     <DataTable rows={preview.rows} rowKey={r => String(r.row)} empty="The source has no rows." columns={[
       { key: 'row', header: 'CSV row' },
       { key: 'number', header: 'Case number', render: r => <>{r.number ?? r.case_number}{r.legacy_number && <div className="muted">Kept as legacy number; a new number will be allocated.</div>}</> },
-      { key: 'filename', header: 'File / title', render: r => <>{r.filename ?? '—'}{r.title && <div>{r.title}</div>}</> },
+      { key: 'filename', header: 'File / title', render: r => r.restricted ? <span className="muted">Restricted document</span> : <>{r.filename ?? '—'}{r.title && <div>{r.title}</div>}</> },
       { key: 'action', header: 'Row action', render: r => <span className={`import-action import-action--${r.action}`}>{r.action === 'skip_existing' ? 'Skip existing' : r.action === 'error' ? 'Error — skip' : 'Create'}</span> },
       { key: 'problems', header: 'Problems', render: r => r.problems.length ? <ul className="import-problems">{r.problems.map((p, i) => <li key={i}>{p}</li>)}</ul> : 'None' },
       { key: 'missing', header: 'Missing values', render: r => r.missing.length ? <ul className="import-missing">{r.missing.map(m => <li key={m}>{m.replace(/_/g, ' ')}</li>)}</ul> : 'None' },
@@ -42,10 +42,10 @@ function PreviewTable({ preview }: { preview: Preview }) {
 }
 function ImportResult({ result }: { result: Result }) {
   return <div role="status"><p>Batch #{result.batch_id} committed: {result.summary.created} created, {result.summary.skip_existing} existing rows skipped, {result.summary.error} error rows skipped.</p>
-    <ul>{result.created.map((r, i) => <li key={i}><Link to={`/cases/${r.case_id}${r.document_id ? '?tab=documents' : ''}`}>{r.number ?? `Case #${r.case_id}`}{r.document_id ? ` — document #${r.document_id}` : ''}</Link></li>)}</ul>
+    <ul>{result.created.map((r, i) => <li key={i}><Link to={`/cases/${r.case_id}${r.document_id || r.restricted ? '?tab=documents' : ''}`}>{r.number ?? `Case #${r.case_id}`}{r.document_id ? ` — document #${r.document_id}` : r.restricted ? ' — restricted document' : ''}</Link></li>)}</ul>
   </div>;
 }
-function CommitPreview({ batchId, preview, initialResult, onCommitted }: { batchId: number; preview: Preview; initialResult?: Result | null; onCommitted: () => void }) {
+function CommitPreview({ batchId, preview, initialResult, canCommit = true, onCommitted }: { batchId: number; preview: Preview; initialResult?: Result | null; canCommit?: boolean; onCommitted: () => void }) {
   const [key] = useState(newKey);
   const [result, setResult] = useState(initialResult ?? null);
   const [busy, setBusy] = useState(false);
@@ -54,7 +54,8 @@ function CommitPreview({ batchId, preview, initialResult, onCommitted }: { batch
   return <>
     <PreviewTable preview={preview} />
     <ErrorBanner error={error} onRetry={() => void commit()} />
-    {result ? <ImportResult result={result} /> : <div className="actions"><Button busy={busy} disabled={!preview.summary.create} onClick={() => void commit()}>Commit import</Button></div>}
+    {result ? <ImportResult result={result} /> : canCommit ? <div className="actions"><Button busy={busy} disabled={!preview.summary.create} onClick={() => void commit()}>Commit import</Button></div>
+      : <p className="muted">This package contains restricted material. Only the person who uploaded it can commit it.</p>}
   </>;
 }
 function Wizard({ zip, onCommitted }: { zip: boolean; onCommitted: () => void }) {
@@ -74,7 +75,7 @@ function Wizard({ zip, onCommitted }: { zip: boolean; onCommitted: () => void })
     <ol className="import-steps"><li>Upload source</li><li>Review preview</li><li>Commit and review result</li></ol>
     {zip ? <>
       <p>Use a ZIP with <code>manifest.csv</code> at its root and the files named by each row. The manifest must be UTF-8 with this exact header:</p><pre className="admin-json">{FILE_HEADER}</pre>
-      <p>Use an accessible current or legacy case number. Filename is the relative archive path. Types use document-type codes; visibility is administrative, party_material, restricted or judicial_note. Dates use YYYY-MM-DD; document_date may be blank. Files must be PDF, DOCX, JPEG or PNG. Limit: 50 MB ZIP, 20 MB per file, 100 MB expanded, 500 archive entries.</p>
+      <p>Use an accessible current or legacy case number. Filename is the relative archive path. Types use document-type codes; visibility is administrative, party_material, restricted or judicial_note. Dates use YYYY-MM-DD; document_date may be blank. Files must be PDF, DOCX, JPEG or PNG. Limit: 20 MB ZIP, 15 MB per file, 40 MB expanded, 500 archive entries. Packages with restricted rows or judicial notes can be committed only by the person who uploaded them; others see those rows as restricted.</p>
       <Button variant="secondary" onClick={() => template(FILE_HEADER, 'manifest.csv')}>Download manifest CSV template</Button>
     </> : <>
       <p>Upload UTF-8 CSV (up to 5 MB) with this exact header:</p><pre className="admin-json">{CASE_HEADER}</pre>
@@ -95,7 +96,7 @@ function BatchDialog({ id, onClose, onCommitted }: { id: number; onClose: () => 
   const detail = useApi<Detail>(`/import/${id}`);
   return <Modal title={`Import batch #${id}`} open onClose={onClose}>
     <ErrorBanner error={detail.error} onRetry={detail.reload} />
-    {detail.loading ? <p role="status">Loading batch…</p> : !detail.error && detail.data && <><p>{detail.data.filename} · {detail.data.status}</p><CommitPreview batchId={id} preview={detail.data.preview} initialResult={detail.data.result} onCommitted={onCommitted} /></>}
+    {detail.loading ? <p role="status">Loading batch…</p> : !detail.error && detail.data && <><p>{detail.data.filename} · {detail.data.status}{!detail.data.own && ' · uploaded by another user'}</p><CommitPreview batchId={id} preview={detail.data.preview} initialResult={detail.data.result} canCommit={detail.data.can_commit} onCommitted={onCommitted} /></>}
   </Modal>;
 }
 function ImportScreen() {

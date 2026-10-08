@@ -316,7 +316,9 @@ GET/POST /cases/:id/dispatches  GET /dispatches?status=   POST /dispatches/:id/{
 GET  /mailbox                          demo local e-mail viewer / production SMTP sent log
 GET  /reports/summary?from=&to=   GET /reports/:kind/cases (drill-down)   GET /reports/:kind.csv
 GET  /search?q=                        cases + document titles, only accessible
-POST /import/cases/preview (multipart CSV)   POST /import/:batch/commit   GET /import
+POST /import/cases/preview (multipart CSV)   POST /import/files/preview (ZIP)   POST /import/:batch/commit   GET /import   GET /import/:batch
+  (batch detail and commit replays redact another uploader's restricted/judicial-note rows unless the created document is
+   visible to the caller; only the uploader commits a package containing such rows)
 POST /cases/:id/export {purpose, version_ids}  -> zip of permitted materials + chronology.json
 GET  /audit?case_id=&user_id=
 /admin/users, /admin/users/:id/{permissions,deactivate,revoke-sessions,reset-password}, /admin/rooms, /admin/registries,

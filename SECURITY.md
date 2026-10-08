@@ -207,6 +207,9 @@ registering cannot duplicate a committed upload.
 `party.edit` permission, and `POST /parties` needs `intake.manage`, `case.register`, `case.edit` or
 `dispatch.manage`. Editing, withdrawing, finalising or amending a decision requires access to its bound
 document version.
+Import batches follow document access as well as case access: another importer sees a document
+package's restricted and judicial-note rows (title, filename, created document ID) only once the
+created document is open to them, and only the uploader can commit a package that contains such rows.
 Multipart requests bind metadata and file SHA-256. Closing evidence must be visible, belong to the
 case and use a clean version; judicial notes are excluded. The evidence picker uses the same policy.
 Case cards and closure audit details redact evidence IDs when the viewer cannot see their document.
