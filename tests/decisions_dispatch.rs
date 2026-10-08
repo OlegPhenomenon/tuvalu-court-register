@@ -511,7 +511,10 @@ async fn copies_review_queue_mailbox_and_delivery_records() {
         )
         .await;
     ok(s, &replay);
-    assert_eq!(replay, queued);
+    // The retry does not queue again; it shows the dispatch as it is now (already delivered).
+    assert_eq!(replay["id"], queued["id"]);
+    assert_eq!(replay["status"], sent["status"]);
+    assert_eq!(replay["attempts"].as_array().unwrap().len(), 1);
     assert_eq!(tuvalu_court::outbox::process(&db).unwrap(), 0);
     assert_eq!(
         scalar(

@@ -8,7 +8,7 @@ use super::common::{
     require_ref, required,
 };
 use crate::audit::{self, Event};
-use crate::auth::{Actor, Ctx, IdemKey, idempotent};
+use crate::auth::{Actor, Ctx, IdemKey, idempotent, replay_id};
 use crate::error::{AppError, AppResult};
 use crate::policy::{self, perm};
 use crate::state::AppState;
@@ -634,7 +634,7 @@ async fn create(
                     .case(Some(case_id)),
                 )?;
                 dispatch_json(tx, &actor, id)
-            })
+            }, |stored| dispatch_json(tx, &actor, replay_id(&stored, "/id")?))
         })
         .await?;
     Ok(Json(v))
@@ -824,7 +824,7 @@ async fn queue(
                 )?;
                 complete_renotify(tx, &actor, id)?;
                 dispatch_json(tx, &actor, id)
-            })
+            }, |_| dispatch_json(tx, &actor, id))
         })
         .await?;
     state.kick_outbox(&db);
@@ -887,7 +887,7 @@ async fn record_sent(
                 )?;
                 complete_renotify(tx, &actor, id)?;
                 dispatch_json(tx, &actor, id)
-            })
+            }, |_| dispatch_json(tx, &actor, id))
         })
         .await?;
     Ok(Json(v))
@@ -971,7 +971,7 @@ async fn confirm(ctx: Ctx, Path(id): Path<i64>, IdemKey(key): IdemKey, JsonBody(
                         .details(json!({ "kind": req.kind })),
                 )?;
                 dispatch_json(tx, &actor, id)
-            })
+            }, |_| dispatch_json(tx, &actor, id))
         })
         .await?;
     Ok(Json(v))
@@ -1013,7 +1013,7 @@ async fn assess(ctx: Ctx, Path(id): Path<i64>, IdemKey(key): IdemKey, JsonBody(r
                         .details(json!({ "assessment": req.assessment, "basis": basis })),
                 )?;
                 dispatch_json(tx, &actor, id)
-            })
+            }, |_| dispatch_json(tx, &actor, id))
         })
         .await?;
     Ok(Json(v))

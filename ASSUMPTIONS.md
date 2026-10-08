@@ -75,8 +75,9 @@ open; each must be confirmed with the Office of the Judiciary before real use
     court's decision. Demo sandbox expiry applies to fictional data only.
 14. **Optimistic locking & idempotency** are API conventions: editable records
     carry `version`; create-type operations accept `Idempotency-Key`, and a
-    replay returns the stored result (a second case number/decision/attempt is
-    never produced).
+    replay never repeats the action (a second case number/decision/attempt is
+    never produced). The replay response is rebuilt from the current record
+    under the caller's current access, not copied from the first response.
 
 ## Import / export / backup formats
 

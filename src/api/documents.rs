@@ -10,7 +10,7 @@
 
 use super::common::{JsonBody, JsonResult, optional, query_json, query_one_json, reason, require_ref, required};
 use crate::audit::{self, Event};
-use crate::auth::{Actor, Ctx, IdemKey, idempotent};
+use crate::auth::{Actor, Ctx, IdemKey, idempotent, replay_id};
 use crate::error::{AppError, AppResult};
 use crate::policy::{self, perm};
 use crate::state::AppState;
@@ -443,6 +443,14 @@ fn check_open_case(conn: &Connection, actor: &Actor, case_id: Option<i64>) -> Ap
     Ok(())
 }
 
+/// Replay of an upload or new version: the document is re-checked and re-rendered under the actor's
+/// current access (current scan verdicts, grants and usage included).
+fn replay_document(conn: &Connection, actor: &Actor, stored: &Value) -> AppResult<Value> {
+    let id = replay_id(stored, "/id")?;
+    policy::require_document(conn, actor, id)?;
+    detail_json(conn, actor, id)
+}
+
 /// Reuse the central idempotency comparison without executing a new operation.
 fn upload_replay(conn: &Connection, actor: &Actor, key: &Option<String>, op: &str, request: &Value) -> AppResult<Option<Value>> {
     let exists = match key {
@@ -454,13 +462,7 @@ fn upload_replay(conn: &Connection, actor: &Actor, key: &Option<String>, op: &st
         None => false,
     };
     if exists {
-        let mut value = idempotent::<Value, _>(conn, actor, key, op, request, || Err(AppError::internal("Missing upload replay")))?;
-        if let Some(versions) = value["versions"].as_array_mut() {
-            for version in versions {
-                let (status,note):(String,Option<String>) = conn.query_row("SELECT scan_status,scan_note FROM document_versions WHERE id=?1", [version["id"].as_i64()], |r|Ok((r.get(0)?,r.get(1)?)))?;
-                version["scan_status"] = json!(status); version["scan_note"] = json!(note);
-            }
-        }
+        let value = idempotent::<Value, _, _>(conn, actor, key, op, request, || Err(AppError::internal("Missing upload replay")), |stored| replay_document(conn, actor, &stored))?;
         return Ok(Some(value));
     }
     Ok(None)
@@ -586,7 +588,7 @@ async fn upload_document(ctx: Ctx, max: u64, case_id: Option<i64>, intake_id: Op
                     "scan_status": file.scan_status, "intake_id": intake_id })),
                 )?;
                 detail_json(tx, &actor, doc_id)
-            })?;
+            }, |stored| replay_document(tx, &actor, &stored))?;
             Ok((value, used))
         })
         .await;
@@ -678,7 +680,7 @@ async fn add_version(ctx: Ctx, State(state): State<AppState>, Path(id): Path<i64
                         .details(json!({ "version_no": next, "filename": file.filename, "sha256": file.sha256, "note": note })),
                 )?;
                 detail_json(tx, &actor, id)
-            })?;
+            }, |stored| replay_document(tx, &actor, &stored))?;
             Ok((value, used))
         })
         .await;

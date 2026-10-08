@@ -183,9 +183,9 @@ pub const PERSONAS: &[Persona] = &[
         key: "elena",
         display: "Elena Brooks",
         title: "Head of registry",
-        summary: "Assigns staff and the judge, oversees open work, reopens cases, grants access to restricted material.",
+        summary: "Assigns staff and the judge, oversees open work, corrects shared contact details, reopens cases, grants access to restricted material.",
         is_judge: false,
-        perms: &[CASE_VIEW_ALL, CASE_ASSIGN_STAFF, CASE_ASSIGN_JUDGE, CASE_REOPEN, CASE_CLOSE, REPORT_VIEW, AUDIT_VIEW, IMPORT_RUN, EXPORT_CASE, DOCUMENT_GRANT_RESTRICTED, HEARING_SCHEDULE, HEARING_OVERRIDE_CONFLICT, TASK_MANAGE],
+        perms: &[CASE_VIEW_ALL, PARTY_EDIT, CASE_ASSIGN_STAFF, CASE_ASSIGN_JUDGE, CASE_REOPEN, CASE_CLOSE, REPORT_VIEW, AUDIT_VIEW, IMPORT_RUN, EXPORT_CASE, DOCUMENT_GRANT_RESTRICTED, HEARING_SCHEDULE, HEARING_OVERRIDE_CONFLICT, TASK_MANAGE],
     },
     Persona {
         key: "viktor",

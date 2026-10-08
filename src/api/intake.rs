@@ -3,7 +3,7 @@
 
 use super::common::{JsonBody, JsonResult, optional, query_json, query_one_json, reason, render_template, require_ref, required};
 use crate::audit::{self, Event};
-use crate::auth::{Actor, Ctx, IdemKey, idempotent};
+use crate::auth::{Actor, Ctx, IdemKey, idempotent, replay_id};
 use crate::error::{AppError, AppResult};
 use crate::policy::{self, perm};
 use crate::state::AppState;
@@ -62,6 +62,22 @@ async fn list(ctx: Ctx, Query(q): Query<ListQuery>) -> JsonResult {
 pub fn require_intake(conn: &Connection, actor: &Actor, id: i64) -> AppResult<Value> {
     let sql = format!("SELECT i.* FROM intakes i WHERE i.id = ?1 AND {}", policy::intake_visible_sql(actor, "i"));
     query_one_json(conn, &sql, [id])
+}
+
+/// Replay of a create/supplement: the reference is re-read under the actor's current access.
+fn replay_reference(conn: &Connection, actor: &Actor, stored: &Value) -> AppResult<Value> {
+    let intake = require_intake(conn, actor, replay_id(stored, "/id")?)?;
+    Ok(json!({ "id": intake["id"], "reference": intake["reference"] }))
+}
+
+/// Replay of link/register: the case number is re-read under the actor's current access and the
+/// cancelled information requests (dispatches of this visible intake) from their current rows.
+fn replay_linked(conn: &Connection, actor: &Actor, stored: &Value) -> AppResult<Value> {
+    let case = policy::require_case(conn, actor, replay_id(stored, "/case_id")?)?;
+    let requests = stored["cancelled_requests"].as_array().map(Vec::as_slice).unwrap_or_default().iter()
+        .map(|r| query_one_json(conn, "SELECT id, kind, recipient_name, status, status_reason FROM dispatches WHERE id = ?1", [replay_id(r, "/id")?]))
+        .collect::<AppResult<Vec<_>>>()?;
+    Ok(json!({ "case_id": case.id, "number": case.number, "cancelled_requests": requests }))
 }
 
 fn status_of(v: &Value) -> &str {
@@ -160,7 +176,7 @@ async fn create(ctx: Ctx, IdemKey(key): IdemKey, JsonBody(input): JsonBody<Intak
                     Event::new("intake.received", "intake", id, format!("Received {reference} from {}", input.sender_name.trim())),
                 )?;
                 Ok(json!({ "id": id, "reference": reference }))
-            })
+            }, |stored| replay_reference(tx, &actor, &stored))
         })
         .await?;
     Ok(Json(v))
@@ -373,7 +389,7 @@ async fn supplement(ctx: Ctx, Path(id): Path<i64>, IdemKey(key): IdemKey, JsonBo
                     .details(json!({ "supplement_intake_id": child })),
                 )?;
                 Ok(json!({ "id": child, "reference": reference }))
-            })
+            }, |stored| replay_reference(tx, &actor, &stored))
         })
         .await?;
     Ok(Json(v))
@@ -443,7 +459,7 @@ async fn request_info(ctx: Ctx, Path(id): Path<i64>, IdemKey(key): IdemKey, Json
                     .details(json!({ "missing_items": missing, "dispatch_id": dispatch_id })),
                 )?;
                 Ok(json!({ "ok": true, "dispatch_id": dispatch_id }))
-            })
+            }, |stored| Ok(json!({ "ok": true, "dispatch_id": replay_id(&stored, "/dispatch_id")? })))
         })
         .await?;
     Ok(Json(v))
@@ -479,7 +495,7 @@ async fn mark_ready(ctx: Ctx, Path(id): Path<i64>, IdemKey(key): IdemKey, JsonBo
                     ),
                 )?;
                 require_intake(tx, &actor, id)
-            })
+            }, |_| require_intake(tx, &actor, id))
         })
         .await?;
     Ok(Json(v))
@@ -526,7 +542,7 @@ async fn mark_duplicate(ctx: Ctx, Path(id): Path<i64>, IdemKey(key): IdemKey, Js
                     .details(json!({ "reason": why, "original_intake_id": req.duplicate_of_intake_id })),
                 )?;
                 require_intake(tx, &actor, id)
-            })
+            }, |_| require_intake(tx, &actor, id))
         })
         .await?;
     Ok(Json(v))
@@ -560,7 +576,7 @@ async fn return_intake(ctx: Ctx, Path(id): Path<i64>, IdemKey(key): IdemKey, Jso
                     .details(json!({ "reason": why })),
                 )?;
                 require_intake(tx, &actor, id)
-            })
+            }, |_| require_intake(tx, &actor, id))
         })
         .await?;
     Ok(Json(v))
@@ -632,7 +648,7 @@ async fn link(ctx: Ctx, Path(id): Path<i64>, IdemKey(key): IdemKey, JsonBody(req
                     .details(json!({ "documents_attached": docs })),
                 )?;
                 Ok(json!({ "case_id": case.id, "number": case.number, "cancelled_requests": cancelled_requests }))
-            })
+            }, |stored| replay_linked(tx, &actor, &stored))
         })
         .await?;
     Ok(Json(v))
@@ -750,7 +766,7 @@ async fn register(ctx: Ctx, Path(id): Path<i64>, IdemKey(key): IdemKey, JsonBody
                         .details(json!({ "intake_id": id, "documents_attached": docs, "related_case_id": req.related_case_id })),
                 )?;
                 Ok(json!({ "case_id": ncase.id, "number": ncase.number, "cancelled_requests": cancelled_requests }))
-            })
+            }, |stored| replay_linked(tx, &actor, &stored))
         })
         .await?;
     Ok(Json(v))

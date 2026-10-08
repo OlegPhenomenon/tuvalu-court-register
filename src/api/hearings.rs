@@ -8,7 +8,7 @@
 use super::common::{JsonBody, JsonResult, optional, query_json, query_one_json, reason, ref_label, require_ref, required};
 use super::tasks::{self, NewTask};
 use crate::audit::{self, Event};
-use crate::auth::{Actor, Ctx, IdemKey, idempotent};
+use crate::auth::{Actor, Ctx, IdemKey, idempotent, replay_id};
 use crate::error::{AppError, AppResult};
 use crate::policy::{self, perm};
 use crate::state::AppState;
@@ -534,7 +534,7 @@ async fn create(ctx: Ctx, Path(case_id): Path<i64>, IdemKey(key): IdemKey, JsonB
                     )?;
                 }
                 hearing_json(tx, id)
-            })
+            }, |stored| require_hearing(tx, &actor, replay_id(&stored, "/id")?))
         })
         .await?;
     Ok(Json(v))
@@ -788,6 +788,11 @@ async fn adjourn(ctx: Ctx, Path(id): Path<i64>, IdemKey(key): IdemKey, JsonBody(
                 )?;
                 super::dispatch::supersede_hearing_notices(tx, &actor, id)?;
                 Ok(json!({ "old": hearing_json(tx, id)?, "new": hearing_json(tx, new_id)?, "tasks": made }))
+            }, |stored| {
+                let tasks = stored["tasks"].as_array().map(Vec::as_slice).unwrap_or_default().iter()
+                    .map(|t| tasks::task_json(tx, replay_id(t, "/id")?))
+                    .collect::<AppResult<Vec<_>>>()?;
+                Ok(json!({ "old": hearing_json(tx, id)?, "new": require_hearing(tx, &actor, replay_id(&stored, "/new/id")?)?, "tasks": tasks }))
             })
         })
         .await?;
@@ -1007,6 +1012,17 @@ async fn outcome(
                 }
                 if future && demo {
                     out["demo_note"] = json!("Recorded ahead of the hearing time (demo only)");
+                }
+                Ok(out)
+            }, |stored| {
+                let task = match stored["task"]["id"].as_i64() { Some(tid) => tasks::task_json(tx, tid)?, None => Value::Null };
+                let next = match stored["next_hearing"]["id"].as_i64() { Some(nid) => require_hearing(tx, &actor, nid)?, None => Value::Null };
+                let mut out = json!({ "hearing": hearing_json(tx, id)?, "task": task, "next_hearing": next });
+                if out["next_hearing"]["status"] == "draft" {
+                    out["next_hearing_note"] = json!("Next hearing saved as a draft for a scheduler to confirm.");
+                }
+                if let Some(note) = stored.get("demo_note") {
+                    out["demo_note"] = note.clone(); // fixed server text, decided when the outcome was recorded
                 }
                 Ok(out)
             })

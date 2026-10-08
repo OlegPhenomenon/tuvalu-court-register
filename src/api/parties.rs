@@ -6,14 +6,14 @@ use super::common::{
 };
 use super::intake::NewParty;
 use crate::audit::{self, Event};
-use crate::auth::{Actor, Ctx, IdemKey, idempotent};
+use crate::auth::{Actor, Ctx, IdemKey, idempotent, replay_id};
 use crate::error::{AppError, AppResult};
 use crate::policy::{self, perm};
 use crate::state::AppState;
 use axum::extract::{Path, Query};
 use axum::routing::get;
 use axum::{Json, Router};
-use rusqlite::{OptionalExtension, params};
+use rusqlite::params;
 use serde::{Deserialize, Serialize};
 use serde_json::json;
 
@@ -27,18 +27,19 @@ pub fn routes() -> Router<AppState> {
         )
 }
 
-/// Party data is needed by people who register cases or edit participants.
+/// Reading party data is needed by people who register cases, edit participants, send notices or
+/// oversee all cases.
 fn require_party_access(actor: &Actor) -> AppResult<()> {
-    if [
-        perm::INTAKE_MANAGE,
-        perm::CASE_REGISTER,
-        perm::CASE_EDIT,
-        perm::CASE_VIEW_ALL,
-        perm::DISPATCH_MANAGE,
-    ]
-    .iter()
-    .any(|p| actor.has(p))
-    {
+    require_any(actor, &[perm::INTAKE_MANAGE, perm::CASE_REGISTER, perm::CASE_EDIT, perm::PARTY_EDIT, perm::CASE_VIEW_ALL, perm::DISPATCH_MANAGE])
+}
+
+/// Creating a party record is a write: `case.view_all` alone is read-only.
+fn require_party_create(actor: &Actor) -> AppResult<()> {
+    require_any(actor, &[perm::INTAKE_MANAGE, perm::CASE_REGISTER, perm::CASE_EDIT, perm::DISPATCH_MANAGE])
+}
+
+fn require_any(actor: &Actor, perms: &[&str]) -> AppResult<()> {
+    if perms.iter().any(|p| actor.has(p)) {
         Ok(())
     } else {
         Err(AppError::forbidden("You do not work with party records."))
@@ -66,25 +67,28 @@ async fn list(ctx: Ctx, Query(q): Query<ListQuery>) -> JsonResult {
 }
 
 async fn create(ctx: Ctx, IdemKey(key): IdemKey, JsonBody(req): JsonBody<NewParty>) -> JsonResult {
-    require_party_access(&ctx.actor)?;
+    require_party_create(&ctx.actor)?;
     let actor = ctx.actor;
     let v = ctx
         .db
         .write(move |tx| {
-            if let Some(key)=&key {
-                let stored: Option<String>=tx.query_row("SELECT result_json FROM operation_keys WHERE user_id=?1 AND key=?2 AND operation='party.create'",params![actor.user_id,key],|r|r.get(0)).optional()?;
-                if let Some(stored)=stored {
-                    let result:serde_json::Value=serde_json::from_str(&stored)?;
-                    policy::require_party(tx,&actor,result["id"].as_i64().unwrap_or_default())?;
-                    if let Some(records)=result["same_name_records"].as_array() { for party in records { policy::require_party(tx,&actor,party["id"].as_i64().unwrap_or_default())?; } }
-                }
-            }
             idempotent(tx, &actor, &key, "party.create", &req, || {
             // Same-name records are allowed and reported, never merged.
             let same_name = query_json(tx, &format!("SELECT id, kind, name, contact_email, island FROM parties p WHERE name = ?1 COLLATE NOCASE AND {}", policy::party_visible_sql(&actor,"p.id")), [req.name.trim()])?;
             let id = super::cases::insert_party(tx, &actor, &req)?;
             audit::record(tx, Some(&actor), Event::new("party.created", "party", id, format!("Party record '{}' created", req.name.trim())))?;
             Ok(json!({ "id": id, "same_name_records": same_name }))
+            }, |stored| {
+                // The new record must still be visible; same-name warnings are re-read and limited to
+                // records the actor can see now.
+                let id = replay_id(&stored, "/id")?;
+                policy::require_party(tx, &actor, id)?;
+                let sql = format!("SELECT id, kind, name, contact_email, island FROM parties p WHERE id = ?1 AND {}", policy::party_visible_sql(&actor, "p.id"));
+                let mut same_name = Vec::new();
+                for party in stored["same_name_records"].as_array().map(Vec::as_slice).unwrap_or_default() {
+                    same_name.extend(query_json(tx, &sql, [replay_id(party, "/id")?])?);
+                }
+                Ok(json!({ "id": id, "same_name_records": same_name }))
             })
         })
         .await?;
@@ -177,7 +181,7 @@ async fn update_participation(
         let fields:Vec<_>=["role","representative_party_id","representation_basis","service_contact"].into_iter().filter(|f|before[*f]!=after[*f]).map(|f|json!({"from_field":f,"to_field":f})).collect();
         audit::record(tx,Some(&actor),Event::new("case.participant_updated","case",id,"Participant role, representation or service contact changed").case(Some(id)).details(json!({"participation_id":pid,"changes":fields})))?;
         Ok(after)
-        })
+        }, |_| query_one_json(tx,"SELECT * FROM case_participations WHERE id=?1 AND case_id=?2",params![pid,id]))
     }).await?;
     Ok(Json(v))
 }

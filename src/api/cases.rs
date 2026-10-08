@@ -708,6 +708,12 @@ async fn update(
                 out["residual_access"] = json!(roles);
             }
             Ok(out)
+            }, |stored| {
+                let mut out = if stored["case"].is_null() { json!({"case":null}) } else { case_json(tx, &actor, id)? };
+                if let Some(roles) = stored.get("residual_access") {
+                    out["residual_access"] = roles.clone();
+                }
+                Ok(out)
             })
         })
         .await?;
@@ -1056,7 +1062,7 @@ async fn close(
                         .details(json!({ "basis": req.basis, "note": note, "closed_date": date, "acknowledge": acknowledged, "basis_document_version_id": req.basis_document_version_id, "basis_decision_id": req.basis_decision_id, "basis_hearing_id": req.basis_hearing_id })),
                 )?;
                 Ok(json!({ "ok": true, "closed_date": date }))
-            })
+            }, |stored| Ok(json!({ "ok": true, "closed_date": stored["closed_date"] })))
         })
         .await?;
     Ok(Json(v))
@@ -1093,7 +1099,7 @@ async fn reopen(ctx: Ctx, Path(id): Path<i64>, IdemKey(key): IdemKey, JsonBody(r
                         .details(json!({ "reason": why })),
                 )?;
                 case_json(tx, &actor, id)
-            })
+            }, |_| case_json(tx, &actor, id))
         })
         .await?;
     Ok(Json(v))
@@ -1132,7 +1138,7 @@ async fn add_relation(ctx: Ctx, Path(id): Path<i64>, IdemKey(key): IdemKey, Json
                     .details(json!({"related_case_id": other.id})),
                 )?;
                 case_json(tx, &actor, id)
-            })
+            }, |_| case_json(tx, &actor, id))
         })
         .await?;
     Ok(Json(v))
@@ -1157,7 +1163,7 @@ async fn participant_add(ctx: Ctx, Path(id): Path<i64>, IdemKey(key): IdemKey, J
                 Event::new("case.participant_added", "case", id, format!("{name} added to {} as {}", case.number, req.role)).case(Some(id)),
             )?;
             case_json(tx, &actor, id)
-            })
+            }, |_| case_json(tx, &actor, id))
         })
         .await?;
     Ok(Json(v))
@@ -1186,7 +1192,7 @@ async fn participant_end(ctx: Ctx, Path((id, pid)): Path<(i64, i64)>, IdemKey(ke
                     .details(json!({ "participation_id": pid, "reason": why })),
             )?;
             case_json(tx, &actor, id)
-            })
+            }, |_| case_json(tx, &actor, id))
         })
         .await?;
     Ok(Json(v))

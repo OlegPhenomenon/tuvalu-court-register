@@ -372,18 +372,24 @@ impl<S: Send + Sync> FromRequestParts<S> for IdemKey {
 
 /// Idempotent operation helper (call inside a write transaction, after authorization checks so a
 /// replay is re-authorised). If `key` was already used by this user for the same operation and the
-/// same request body, returns the stored result instead of running `op` again; a different body → 409.
-pub fn idempotent<T, F>(
+/// same request body, `op` is NOT run again: `replay` receives the stored result and rebuilds the
+/// response from the current records with the actor's CURRENT access, using the stored value only
+/// to locate them (ids). Access may have changed since the first call (a grant revoked, an
+/// assignment ended), so stored record content is never echoed; only ids, dates and fixed server
+/// notes may be carried over. A different body → 409.
+pub fn idempotent<T, F, R>(
     tx: &Connection,
     actor: &Actor,
     key: &Option<String>,
     operation: &str,
     request: &impl Serialize,
     op: F,
+    replay: R,
 ) -> AppResult<serde_json::Value>
 where
     T: Serialize,
     F: FnOnce() -> AppResult<T>,
+    R: FnOnce(serde_json::Value) -> AppResult<serde_json::Value>,
 {
     let request_hash = sha256_hex(serde_json::to_string(request)?.as_bytes());
     if let Some(k) = key {
@@ -401,7 +407,7 @@ where
                     "This request key was already used for a different request.",
                 ));
             }
-            return Ok(serde_json::from_str(&json)?);
+            return replay(serde_json::from_str(&json)?);
         }
     }
     let value = serde_json::to_value(op()?)?;
@@ -413,6 +419,14 @@ where
         )?;
     }
     Ok(value)
+}
+
+/// Record id stored in an idempotent result at JSON pointer `ptr` (e.g. "/id", "/new/id").
+pub fn replay_id(stored: &serde_json::Value, ptr: &str) -> AppResult<i64> {
+    stored
+        .pointer(ptr)
+        .and_then(serde_json::Value::as_i64)
+        .ok_or_else(|| AppError::internal("Stored request result has no record id."))
 }
 
 #[cfg(test)]

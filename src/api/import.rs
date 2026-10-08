@@ -745,6 +745,11 @@ async fn commit(ctx: Ctx, Path(id): Path<i64>, IdemKey(key): IdemKey) -> JsonRes
                     }
                 }
                 commit_rows(tx, &actor, &db, id, &b, prepared.as_mut(), &mut keys.lock())
+            }, |_| {
+                // Same source as GET /import/{id}: the committed batch result (ids and numbers only),
+                // served after `batch` re-checked that every linked case is still visible.
+                let result = b["result_json"].as_str().ok_or_else(|| AppError::internal("Committed import has no result."))?;
+                Ok(serde_json::from_str(result)?)
             })
         })
         .await;

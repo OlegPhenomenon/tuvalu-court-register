@@ -261,7 +261,7 @@ export function PartyPicker({
   const { hasPerm } = useSession();
   useEffect(() => {
     let alive = true; setCanEdit(false); setEditing(false);
-    if (value && (hasPerm('case.edit') || hasPerm('intake.manage') || hasPerm('case.view_all'))) {
+    if (value && (hasPerm('case.edit') || hasPerm('intake.manage') || hasPerm('party.edit'))) {
       api<{editable: boolean}>('GET', `/parties/${value.id}`).then(d => { if (alive) setCanEdit(d.editable); }).catch(() => {});
     }
     return () => { alive = false; };

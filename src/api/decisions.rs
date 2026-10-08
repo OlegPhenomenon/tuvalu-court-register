@@ -4,7 +4,7 @@
 
 use super::common::{JsonBody, JsonResult, optional, query_json, query_one_json, reason, required};
 use crate::audit::{self, Event};
-use crate::auth::{Actor, Ctx, IdemKey, idempotent};
+use crate::auth::{Actor, Ctx, IdemKey, idempotent, replay_id};
 use crate::error::{AppError, AppResult};
 use crate::policy::{self, perm};
 use crate::state::AppState;
@@ -85,6 +85,17 @@ fn require_judge_scope(conn: &Connection, actor: &Actor, case_id: i64) -> AppRes
         return Err(AppError::forbidden(
             "Only the judge assigned to this case can do this.",
         ));
+    }
+    Ok(())
+}
+
+/// Changing, finalising, withdrawing or amending a decision needs access to the exact document
+/// version it is bound to. A generic decision permission never lets someone manage material they
+/// cannot open — replacing the file would otherwise expose the hidden title (R03).
+fn require_material_access(conn: &Connection, actor: &Actor, d: &Value) -> AppResult<()> {
+    let vid = d["document_version_id"].as_i64().ok_or_else(|| AppError::internal("Decision without a document version."))?;
+    if policy::require_version(conn, actor, vid).is_err() {
+        return Err(AppError::forbidden("You need access to the document bound to this decision to change it."));
     }
     Ok(())
 }
@@ -257,7 +268,7 @@ async fn create(
                     Event::new("decision.drafted", "decision", id, format!("Draft decision “{title}” prepared")).case(Some(case_id)),
                 )?;
                 decision_json(tx, &actor, id)
-            })
+            }, |stored| decision_json(tx, &actor, replay_id(&stored, "/id")?))
         })
         .await?;
     Ok(Json(v))
@@ -281,6 +292,7 @@ async fn update(ctx: Ctx, Path(id): Path<i64>, JsonBody(req): JsonBody<UpdateReq
             require_judge_scope(tx, &actor, case_id)?;
             let current = decision_json(tx, &actor, id)?;
             actor.require(perm::DECISION_DRAFT)?;
+            require_material_access(tx, &actor, &current)?;
             if current["status"].as_str() != Some("draft") {
                 return Err(AppError::invalid_transition("Only a draft decision can be edited."));
             }
@@ -350,6 +362,10 @@ async fn finalise(
             require_judge_scope(tx, &actor, case_id)?;
             let current = decision_json(tx, &actor, id)?;
             actor.require(perm::DECISION_FINALISE)?;
+            require_material_access(tx, &actor, &current)?;
+            if let Some(old_id) = current["amends_decision_id"].as_i64() {
+                require_material_access(tx, &actor, &decision_json(tx, &actor, old_id)?)?;
+            }
             idempotent(tx, &actor, &key, "decision.finalise", &(id, &req), || {
                 if current["status"].as_str() != Some("draft") {
                     return Err(AppError::invalid_transition("Only a draft decision can be finalised."));
@@ -404,7 +420,7 @@ async fn finalise(
                     .details(json!({ "decision_date": date, "signed_file_uploaded": req.signed_file_uploaded.unwrap_or(false) })),
                 )?;
                 decision_json(tx, &actor, id)
-            })
+            }, |_| decision_json(tx, &actor, id))
         })
         .await?;
     Ok(Json(v))
@@ -429,6 +445,7 @@ async fn withdraw(
             require_judge_scope(tx, &actor, case_id)?;
             let current = decision_json(tx, &actor, id)?;
             actor.require(perm::DECISION_DRAFT)?;
+            require_material_access(tx, &actor, &current)?;
             idempotent(tx, &actor, &key, "decision.withdraw", &(id, &req), || {
                 if current["status"].as_str() != Some("draft") {
                     return Err(AppError::invalid_transition("Only a draft decision can be withdrawn."));
@@ -446,7 +463,7 @@ async fn withdraw(
                         .details(json!({ "reason": why })),
                 )?;
                 decision_json(tx, &actor, id)
-            })
+            }, |_| decision_json(tx, &actor, id))
         })
         .await?;
     Ok(Json(v))
@@ -471,6 +488,7 @@ async fn amend(ctx: Ctx, Path(id): Path<i64>, IdemKey(key): IdemKey, JsonBody(re
             require_judge_scope(tx, &actor, case_id)?;
             let old = decision_json(tx, &actor, id)?;
             actor.require(perm::DECISION_FINALISE)?;
+            require_material_access(tx, &actor, &old)?;
             idempotent(tx, &actor, &key, "decision.amend", &(id, &req), || {
                 if old["status"].as_str() != Some("finalised") {
                     return Err(AppError::invalid_transition("Only a finalised decision can be amended."));
@@ -509,7 +527,7 @@ async fn amend(ctx: Ctx, Path(id): Path<i64>, IdemKey(key): IdemKey, JsonBody(re
                         .details(json!({ "amends_decision_id": id, "amendment_basis": basis })),
                 )?;
                 decision_json(tx, &actor, new_id)
-            })
+            }, |stored| decision_json(tx, &actor, replay_id(&stored, "/id")?))
         })
         .await?;
     Ok(Json(v))

@@ -400,12 +400,17 @@ async fn f13_t04_t15_document_replay_survives_case_closing() {
         .unwrap();
     let (s, retry) = c.upload_idem(&path, "closed-upload", &fields, "DEMO.pdf", &bytes).await;
     ok(s, &retry);
-    assert_eq!(doc, retry);
+    // A replay re-renders the same document as it is now (the later version included), without
+    // creating anything.
+    assert_eq!(retry["id"], doc["id"]);
+    assert_eq!(retry["version_count"], 2);
     let (s, retry) = c
         .upload_idem(&vpath, "closed-version", &[("note", "DEMO correction")], "DEMO.pdf", &bytes)
         .await;
     ok(s, &retry);
-    assert_eq!(version, retry);
+    assert_eq!(retry["id"], version["id"]);
+    assert_eq!(retry["versions"], version["versions"]);
+    assert_eq!(retry["version_count"], 2);
 }
 
 #[tokio::test]
@@ -438,7 +443,10 @@ async fn f13_t02_t04_intake_register_link_and_upload_retries_survive_linking() {
     assert_eq!(event_count(&c, &app, "case.registered", cid), 1);
     let (s, retry) = c.upload_idem(&path, "intake-upload", &fields, "DEMO.pdf", &bytes).await;
     ok(s, &retry);
-    assert_eq!(doc, retry);
+    // Same record, now shown under the registered case.
+    assert_eq!(retry["id"], doc["id"]);
+    assert_eq!(retry["versions"], doc["versions"]);
+    assert_eq!(retry["case_id"], cid);
     assert_eq!(event_count(&c, &app, "document.uploaded", doc["id"].as_i64().unwrap()), 1);
     let id = new_intake(&c, "DEMO link retry").await;
     replay(&c, &format!("/api/intakes/{id}/link"), "intake-link", json!({"case_id":cid,"note":"DEMO link"})).await;

@@ -129,7 +129,7 @@ accounts with `tuvalu-court create-user` and assign permissions individually.
 | Persona | Role | Can do |
 |---|---|---|
 | Olga Marsh | Registry clerk | Intake, register cases, schedule hearings, tasks, documents, dispatch, close cases, reports, case export |
-| Elena Brooks | Head of registry | Assign staff and the judge, view all non-restricted cases, grant restricted-document access, override hearing conflicts, reopen cases, import, audit view |
+| Elena Brooks | Head of registry | Assign staff and the judge, view all non-restricted cases, correct contact details (`party.edit`), grant restricted-document access, override hearing conflicts, reopen cases, import, audit view |
 | Viktor Hale | Judge | Sees assigned cases; records hearing outcomes; drafts/finalises decisions; private judicial notes; records service assessment |
 | Sergei Novak | Hearings & service officer | Schedules hearings, manages dispatches and tasks; no restricted files or judicial notes |
 | Pavel Stone | Technical administrator | Manages users and settings; **no** access to cases, files or judicial notes |

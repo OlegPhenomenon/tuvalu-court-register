@@ -5,7 +5,7 @@
 
 use super::common::{JsonBody, JsonResult, optional, query_json, query_one_json, reason, required};
 use crate::audit::{self, Event};
-use crate::auth::{Actor, Ctx, IdemKey, idempotent};
+use crate::auth::{Actor, Ctx, IdemKey, idempotent, replay_id};
 use crate::error::{AppError, AppResult};
 use crate::policy::{self, perm};
 use crate::state::AppState;
@@ -210,7 +210,7 @@ async fn create(ctx: Ctx, Path(id): Path<i64>, IdemKey(key): IdemKey, JsonBody(r
                     },
                 )?;
                 task_json(tx, tid)
-            })
+            }, |stored| require_task(tx, &actor, replay_id(&stored, "/id")?))
         })
         .await?;
     Ok(Json(v))
@@ -273,7 +273,7 @@ async fn update(ctx: Ctx, Path(id): Path<i64>, IdemKey(key): IdemKey, JsonBody(r
                     .details(json!({ "before": current })),
                 )?;
                 task_json(tx, id)
-            })
+            }, |_| require_task(tx, &actor, id))
         })
         .await?;
     Ok(Json(v))
@@ -332,7 +332,7 @@ async fn complete(ctx: Ctx, Path(id): Path<i64>, IdemKey(key): IdemKey, JsonBody
                         .details(json!({ "result": result })),
                 )?;
                 task_json(tx, id)
-            })
+            }, |_| require_task(tx, &actor, id))
         })
         .await?;
     Ok(Json(v))
@@ -367,7 +367,7 @@ async fn cancel(ctx: Ctx, Path(id): Path<i64>, IdemKey(key): IdemKey, JsonBody(r
                     .details(json!({ "reason": why })),
                 )?;
                 task_json(tx, id)
-            })
+            }, |_| require_task(tx, &actor, id))
         })
         .await?;
     Ok(Json(v))
@@ -398,7 +398,7 @@ async fn carry_forward(ctx: Ctx, Path(id): Path<i64>, IdemKey(key): IdemKey, Jso
                     .details(json!({ "reason": why })),
                 )?;
                 task_json(tx, id)
-            })
+            }, |_| require_task(tx, &actor, id))
         })
         .await?;
     Ok(Json(v))

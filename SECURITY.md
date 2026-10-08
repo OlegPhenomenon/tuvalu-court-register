@@ -199,7 +199,14 @@ software was delivered by.
 
 Command keys belong to the authenticated user and bind the operation, target and request hash.
 The action, audit event and stored response commit atomically. A replay rechecks current object
-visibility and permissions; state changes such as closing or registering cannot duplicate a committed upload.
+visibility and permissions and never runs the action again; its response is rebuilt from the current
+records under the caller's current access, so metadata the caller has since lost (a revoked document
+grant, an ended assignment) is not returned from the stored copy. State changes such as closing or
+registering cannot duplicate a committed upload.
+`case.view_all` is read-only: party contact corrections need `case.edit`, `intake.manage` or the explicit
+`party.edit` permission, and `POST /parties` needs `intake.manage`, `case.register`, `case.edit` or
+`dispatch.manage`. Editing, withdrawing, finalising or amending a decision requires access to its bound
+document version.
 Multipart requests bind metadata and file SHA-256. Closing evidence must be visible, belong to the
 case and use a clean version; judicial notes are excluded. The evidence picker uses the same policy.
 Case cards and closure audit details redact evidence IDs when the viewer cannot see their document.

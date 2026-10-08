@@ -16,6 +16,7 @@ pub mod perm {
     pub const CASE_VIEW_ALL: &str = "case.view_all";
     pub const CASE_VIEW_RESTRICTED: &str = "case.view_restricted";
     pub const CASE_EDIT: &str = "case.edit";
+    pub const PARTY_EDIT: &str = "party.edit";
     pub const CASE_ASSIGN_STAFF: &str = "case.assign_staff";
     pub const CASE_ASSIGN_JUDGE: &str = "case.assign_judge";
     pub const CASE_CLOSE: &str = "case.close";
@@ -45,6 +46,7 @@ pub mod perm {
         (CASE_VIEW_ALL, "See all non-restricted cases"),
         (CASE_VIEW_RESTRICTED, "See restricted cases without being assigned"),
         (CASE_EDIT, "Edit case details and participants"),
+        (PARTY_EDIT, "Correct contact details of people and organisations on cases you can see"),
         (CASE_ASSIGN_STAFF, "Assign or remove registry staff on a case"),
         (CASE_ASSIGN_JUDGE, "Assign or remove the judge on a case"),
         (CASE_CLOSE, "Close a case with a basis"),
@@ -72,7 +74,7 @@ pub mod perm {
     /// so a technical administrator cannot escalate himself into the judiciary; those must be
     /// granted from the command line (`tuvalu-court grant`) by the court's appointed authority.
     pub const ADMIN_GRANTABLE: &[&str] = &[
-        INTAKE_MANAGE, CASE_REGISTER, CASE_EDIT, CASE_CLOSE, HEARING_SCHEDULE, TASK_MANAGE, DOCUMENT_MANAGE,
+        INTAKE_MANAGE, CASE_REGISTER, CASE_EDIT, PARTY_EDIT, CASE_CLOSE, HEARING_SCHEDULE, TASK_MANAGE, DOCUMENT_MANAGE,
         DISPATCH_MANAGE, REPORT_VIEW, EXPORT_CASE, ADMIN_SETTINGS,
     ];
 }
@@ -286,10 +288,11 @@ pub fn party_shared(conn: &Connection, actor: &Actor, id: i64) -> AppResult<bool
     )?)
 }
 
+/// Writing a contact record needs an explicit write permission; `case.view_all` is read-only.
 pub fn can_edit_party(conn: &Connection, actor: &Actor, id: i64) -> AppResult<bool> {
     Ok((actor.has(perm::CASE_EDIT)
         || actor.has(perm::INTAKE_MANAGE)
-        || actor.has(perm::CASE_VIEW_ALL))
+        || actor.has(perm::PARTY_EDIT))
         && !party_shared(conn, actor, id)?)
 }
 

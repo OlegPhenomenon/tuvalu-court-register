@@ -276,7 +276,7 @@ function EditParticipationModal({ participant: p, caseId, onClose, onSaved }: { 
 
 export default function ParticipantsTab({ caseId, caseData, reload }: CaseTabProps) {
   const { hasPerm } = useSession();
-  const canCorrectContacts = hasPerm('case.edit') || hasPerm('intake.manage') || hasPerm('case.view_all');
+  const canCorrectContacts = hasPerm('case.edit') || hasPerm('intake.manage') || hasPerm('party.edit');
   const { data: ref, error: refError, reload: reloadRef } = useRefData();
   const allowed = caseData.allowed;
   const [addOpen, setAddOpen] = useState(false);

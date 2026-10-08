@@ -189,9 +189,10 @@ function DecisionsTabContent(props: CaseTabProps) {
       {!decisions.loading && !decisions.error && items.length === 0 && <p className="muted">No decisions on this case yet.</p>}
     </Card>
     {items.map((d) => <div id={`decision-${d.id}`} key={d.id}><Card title={<>{d.title} <StatusBadge status={d.status} /></>} actions={<>
-      {d.status === 'draft' && canDraft && <><Button variant="secondary" onClick={() => setForm({ mode: 'edit', decision: d })}>Edit draft</Button><Button variant="secondary" onClick={() => { setError(null); setWithdrawKey(newKey()); setWithdraw(d); }}>Withdraw draft</Button></>}
-      {d.status === 'draft' && canFinalise && <Button onClick={() => setForm({ mode: 'finalise', decision: d })}>Finalise</Button>}
-      {d.status === 'finalised' && canFinalise && <Button variant="secondary" onClick={() => setForm({ mode: 'amend', decision: d })}>Amend finalised</Button>}
+      {d.status === 'draft' && canDraft && !d.restricted && <><Button variant="secondary" onClick={() => setForm({ mode: 'edit', decision: d })}>Edit draft</Button><Button variant="secondary" onClick={() => { setError(null); setWithdrawKey(newKey()); setWithdraw(d); }}>Withdraw draft</Button></>}
+      {d.status === 'draft' && canFinalise && !d.restricted && <Button onClick={() => setForm({ mode: 'finalise', decision: d })}>Finalise</Button>}
+      {d.status === 'finalised' && canFinalise && !d.restricted && <Button variant="secondary" onClick={() => setForm({ mode: 'amend', decision: d })}>Amend finalised</Button>}
+      {d.restricted && (canDraft || canFinalise) && ['draft', 'finalised'].includes(d.status) && <span className="muted">You need access to the bound document to change this decision.</span>}
     </>}>
       <dl className="doc-meta">
         <div><dt>Decision date</dt><dd>{d.decision_date ? fmtDate(d.decision_date) : 'Not recorded'}</dd></div>

@@ -79,9 +79,12 @@ JSON `{"error":{"code":"snake_case","message":"Human readable","details":{}}}`.
   task create/update/complete/cancel/carry-forward; document upload/new-version; party creation, participant addition/ending and
   representation edits; hearing schedule and outcome; decision create/amend/withdraw/finalise; dispatch create/queue/record-sent/confirm/assess.
   Keys bind the actor, operation, target and request hash (multipart: metadata, sanitized filename and file SHA-256). Same key + same
-  request replays the stored response (never a second case number / decision / attempt); a changed request returns 409
-  `idempotency_mismatch`. Replays recheck current visibility and permissions first. Each opened UI form/dialog keeps one key
-  through retries; a new deliberate command uses a new key.
+  request never runs the action again (never a second case number / decision / attempt); a changed request returns 409
+  `idempotency_mismatch`. Replays recheck current visibility and permissions first, then rebuild the response from the current
+  records through the same access-checked serializer as a fresh request (`idempotent(…, op, replay)`): the stored result is used
+  only to locate the records (ids), so a revoked grant or ended assignment never resurfaces through a stored response. Only ids,
+  dates and fixed server notes are carried over. A replay therefore shows the record as it is now (e.g. a queued dispatch that
+  has since been sent). Each opened UI form/dialog keeps one key through retries; a new deliberate command uses a new key.
 - Every response for private data: `Cache-Control: no-store, private`.
 
 ## 3. Time
@@ -102,6 +105,7 @@ JSON `{"error":{"code":"snake_case","message":"Human readable","details":{}}}`.
 | `case.view_all` | see all non-restricted cases |
 | `case.view_restricted` | see restricted cases without assignment |
 | `case.edit` | edit case card, participants |
+| `party.edit` | correct contact records of people/organisations linked to visible records (no other case edits) |
 | `case.assign_staff` | assign/unassign non-judge staff |
 | `case.assign_judge` | assign/unassign judge (separate from registry head role) |
 | `case.close` / `case.reopen` | close with basis / reopen with reason |
@@ -123,7 +127,7 @@ JSON `{"error":{"code":"snake_case","message":"Human readable","details":{}}}`.
 | `admin.settings` | rooms, registries, reference lists, templates, settings |
 
 Personas (demo): **Olga** (clerk): intake.manage, case.register, case.edit, hearing.schedule, task.manage, document.manage, dispatch.manage, case.close, report.view, export.case.
-**Elena** (registry head): case.view_all, case.assign_staff, case.assign_judge, case.reopen, case.close, report.view, audit.view, import.run, export.case, document.grant_restricted, hearing.override_conflict.
+**Elena** (registry head): case.view_all, party.edit, case.assign_staff, case.assign_judge, case.reopen, case.close, report.view, audit.view, import.run, export.case, document.grant_restricted, hearing.override_conflict.
 **Viktor** (judge): decision.draft, decision.finalise, hearing.record_outcome, hearing.admin_correct, task.manage, dispatch.assess_service; sees cases where assigned.
 **Sergei** (service officer): dispatch.manage, hearing.schedule, task.manage.
 **Pavel** (tech admin): admin.users, admin.settings — **no case access, no judicial notes, cannot delete audit.**
@@ -151,7 +155,9 @@ Party directory list/search/detail and same-name warnings follow case/intake vis
 as a participant, representative, intake sender, document source or dispatch recipient to a visible record. An unlinked
 party is visible only to its creator. Hidden contacts return 404, including when submitted as an existing party id.
 Contact writes require visibility of **every** linked case/intake and one of `case.edit`, `intake.manage` or
-`case.view_all`. The registry head can correct a contact shared across visible cases without `case.edit`.
+`party.edit`. `case.view_all` is read-only: it shows the directory and contacts but never permits a contact write or
+`POST /parties` (which needs `intake.manage`, `case.register`, `case.edit` or `dispatch.manage`). The registry head
+holds `party.edit` to correct a contact shared across visible cases without `case.edit`.
 If any linked record is hidden, PATCH returns `409 party_shared` with the neutral message "This person is linked to
 records you cannot access; ask the registry head"; GET returns `editable:false` and `edit_blocked_reason:"party_shared"`.
 The contact editor shows that explanation instead of a form. Hidden record identities are never included.
@@ -163,6 +169,11 @@ Decision list/detail responses check the exact bound document version. Without d
 `document_id`, `filename`, `sha256`, `version_no`, `status_reason` and `amendment_basis` are omitted. History/audit
 summaries and draft-decision prompts/closure blockers are neutral. Old decision events resolve the document version
 bound at that time from draft-edit snapshots, so replacing a restricted draft does not disclose its old metadata.
+Changing a decision needs access to the exact document version it is bound to: edit, withdraw, finalise and amend
+return 403 when the actor cannot open that version (finalising an amendment also needs access to the decision it
+supersedes). A generic `decision.draft`/`decision.finalise` permission never manages hidden material, so a hidden
+draft cannot be declassified by swapping its attachment. The Decisions tab hides those actions on restricted cards
+and explains why; the server check is authoritative.
 Case history includes received/completed/supplemented/registered events and information-request events from linked
 intakes and their supplements, with original timestamps/authors and no duplicate event ids. Document redaction also
 applies to those earlier events. Global audit details undergo recursive document redaction for references in any
