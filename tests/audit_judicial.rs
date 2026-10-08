@@ -634,3 +634,60 @@ async fn f07_t13_schema_upgrade_preserves_existing_dispatch_history() {
             .unwrap()
     );
 }
+
+#[tokio::test]
+async fn f13_service_assessment_retry_records_once_and_rechecks_access() {
+    let app = TestApp::demo();
+    let (o, v, cid, _) = setup(&app).await;
+    let d = post(
+        &o,
+        &format!("/api/cases/{cid}/dispatches"),
+        json!({"kind":"notice","recipient_name":"DEMO recipient","method":"hand","subject":"DEMO service","body":"DEMO notice"}),
+    )
+    .await;
+    post(&o, &format!("/api/dispatches/{}/preview", d["id"]), json!({})).await;
+    post(
+        &o,
+        &format!("/api/dispatches/{}/record-sent", d["id"]),
+        json!({"occurred_date":today(),"note":"DEMO handed over"}),
+    )
+    .await;
+    let path = format!("/api/dispatches/{}/assess", d["id"]);
+    let body = json!({"assessment":"served","basis":"DEMO signed receipt"});
+    let (s, first) = v.post_idem(&path, "service-assess", body.clone()).await;
+    ok(s, &first);
+    let (s, retry) = v.post_idem(&path, "service-assess", body.clone()).await;
+    ok(s, &retry);
+    assert_eq!(first, retry);
+    assert_eq!(retry["assessments"].as_array().unwrap().len(), 1);
+    let (s, b) = v
+        .post_idem(&path, "service-assess", json!({"assessment":"not_served","basis":"DEMO signed receipt"}))
+        .await;
+    err(s, &b, StatusCode::CONFLICT, "idempotency_mismatch");
+    let conn = o.db(&app).open().unwrap();
+    let did = d["id"].as_i64().unwrap();
+    let count: i64 = conn
+        .query_row(
+            "SELECT COUNT(*) FROM audit_events WHERE action='dispatch.assessed' AND entity_id=?1",
+            [did],
+            |r| r.get(0),
+        )
+        .unwrap();
+    assert_eq!(count, 1);
+    let (s, b) = o.post_idem(&path, "service-assess", body.clone()).await;
+    err(s, &b, StatusCode::FORBIDDEN, "forbidden");
+    conn.execute(
+        "DELETE FROM user_permissions WHERE user_id=?1 AND permission='dispatch.assess_service'",
+        [user_id(&v, "Viktor").await],
+    )
+    .unwrap();
+    let (s, b) = v.post_idem(&path, "service-assess", body.clone()).await;
+    err(s, &b, StatusCode::FORBIDDEN, "forbidden");
+    conn.execute(
+        "UPDATE case_assignments SET end_at=?2 WHERE case_id=?1 AND role='judge'",
+        rusqlite::params![cid, tuvalu_court::time::now_utc()],
+    )
+    .unwrap();
+    let (s, b) = v.post_idem(&path, "service-assess", body).await;
+    err(s, &b, StatusCode::NOT_FOUND, "not_found");
+}

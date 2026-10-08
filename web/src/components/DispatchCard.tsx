@@ -291,7 +291,7 @@ export function DispatchCard({ dispatch, showContext, onChanged }: {
       api<DispatchRecord>('POST', `/dispatches/${d.id}/assess`, {
         assessment,
         basis,
-      }),
+      }, { idempotencyKey: commandKey }),
     );
 
   const cancel = (reason: string) =>

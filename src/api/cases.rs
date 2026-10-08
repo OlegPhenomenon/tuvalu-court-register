@@ -328,19 +328,22 @@ fn action(code: &str, message: String, link: String) -> Value {
     json!({ "code": code, "message": message, "link": link })
 }
 
-/// Existing planned work, independent of whether a person needs to act immediately.
+/// Recorded planned or pending work, independent of urgency and document visibility.
+/// Callers still require case access; private decision details remain redacted in prompts.
 pub fn has_next_step(c: &Connection, actor: &Actor, case_id: i64) -> AppResult<bool> {
     policy::require_case(c, actor, case_id)?;
-    let sql = format!(
-        "SELECT status <> 'closed' AND (
-        EXISTS(SELECT 1 FROM hearings WHERE case_id=?1 AND status='scheduled' AND ends_at > ?2)
+    let sql = "SELECT status <> 'closed' AND (
+        status='reopened'
+        OR EXISTS(SELECT 1 FROM hearings WHERE case_id=?1 AND (
+            status='draft' OR (status='scheduled' AND (ends_at > ?2 OR outcome_recorded_at IS NULL))))
         OR EXISTS(SELECT 1 FROM tasks WHERE case_id=?1 AND status='open')
-        OR EXISTS(SELECT 1 FROM dispatches WHERE case_id=?1 AND status IN ('draft','queued','failed'))
-        OR EXISTS(SELECT 1 FROM decisions dc JOIN documents doc ON doc.id=dc.document_id
-            WHERE dc.case_id=?1 AND dc.status='draft' AND {})) FROM cases WHERE id=?1",
-        policy::document_visible_sql(actor, "doc")
-    );
-    Ok(c.query_row(&sql, params![case_id, crate::time::now_utc()], |r| r.get(0))?)
+        OR EXISTS(SELECT 1 FROM dispatches d WHERE d.case_id=?1 AND (
+            d.status IN ('draft','queued','failed') OR (d.status='sent' AND (
+                NOT EXISTS(SELECT 1 FROM delivery_confirmations WHERE dispatch_id=d.id AND kind='human_handover')
+                OR NOT EXISTS(SELECT 1 FROM service_assessments WHERE dispatch_id=d.id)))))
+        OR EXISTS(SELECT 1 FROM decisions WHERE case_id=?1 AND status='draft'))
+        FROM cases WHERE id=?1";
+    Ok(c.query_row(sql, params![case_id, crate::time::now_utc()], |r| r.get(0))?)
 }
 
 /// Plain-language next steps for a case, computed from its records (spec §5: explain the next step,
@@ -384,6 +387,17 @@ pub fn next_actions(c: &Connection, actor: &Actor, case_id: i64) -> AppResult<Ve
             format!("{base}?tab=hearings&hearing={}", h["id"]),
         ));
     }
+    for h in query_json(
+        c,
+        "SELECT id FROM hearings WHERE case_id=?1 AND status='draft' ORDER BY starts_at",
+        [case_id],
+    )? {
+        out.push(action(
+            "confirm_hearing",
+            "Review and confirm the draft hearing.".into(),
+            format!("{base}?tab=hearings&hearing={}", h["id"]),
+        ));
+    }
     if !has_next_step(c, actor, case_id)? {
         out.push(action(
             "plan_next_step",
@@ -394,7 +408,7 @@ pub fn next_actions(c: &Connection, actor: &Actor, case_id: i64) -> AppResult<Ve
     // Hearings that ended but have no outcome.
     for h in query_json(
         c,
-        "SELECT id, starts_at FROM hearings WHERE case_id = ?1 AND status = 'scheduled' AND ends_at <= ?2 ORDER BY starts_at",
+        "SELECT id, starts_at FROM hearings WHERE case_id = ?1 AND status = 'scheduled' AND ends_at <= ?2 AND outcome_recorded_at IS NULL ORDER BY starts_at",
         params![case_id, now],
     )? {
         let when = crate::time::utc_to_local(h["starts_at"].as_str().unwrap_or_default());
@@ -454,7 +468,19 @@ pub fn next_actions(c: &Connection, actor: &Actor, case_id: i64) -> AppResult<Ve
                     } else {
                         format!("Confirm that the {what} “{}” reached {who}.", d["subject"].as_str().unwrap_or_default())
                     };
-                    out.push(action("confirm_delivery", message, link));
+                    out.push(action("confirm_delivery", message, link.clone()));
+                }
+                let assessed: bool = c.query_row(
+                    "SELECT EXISTS (SELECT 1 FROM service_assessments WHERE dispatch_id = ?1)",
+                    [d["id"].as_i64()],
+                    |r| r.get(0),
+                )?;
+                if !assessed {
+                    out.push(action(
+                        "assess_service",
+                        format!("Record the legal assessment of service of the {what} to {who}."),
+                        link,
+                    ));
                 }
             }
             _ => {}
@@ -882,6 +908,15 @@ async fn close(ctx: Ctx, Path(id): Path<i64>, IdemKey(key): IdemKey, JsonBody(re
                     Some(d) if !d.trim().is_empty() => crate::time::parse_date(d)?,
                     _ => crate::time::today_local(),
                 };
+                let latest_status_date: Option<String> = tx.query_row(
+                    "SELECT MAX(effective_date) FROM case_status_history WHERE case_id=?1",
+                    [id],
+                    |r| r.get(0),
+                )?;
+                if latest_status_date.as_deref().is_some_and(|latest| date.as_str() < latest) {
+                    return Err(AppError::validation("Closed date cannot precede the latest case status change.")
+                        .with_details(json!({"field":"closed_date"})));
+                }
                 validate_closing_basis(tx, &actor, id, &req, &date)?;
                 record_status(tx, &actor, id, &case.status, "closed", note.as_deref(), Some(&req.basis), &date)?;
                 tx.execute(

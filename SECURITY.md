@@ -222,3 +222,10 @@ id, and refuse an absent/uninitialised source database. Restore reads the existi
 DB inside an authenticated backup and requires explicit confirmation before writing
 a new/empty destination. Installation ids survive restore. Keep env files, data,
 backups and keys private; see `docs/OPERATIONS.md` for absolute-path commands.
+
+Service-assessment retries use the same command-key contract: a matching key replays one committed
+assessment and audit event, while a changed body returns `409 idempotency_mismatch`. Replay rechecks
+current dispatch access and assessment permission. The recorded-next-step predicate is independent of
+document visibility for visible cases; prompts still redact private draft decision titles and document IDs.
+Closure commands reject dates before the latest status history effective date, and case import revalidates
+future closure dates at preview and commit using the court's date.

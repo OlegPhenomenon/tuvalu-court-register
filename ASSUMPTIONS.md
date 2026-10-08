@@ -130,3 +130,8 @@ an immediate button to press. Period dates apply to event metrics, while this me
 - New/reset passwords are temporary: all records APIs are blocked until own-password
   change. Own changes require fresh TOTP when enabled, revoke other sessions and
   retain MFA. Technical admins cannot reset protected judicial accounts.
+
+Recorded next steps include awaiting a hearing outcome, confirming a draft hearing, pending handover or
+service assessment, and deciding the status after reopening. Draft decisions count even when their
+private documents are hidden from the viewer. This is a registry workflow metric, not a legal conclusion.
+A new closure cannot precede the latest effective status date; imported closures cannot be in the future.

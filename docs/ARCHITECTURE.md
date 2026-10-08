@@ -77,7 +77,7 @@ JSON `{"error":{"code":"snake_case","message":"Human readable","details":{}}}`.
 - Idempotency: `Idempotency-Key` header (client UUID), stored in `operation_keys` in the same transaction as the action.
   Supported on: intake create/request-info/mark-ready/supplement/return/mark-duplicate/link/register; case close/reopen/relation;
   task create/update/complete/cancel/carry-forward; document upload/new-version; party creation, participant addition/ending and
-  representation edits; hearing schedule and outcome; decision create/amend/withdraw/finalise; dispatch create/queue/record-sent/confirm.
+  representation edits; hearing schedule and outcome; decision create/amend/withdraw/finalise; dispatch create/queue/record-sent/confirm/assess.
   Keys bind the actor, operation, target and request hash (multipart: metadata, sanitized filename and file SHA-256). Same key + same
   request replays the stored response (never a second case number / decision / attempt); a changed request returns 409
   `idempotency_mismatch`. Replays recheck current visibility and permissions first. Each opened UI form/dialog keeps one key
@@ -189,10 +189,10 @@ Closing requires exactly one explicit evidence reference: `basis_document_versio
 Without a held hearing, a basis document must belong to the case, be visible to the actor, clean and not a judicial note;
 a finalised decision with a visible, clean case document is also allowed. Basis `decided`, or a case with a held hearing,
 requires a finalised decision or a held hearing with a recorded outcome. `closed_date` is a court date, no earlier than
-registration and the evidence date, and no later than today. Undated documents use their received date, then court-local creation date.
+registration, the evidence date and the latest case status history effective date, and no later than today. Undated documents use their received date, then court-local creation date.
 Evidence IDs are kept on the case and in the closure audit event; reopening keeps prior evidence and status history.
 `GET /cases/:id/closing-bases` (requires case.close) returns `{items:[{kind:"document"|"decision"|"hearing",id,date,label}]}`
-filtered through document policy. The closing dialog selects exact evidence and date and retains validation errors.
+filtered through document policy. The closing dialog selects exact evidence and date and retains validation errors; its minimum date is the latest of registration, evidence and status history dates.
 Close/reopen and task completion accept `version`; when supplied, stale versions return 409 `version_conflict`. The UI sends it.
 Older command clients without a version remain compatible; ordinary PATCH always requires a version.
 
@@ -257,9 +257,14 @@ kind, recipient and document count instead of repeating the subject's court name
 Mailbox attachments include `document_version_id`. Missing/unknown versions are redacted instead of causing a 404.
 Report drill-down rows keep codes and add `category_label`, `status_label`, `closure_basis_label` (when applicable);
 display/CSV columns use labels. `without_next_step` is a current snapshot, independent of report period dates and UI prompts. It counts open visible cases
-with no scheduled hearing still ahead/in progress, open task, draft/queued/failed dispatch, or visible draft decision.
-The same predicate drives summary hint `plan_next_step`; a future hearing produces `scheduled_hearing`, and queued
-messages produce `queued_dispatch`. Counts, drill-down and CSV use the same filtered rows.
+with no recorded next step. One shared predicate counts future/in-progress scheduled hearings, ended scheduled
+hearings awaiting a recorded outcome, draft hearings awaiting confirmation, open tasks, draft/queued/failed
+dispatches, sent dispatches awaiting human handover or a service assessment, draft decisions, and a reopened
+case awaiting a status decision. This predicate is independent of the viewer's document visibility, while cases
+remain filtered through case policy and private decision prompts remain neutral. It drives `plan_next_step`
+in the summary and work queue as well as report counts, drill-down and CSV. Pending draft hearings produce
+`confirm_hearing`, pending service assessments produce `assess_service`, future hearings produce
+`scheduled_hearing`, and queued messages produce `queued_dispatch`.
 Intake references use the numeric maximum of fully parsed suffixes for the configured prefix/year inside BEGIN IMMEDIATE;
 formatting uses at least four digits, including 9999 → 10000 → 10001. Existing references stay unchanged.
 
@@ -370,3 +375,9 @@ enrolled. It clears the flag, rotates the current session, revokes all other
 sessions and preserves TOTP. CLI-created and admin-reset accounts set the flag.
 Every production user can change their own password in Settings. Protected-account
 reset rules remain enforced server-side.
+
+Legacy case CSV preview rejects closure dates after today in Pacific/Funafuti. Commit runs the same date
+validation again, so an older preview cannot publish a future closure (`409 import_changed`); valid historical
+closures remain supported. `POST /dispatches/:id/assess {assessment,basis}` accepts `Idempotency-Key`,
+rechecks dispatch visibility and assessment permission before replay, and atomically stores the assessment,
+audit event and response. The UI retains one key per opened assessment form through retries.

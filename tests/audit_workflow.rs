@@ -541,3 +541,223 @@ async fn f11_t16_t24_t27_restricted_closure_evidence_is_redacted_for_other_case_
     let (_, own) = c.get(&format!("/api/cases/{cid}")).await;
     assert_eq!(own["case"]["basis_document_version_id"], vid);
 }
+
+async fn f15_assert_step_views(c: &Client, cid: i64, has_step: bool, action: Option<&str>) {
+    let (s, report) = c.get("/api/reports/without_next_step/items").await;
+    ok(s, &report);
+    let rows = report["rows"].as_array().unwrap();
+    assert_eq!(rows.iter().any(|r| r["id"] == cid), !has_step, "{report}");
+    let (s, summary) = c.get("/api/reports/summary").await;
+    ok(s, &summary);
+    let metric = summary["metrics"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|m| m["key"] == "without_next_step")
+        .unwrap();
+    assert_eq!(metric["count"].as_u64().unwrap() as usize, rows.len());
+    let (s, detail) = c.get(&format!("/api/cases/{cid}")).await;
+    ok(s, &detail);
+    let actions = detail["next_actions"].as_array().unwrap();
+    assert_eq!(actions.iter().any(|a| a["code"] == "plan_next_step"), !has_step, "{detail}");
+    if let Some(code) = action {
+        assert!(actions.iter().any(|a| a["code"] == code), "{detail}");
+    }
+    let (s, queue) = c.get("/api/queue").await;
+    ok(s, &queue);
+    let case_items: Vec<_> = queue["items"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .filter(|i| i["case_number"] == detail["case"]["number"])
+        .collect();
+    assert_eq!(
+        case_items
+            .iter()
+            .any(|i| i["message"].as_str().unwrap_or_default().starts_with("No next step is recorded.")),
+        !has_step
+    );
+}
+
+async fn f15_hearing_step(status: &str, start: &str, end: &str, action: &str) {
+    let app = TestApp::demo();
+    let c = app.persona("olga").await;
+    let (cid, _) = register_case(&c, "DEMO pending hearing").await;
+    let conn = c.db(&app).open().unwrap();
+    conn.execute(
+        "INSERT INTO hearings(case_id,hearing_type,status,starts_at,ends_at,created_by,created_at)
+        VALUES(?1,'directions',?2,?3,?4,?5,?6)",
+        params![cid, status, start, end, user_id(&c, "Olga").await, tuvalu_court::time::now_utc()],
+    )
+    .unwrap();
+    f15_assert_step_views(&c, cid, true, Some(action)).await;
+    conn.execute("UPDATE hearings SET status='cancelled' WHERE case_id=?1", [cid]).unwrap();
+    f15_assert_step_views(&c, cid, false, None).await;
+}
+
+#[tokio::test]
+async fn f15_ended_hearing_awaiting_outcome_agrees_across_views() {
+    f15_hearing_step("scheduled", "2000-01-01T00:00:00Z", "2000-01-01T01:00:00Z", "record_outcome").await;
+}
+
+#[tokio::test]
+async fn f15_draft_hearing_awaiting_confirmation_agrees_across_views() {
+    f15_hearing_step("draft", "2099-01-01T00:00:00Z", "2099-01-01T01:00:00Z", "confirm_hearing").await;
+}
+
+#[tokio::test]
+async fn f15_reopened_case_awaiting_status_agrees_across_views() {
+    let app = TestApp::demo();
+    let c = app.persona("olga").await;
+    let (cid, _) = register_case(&c, "DEMO reopened workflow").await;
+    let vid = basis(&c, &app, cid, user_id(&c, "Olga").await);
+    let (s, b) = c
+        .post(
+            &format!("/api/cases/{cid}/close"),
+            json!({"basis":"settled","basis_document_version_id":vid}),
+        )
+        .await;
+    ok(s, &b);
+    let e = c.switch("elena").await;
+    let (s, b) = e.post(&format!("/api/cases/{cid}/reopen"), json!({"reason":"DEMO new filing"})).await;
+    ok(s, &b);
+    f15_assert_step_views(&c, cid, true, Some("decide_after_reopen")).await;
+}
+
+#[tokio::test]
+async fn f15_sent_dispatch_pending_handover_or_assessment_agrees_across_views() {
+    let app = TestApp::demo();
+    let c = app.persona("olga").await;
+    let (cid, _) = register_case(&c, "DEMO pending service").await;
+    let uid = user_id(&c, "Olga").await;
+    let conn = c.db(&app).open().unwrap();
+    conn.execute(
+        "INSERT INTO dispatches(case_id,kind,recipient_name,method,subject,body,status,prepared_by,prepared_at,sent_at)
+        VALUES(?1,'notice','DEMO recipient','hand','DEMO subject','DEMO message','sent',?2,?3,?3)",
+        params![cid, uid, tuvalu_court::time::now_utc()],
+    )
+    .unwrap();
+    let did = conn.last_insert_rowid();
+    f15_assert_step_views(&c, cid, true, Some("confirm_delivery")).await;
+    conn.execute(
+        "INSERT INTO delivery_confirmations(dispatch_id,kind,note,recorded_by,recorded_at)
+        VALUES(?1,'human_handover','DEMO received',?2,?3)",
+        params![did, uid, tuvalu_court::time::now_utc()],
+    )
+    .unwrap();
+    f15_assert_step_views(&c, cid, true, Some("assess_service")).await;
+    conn.execute(
+        "INSERT INTO service_assessments(dispatch_id,assessment,basis,assessed_by,assessed_at)
+        VALUES(?1,'served','DEMO receipt',?2,?3)",
+        params![did, uid, tuvalu_court::time::now_utc()],
+    )
+    .unwrap();
+    f15_assert_step_views(&c, cid, false, None).await;
+    conn.execute("DELETE FROM delivery_confirmations WHERE dispatch_id=?1", [did]).unwrap();
+    f15_assert_step_views(&c, cid, true, Some("confirm_delivery")).await;
+}
+
+#[tokio::test]
+async fn f15_hidden_draft_decision_still_counts_as_recorded_work() {
+    let app = TestApp::demo();
+    let c = app.persona("olga").await;
+    let (cid, _) = register_case(&c, "DEMO restricted draft work").await;
+    let judge = user_id(&c, "Viktor").await;
+    let (doc, vid) = insert_document(&c.db(&app), cid, "DEMO private draft title", "decision", "restricted", judge);
+    c.db(&app)
+        .open()
+        .unwrap()
+        .execute(
+            "INSERT INTO decisions(case_id,title,status,document_id,document_version_id,author_user_id,created_at)
+        VALUES(?1,'DEMO private draft title','draft',?2,?3,?4,?5)",
+            params![cid, doc, vid, judge, tuvalu_court::time::now_utc()],
+        )
+        .unwrap();
+    f15_assert_step_views(&c, cid, true, Some("finalise_decision")).await;
+    let (_, detail) = c.get(&format!("/api/cases/{cid}")).await;
+    assert!(!detail["next_actions"].to_string().contains("DEMO private draft title"));
+}
+
+#[tokio::test]
+async fn f11_reopen_rejects_backdated_close_and_preserves_open_as_of() {
+    let app = TestApp::demo();
+    let c = app.persona("olga").await;
+    let (cid, _) = register_case(&c, "DEMO closure chronology").await;
+    let conn = c.db(&app).open().unwrap();
+    conn.execute("UPDATE cases SET registered_date='2000-01-01' WHERE id=?1", [cid]).unwrap();
+    conn.execute("UPDATE case_status_history SET effective_date='2000-01-01' WHERE case_id=?1", [cid])
+        .unwrap();
+    let vid = basis(&c, &app, cid, user_id(&c, "Olga").await);
+    conn.execute(
+        "UPDATE documents SET document_date='2000-01-01' WHERE id=(SELECT document_id FROM document_versions WHERE id=?1)",
+        [vid],
+    )
+    .unwrap();
+    let close = format!("/api/cases/{cid}/close");
+    let (s, b) = c
+        .post(
+            &close,
+            json!({"basis":"settled","basis_document_version_id":vid,"closed_date":"2000-02-01"}),
+        )
+        .await;
+    ok(s, &b);
+    let e = c.switch("elena").await;
+    let (s, b) = e.post(&format!("/api/cases/{cid}/reopen"), json!({"reason":"DEMO reopen"})).await;
+    ok(s, &b);
+    let (s, b) = c
+        .post(
+            &close,
+            json!({"basis":"settled","basis_document_version_id":vid,"closed_date":"2000-03-01"}),
+        )
+        .await;
+    err(s, &b, StatusCode::BAD_REQUEST, "validation");
+    assert_eq!(b["error"]["details"]["field"], "closed_date");
+    assert_eq!(event_count(&c, &app, "case.closed", cid), 1);
+    let report = format!("/api/reports/open_as_of/items?as_of={}", today());
+    let (s, b) = c.get(&report).await;
+    ok(s, &b);
+    assert!(
+        b["rows"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|r| r["id"] == cid && r["state_as_of"] == "reopened")
+    );
+    let (s, b) = c
+        .post(&close, json!({"basis":"settled","basis_document_version_id":vid,"closed_date":today()}))
+        .await;
+    ok(s, &b);
+    let (s, b) = c.get(&report).await;
+    ok(s, &b);
+    assert!(!b["rows"].as_array().unwrap().iter().any(|r| r["id"] == cid));
+}
+
+#[tokio::test]
+async fn f11_import_future_closed_date_rejected_at_preview_and_commit() {
+    let app = TestApp::demo();
+    let c = app.persona("elena").await;
+    let csv = b"number,category,title,registered_date,status,responsible_username,closed_date,closure_basis,parties\nDEMO-CIV-2000-0999,civil_contract,DEMO future closure,2000-01-01,closed,,2099-01-01,settled,\n";
+    let (s, preview) = c.upload("/api/import/cases/preview", &[], "future.csv", csv).await;
+    ok(s, &preview);
+    let id = preview["batch_id"].as_i64().unwrap();
+    // Model a batch previewed by the old server before this validation was added.
+    let mut old = preview.clone();
+    old["rows"][0]["action"] = json!("create");
+    old["rows"][0]["problems"] = json!([]);
+    old["summary"] = json!({"create":1,"skip_existing":0,"error":0});
+    let conn = c.db(&app).open().unwrap();
+    conn.execute("UPDATE import_batches SET preview_json=?2 WHERE id=?1", params![id, old.to_string()])
+        .unwrap();
+    let (s, b) = c.post(&format!("/api/import/{id}/commit"), json!({})).await;
+    err(s, &b, StatusCode::CONFLICT, "import_changed");
+    assert_eq!(preview["rows"][0]["action"], "error");
+    assert!(
+        preview["rows"][0]["problems"]
+            .to_string()
+            .contains("Closed date cannot be in the future.")
+    );
+    let count: i64 = conn
+        .query_row("SELECT COUNT(*) FROM cases WHERE import_batch_id=?1", [id], |r| r.get(0))
+        .unwrap();
+    assert_eq!(count, 0);
+}
