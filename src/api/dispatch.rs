@@ -956,7 +956,7 @@ async fn confirm(ctx: Ctx, Path(id): Path<i64>, IdemKey(key): IdemKey, JsonBody(
     Ok(Json(v))
 }
 
-#[derive(Deserialize)]
+#[derive(Deserialize, Serialize)]
 struct AssessReq {
     assessment: String, // 'served' | 'not_served' | 'undetermined'
     basis: String,
@@ -964,33 +964,35 @@ struct AssessReq {
 
 /// The legal assessment of service, recorded separately by an authorised human. The register
 /// never computes it (and never derives deadlines from it).
-async fn assess(ctx: Ctx, Path(id): Path<i64>, JsonBody(req): JsonBody<AssessReq>) -> JsonResult {
+async fn assess(ctx: Ctx, Path(id): Path<i64>, IdemKey(key): IdemKey, JsonBody(req): JsonBody<AssessReq>) -> JsonResult {
     let actor = ctx.actor;
     let v = ctx
         .db
         .write(move |tx| {
             let d = dispatch_json(tx, &actor, id)?;
             require_dispatch_perm(&actor, &d, perm::DISPATCH_ASSESS_SERVICE)?;
-            if d["status"].as_str() != Some("sent") {
-                return Err(AppError::invalid_transition("Service can only be assessed after the dispatch was sent."));
-            }
-            if !matches!(req.assessment.as_str(), "served" | "not_served" | "undetermined") {
-                return Err(AppError::validation("Assessment must be 'served', 'not_served' or 'undetermined'."));
-            }
-            let basis = required(&req.basis, "Basis")?;
-            tx.execute(
-                "INSERT INTO service_assessments (dispatch_id, assessment, basis, assessed_by, assessed_at)
-                 VALUES (?1, ?2, ?3, ?4, ?5)",
-                params![id, req.assessment, basis, actor.user_id, crate::time::now_utc()],
-            )?;
-            audit::record(
-                tx,
-                Some(&actor),
-                Event::new("dispatch.assessed", "dispatch", id, format!("Service assessed as '{}'", req.assessment.replace('_', " ")))
-                    .case(d["case_id"].as_i64())
-                    .details(json!({ "assessment": req.assessment, "basis": basis })),
-            )?;
-            dispatch_json(tx, &actor, id)
+            idempotent(tx, &actor, &key, "dispatch.assess", &(id, &req), || {
+                if d["status"].as_str() != Some("sent") {
+                    return Err(AppError::invalid_transition("Service can only be assessed after the dispatch was sent."));
+                }
+                if !matches!(req.assessment.as_str(), "served" | "not_served" | "undetermined") {
+                    return Err(AppError::validation("Assessment must be 'served', 'not_served' or 'undetermined'."));
+                }
+                let basis = required(&req.basis, "Basis")?;
+                tx.execute(
+                    "INSERT INTO service_assessments (dispatch_id, assessment, basis, assessed_by, assessed_at)
+                     VALUES (?1, ?2, ?3, ?4, ?5)",
+                    params![id, req.assessment, basis, actor.user_id, crate::time::now_utc()],
+                )?;
+                audit::record(
+                    tx,
+                    Some(&actor),
+                    Event::new("dispatch.assessed", "dispatch", id, format!("Service assessed as '{}'", req.assessment.replace('_', " ")))
+                        .case(d["case_id"].as_i64())
+                        .details(json!({ "assessment": req.assessment, "basis": basis })),
+                )?;
+                dispatch_json(tx, &actor, id)
+            })
         })
         .await?;
     Ok(Json(v))

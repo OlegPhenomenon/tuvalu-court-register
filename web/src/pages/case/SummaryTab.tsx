@@ -214,10 +214,11 @@ function ChangeResponsibleModal({ caseData, onClose, onSaved }: {
 
 /* ------------------------------ close form ------------------------------ */
 
-function CloseCaseModal({ caseId, caseVersion, registeredDate, onClose, onSaved }: {
+function CloseCaseModal({ caseId, caseVersion, registeredDate, latestStatusDate, onClose, onSaved }: {
   caseId: number;
   caseVersion: number;
   registeredDate: string;
+  latestStatusDate: string;
   onClose: () => void;
   onSaved: () => void;
 }) {
@@ -350,7 +351,7 @@ function CloseCaseModal({ caseId, caseVersion, registeredDate, onClose, onSaved 
           }))} placeholder="Choose evidence for closing" required
           help="Without a hearing, choose a document of this case or a finalised decision. After a hearing, choose its recorded outcome or decision." />
         <DateField label="Closed date" value={closedDate} onChange={setClosedDate} required
-          min={selected && selected.date > registeredDate ? selected.date : registeredDate} max={courtToday()} />
+          min={[registeredDate, latestStatusDate, selected?.date ?? ''].sort().at(-1)} max={courtToday()} />
         <p className="muted">
           Closed in the register means the registry stage is complete. It is not proof that the
           decision was enforced or that appeal rights have expired.
@@ -788,7 +789,7 @@ export default function SummaryTab({ caseId, caseData, reload }: CaseTabProps) {
         <EditCaseModal key={modalTick} caseData={caseData} onClose={() => setModal(null)} onSaved={reload} />
       )}
       {modal === 'close' && (
-        <CloseCaseModal key={modalTick} caseId={caseId} caseVersion={c.version} registeredDate={c.registered_date} onClose={() => setModal(null)} onSaved={reload} />
+        <CloseCaseModal key={modalTick} caseId={caseId} caseVersion={c.version} registeredDate={c.registered_date} latestStatusDate={caseData.status_history.reduce((latest, h) => h.effective_date && h.effective_date > latest ? h.effective_date : latest, c.registered_date)} onClose={() => setModal(null)} onSaved={reload} />
       )}
       {modal === 'assign' && (
         <AssignModal

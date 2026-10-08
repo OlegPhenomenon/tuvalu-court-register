@@ -253,6 +253,8 @@ fn case_preview(
                 problems.push("Invalid closed date.".into());
             } else if r.closed_date < r.registered_date {
                 problems.push("Closed date precedes registration.".into());
+            } else if r.closed_date > crate::time::today_local() {
+                problems.push("Closed date cannot be in the future.".into());
             }
         }
         if !r.closure_basis.is_empty() {

@@ -225,3 +225,13 @@ registry head is Elena. Hidden record names are not displayed in the explanation
 
 Migration 0011 is applied at startup and adds the five party-link lookup indexes. No data rewrite is needed.
 Global audit redaction is computed for each viewer; stored audit events and chain verification remain intact.
+
+## Workflow checks after upgrade
+
+Legacy CSV preview rejects future closure dates using Pacific/Funafuti (UTC+12). Commit revalidates older
+previews and returns `import_changed` if a previously accepted row now fails; preview the source again.
+After reopening, close on or after the latest effective status date and the chosen evidence date.
+“Open cases with no next step” excludes pending hearing outcomes/confirmations, handover or service
+assessments, draft decisions and reopened cases awaiting a status decision. Hidden draft documents
+still count as recorded work on visible cases, with neutral prompts. Retrying a service-assessment form
+retains its command key and records only one assessment; open a new form for a deliberate new assessment.

@@ -141,3 +141,8 @@ an immediate button to press. Period dates apply to event metrics, while this me
   explanation and no correction form. Audit stores changed field names only.
 - Document metadata in nested audit snapshots follows current document access. Inventory redaction changes
   response text only and preserves the append-only audit journal.
+
+Recorded next steps include awaiting a hearing outcome, confirming a draft hearing, pending handover or
+service assessment, and deciding the status after reopening. Draft decisions count even when their
+private documents are hidden from the viewer. This is a registry workflow metric, not a legal conclusion.
+A new closure cannot precede the latest effective status date; imported closures cannot be in the future.
