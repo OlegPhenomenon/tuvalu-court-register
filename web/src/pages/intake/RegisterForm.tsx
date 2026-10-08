@@ -12,6 +12,7 @@ import { FormErrors } from './FormErrors';
 import { CheckboxField, DateField, SelectField, TextArea, TextField } from '../../components/fields';
 import { options, refList, staffOptions, useRef as useRefData } from '../../components/refdata';
 import { courtToday } from '../../time';
+import { useSession } from '../../session';
 import { CasePicker, PartyPicker } from './pickers';
 import type { CaseHit, Party } from './pickers';
 
@@ -41,6 +42,7 @@ export interface RegisterValues {
   registered_date: string;
   restricted: boolean;
   responsible_user_id: number | null;
+  assignment_reason: string;
   related_case_id: number | null;
   participants: ParticipantRow[];
 }
@@ -63,6 +65,7 @@ export function registerPayload(v: RegisterValues): { body?: Record<string, unkn
   if (!v.registry_id) return { error: 'Choose the register (number series).' };
   if (!v.title.trim()) return { error: 'Title is required.' };
   if (!v.category) return { error: 'Choose a category.' };
+  if (v.responsible_user_id && !v.assignment_reason.trim()) return { error: 'Give a reason for assigning another responsible officer.' };
   const participants = [];
   for (const [i, row] of v.participants.entries()) {
     if (!row.role) return { error: `Participant ${i + 1}: choose a role.` };
@@ -94,6 +97,7 @@ export function registerPayload(v: RegisterValues): { body?: Record<string, unkn
       registered_date: v.registered_date || null,
       restricted: v.restricted,
       responsible_user_id: v.responsible_user_id,
+      assignment_reason: v.assignment_reason || null,
       related_case_id: v.related_case_id,
       participants,
     },
@@ -195,6 +199,7 @@ export function RegisterForm({
   onSubmit: (values: RegisterValues) => void;
   onCancel: () => void;
 }) {
+  const { hasPerm, session } = useSession();
   const { data: ref, error: refError, reload: reloadRef } = useRefData();
   const form = useRef<HTMLFormElement>(null);
   const roles = refList(ref, 'participant_role');
@@ -207,6 +212,7 @@ export function RegisterForm({
     registered_date: courtToday(),
     restricted: false,
     responsible_user_id: null,
+    assignment_reason: '',
     related_case_id: null,
     // Spec: one row pre-filled with the sender as claimant/applicant.
     participants: [
@@ -227,7 +233,7 @@ export function RegisterForm({
 
   const submit = (e: FormEvent) => {
     e.preventDefault();
-    const values = { ...v, related_case_id: related?.id ?? null };
+    const values = { ...v, responsible_user_id: hasPerm('case.assign_staff') ? v.responsible_user_id : null, related_case_id: related?.id ?? null };
     const { error: msg } = registerPayload(values);
     if (msg) {
       setLocalError(msg);
@@ -290,13 +296,17 @@ export function RegisterForm({
         onChange={(restricted) => setV((prev) => ({ ...prev, restricted }))}
         help="A restricted case does not appear in general lists, search suggestions or counts for staff without the right to see it. Restrict access only when the case requires it."
       />
-      <SelectField
-        label="Responsible officer"
-        value={v.responsible_user_id ? String(v.responsible_user_id) : ''}
-        onChange={(s) => setV((prev) => ({ ...prev, responsible_user_id: s ? Number(s) : null }))}
-        options={staffOptions((ref?.staff ?? []).filter((s) => s.assignable !== false))}
-        placeholder="You (the registering clerk)"
-      />
+      {hasPerm('case.assign_staff') && <>
+        <SelectField
+          label="Responsible officer"
+          value={v.responsible_user_id ? String(v.responsible_user_id) : ''}
+          onChange={(s) => setV((prev) => ({ ...prev, responsible_user_id: s ? Number(s) : null }))}
+          options={staffOptions((ref?.staff ?? []).filter((s) => s.assignable !== false && !s.is_judge && s.id !== Number(session.user.id)))}
+          placeholder="You (the registering clerk)"
+        />
+        {v.responsible_user_id && <TextArea label="Reason for assigning responsible officer" value={v.assignment_reason}
+          onChange={(assignment_reason) => setV(prev => ({...prev, assignment_reason}))} required rows={2} />}
+      </>}
       <CasePicker
         label="Earlier related case (optional)"
         value={related}

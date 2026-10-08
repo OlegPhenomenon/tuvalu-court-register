@@ -130,3 +130,14 @@ an immediate button to press. Period dates apply to event metrics, while this me
 - New/reset passwords are temporary: all records APIs are blocked until own-password
   change. Own changes require fresh TOTP when enabled, revoke other sessions and
   retain MFA. Technical admins cannot reset protected judicial accounts.
+
+- Responsible-officer replacement ends the previous active clerk assignment, even if that assignment originally
+  came from registration. Another role or general case-view permission can preserve access; registration by
+  itself is not a permanent visibility basis. Changing responsibility and registration's named assignee are
+  staff-assignment actions with reasons. Judicial officers are assigned only in the judge role.
+- Shared-party corrections belong to an actor who can see every linked case/intake and holds `case.edit`,
+  `intake.manage` or `case.view_all`. The registry head (Elena in the demo) is the correction owner for contacts
+  shared across ordinary cases. This does not bypass restricted-case visibility. A blocked editor sees a neutral
+  explanation and no correction form. Audit stores changed field names only.
+- Document metadata in nested audit snapshots follows current document access. Inventory redaction changes
+  response text only and preserves the append-only audit journal.

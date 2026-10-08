@@ -8,6 +8,7 @@
 import { useRef, useState } from 'react';
 import type { FormEvent } from 'react';
 import { api, newKey, ApiError } from '../../api';
+import { useSession } from '../../session';
 import { Button } from '../../components/Button';
 import { Card } from '../../components/Card';
 import { DataTable } from '../../components/DataTable';
@@ -274,6 +275,8 @@ function EditParticipationModal({ participant: p, caseId, onClose, onSaved }: { 
 }
 
 export default function ParticipantsTab({ caseId, caseData, reload }: CaseTabProps) {
+  const { hasPerm } = useSession();
+  const canCorrectContacts = hasPerm('case.edit') || hasPerm('intake.manage') || hasPerm('case.view_all');
   const { data: ref, error: refError, reload: reloadRef } = useRefData();
   const allowed = caseData.allowed;
   const [addOpen, setAddOpen] = useState(false);
@@ -316,10 +319,10 @@ export default function ParticipantsTab({ caseId, caseData, reload }: CaseTabPro
       cols.push({
         key: 'id',
         header: '',
-        render: (p) =>
-          allowed.edit ? (
-            <><Button variant="secondary" onClick={() => setContactEditing(p)}>Edit contact</Button><Button variant="secondary" onClick={() => setEditing(p)}>Edit participation</Button><Button variant="secondary" onClick={() => setEnding(p)}>End participation</Button></>
-          ) : null,
+        render: (p) => <>
+          {canCorrectContacts && <Button variant="secondary" onClick={() => setContactEditing(p)}>Edit contact</Button>}
+          {allowed.edit && <><Button variant="secondary" onClick={() => setEditing(p)}>Edit participation</Button><Button variant="secondary" onClick={() => setEnding(p)}>End participation</Button></>}
+        </>,
       });
     } else {
       cols.push({

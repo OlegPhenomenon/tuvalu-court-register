@@ -97,9 +97,6 @@ function EditCaseModal({ caseData, onClose, onSaved }: {
   const [title, setTitle] = useState(c.title);
   const [category, setCategory] = useState(c.category);
   const [summary, setSummary] = useState(c.summary ?? '');
-  const [responsible, setResponsible] = useState(c.responsible_user_id ? String(c.responsible_user_id) : '');
-  const [assignmentReason, setAssignmentReason] = useState('');
-  const responsibleChanged = responsible !== (c.responsible_user_id ? String(c.responsible_user_id) : '');
   const [restricted, setRestricted] = useState(Boolean(c.restricted));
   const [busy, setBusy] = useState(false);
   const [error, setError] = useState<unknown>(null);
@@ -112,7 +109,6 @@ function EditCaseModal({ caseData, onClose, onSaved }: {
       title,
       category,
       summary,
-      ...(caseData.allowed.assign_staff && responsibleChanged ? { responsible_user_id: Number(responsible), assignment_reason: assignmentReason } : {}),
       restricted,
     };
     setAttempted(body as Record<string, unknown>);
@@ -145,15 +141,6 @@ function EditCaseModal({ caseData, onClose, onSaved }: {
           required
         />
         <TextArea label="Summary" value={summary} onChange={setSummary} rows={3} />
-        {caseData.allowed.assign_staff && <SelectField
-          label="Responsible officer"
-          value={responsible}
-          onChange={setResponsible}
-          options={staffOptions((ref?.staff ?? []).filter((s) => s.assignable !== false))}
-          placeholder={c.responsible_user_id ? "Keep current responsible officer" : "Not assigned"}
-          required
-        />}
-        {caseData.allowed.assign_staff && responsibleChanged && <TextArea label="Reason for changing responsible officer" value={assignmentReason} onChange={setAssignmentReason} required rows={2} />}
         <CheckboxField
           label="Restricted case"
           checked={restricted}
@@ -168,6 +155,61 @@ function EditCaseModal({ caseData, onClose, onSaved }: {
       </form>
     </Modal>
   );
+}
+
+function ChangeResponsibleModal({ caseData, onClose, onSaved }: {
+  caseData: CaseData;
+  onClose: () => void;
+  onSaved: () => void;
+}) {
+  const { data: ref, error: refError, reload: reloadRef } = useRefData();
+  const c = caseData.case;
+  const navigate = useNavigate();
+  const form = useRef<HTMLFormElement>(null);
+  const [key] = useState(newKey);
+  const [responsible, setResponsible] = useState('');
+  const [reason, setReason] = useState('');
+  const [busy, setBusy] = useState(false);
+  const [error, setError] = useState<unknown>(null);
+  const [residual, setResidual] = useState<string[] | null>(null);
+  const conflict = error instanceof ApiError && error.code === 'version_conflict';
+  const submit = async (e: FormEvent) => {
+    e.preventDefault();
+    if (!responsible || !reason.trim()) return;
+    setBusy(true); setError(null);
+    try {
+      const result = await api<{ case: CaseData['case'] | null; residual_access?: { role: string }[] }>('PATCH', `/cases/${c.id}`, {
+        version: c.version,
+        responsible_user_id: Number(responsible),
+        assignment_reason: reason.trim(),
+      }, { idempotencyKey: key });
+      if (!result.case) {
+        navigate('/cases', { state: { assignmentEnded: { name: 'You', roles: [] } } });
+        return;
+      }
+      setResidual((result.residual_access ?? []).map(r => r.role));
+      onSaved();
+    } catch (e) { setError(e); } finally { setBusy(false); }
+  };
+  return <Modal title="Change responsible officer" open onClose={busy ? () => {} : onClose}>
+    <ErrorBanner error={refError} onRetry={reloadRef} />
+    {residual !== null ? <>
+      <p>Responsible officer changed. {residual.length ? `The previous officer keeps these assignments: ${residual.map(r => ASSIGN_ROLE_LABELS[r] ?? r).join(', ')}.` : 'The previous officer has no remaining assignments. Access may remain through general case-view permissions.'}</p>
+      <Button type="button" onClick={onClose}>Done</Button>
+    </> : <>
+      {conflict ? <p role="alert">Changed by someone else, reload before assigning. <Button type="button" variant="secondary" onClick={() => { onSaved(); onClose(); }}>Reload</Button></p> : <FormErrors error={error} form={form} />}
+      <form ref={form} onSubmit={submit}><fieldset disabled={busy || conflict} style={{border: 0, padding: 0}}>
+        <SelectField label="Responsible officer" value={responsible} onChange={setResponsible}
+          options={staffOptions((ref?.staff ?? []).filter(s => s.assignable !== false && !s.is_judge && s.id !== c.responsible_user_id))}
+          placeholder="Choose a new responsible officer" required />
+        <TextArea label="Reason for changing responsible officer" value={reason} onChange={setReason} required rows={3} />
+        <div className="actions">
+          <Button type="submit" busy={busy} disabled={!responsible || !reason.trim()}>Change responsible officer</Button>
+          <Button type="button" variant="secondary" disabled={busy} onClick={onClose}>Cancel</Button>
+        </div>
+      </fieldset></form>
+    </>}
+  </Modal>;
 }
 
 /* ------------------------------ close form ------------------------------ */
@@ -354,7 +396,7 @@ function AssignModal({ caseId, allowed, staff, onClose, onSaved }: {
 
   // The judge role only accepts registered judicial officers; people flagged
   // non-assignable (system administration only) are never offered at all.
-  const eligible = (role === 'judge' ? staff.filter((s) => s.is_judge) : staff).filter(
+  const eligible = (role === 'judge' ? staff.filter((s) => s.is_judge) : staff.filter((s) => !s.is_judge)).filter(
     (s) => s.assignable !== false,
   );
 
@@ -483,7 +525,7 @@ export default function SummaryTab({ caseId, caseData, reload }: CaseTabProps) {
   const c = caseData.case;
   const allowed = caseData.allowed;
   // `modal` keys remount each dialog so every open gets fresh state/keys.
-  const [modal, setModal] = useState<'edit' | 'close' | 'assign' | 'relate' | 'hold' | 'reopen' | null>(null);
+  const [modal, setModal] = useState<'edit' | 'responsible' | 'close' | 'assign' | 'relate' | 'hold' | 'reopen' | null>(null);
   const [modalTick, setModalTick] = useState(0);
   const [actionKey, setActionKey] = useState(newKey);
   const [endAssignment, setEndAssignment] = useState<Assignment | null>(null);
@@ -590,7 +632,7 @@ export default function SummaryTab({ caseId, caseData, reload }: CaseTabProps) {
       <ErrorBanner error={refError} onRetry={reloadRef} />
       <Card
         title="Case details"
-        actions={<>{allowed.export && <Button variant="secondary" onClick={() => setExportOpen(true)}>Export package</Button>}{allowed.edit && <Button variant="secondary" onClick={() => openModal('edit')}>Edit</Button>}</>}
+        actions={<>{allowed.export && <Button variant="secondary" onClick={() => setExportOpen(true)}>Export package</Button>}{allowed.assign_staff && <Button variant="secondary" onClick={() => openModal('responsible')}>Change responsible officer</Button>}{allowed.edit && <Button variant="secondary" onClick={() => openModal('edit')}>Edit</Button>}</>}
       >
         <div className="table-wrap">
           <table>
@@ -741,6 +783,7 @@ export default function SummaryTab({ caseId, caseData, reload }: CaseTabProps) {
         )}
       </Card>
 
+      {modal === 'responsible' && <ChangeResponsibleModal key={modalTick} caseData={caseData} onClose={() => setModal(null)} onSaved={reload} />}
       {modal === 'edit' && (
         <EditCaseModal key={modalTick} caseData={caseData} onClose={() => setModal(null)} onSaved={reload} />
       )}

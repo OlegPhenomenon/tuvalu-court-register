@@ -104,17 +104,46 @@ pub fn create_case(tx: &Transaction, actor: &Actor, nc: NewCase) -> AppResult<Cr
     Ok(CreatedCase { id, number })
 }
 
-fn insert_assignment(tx: &Transaction, actor: &Actor, case_id: i64, user_id: i64, role: &str, why: &str) -> AppResult<i64> {
-    let active: bool = tx
-        .query_row("SELECT active FROM users WHERE id = ?1", [user_id], |r| r.get(0))
+/// Staff responsibility and manual assignments share eligibility checks.
+pub(super) fn require_assignment_user(c: &Connection, user_id: i64, role: &str) -> AppResult<()> {
+    let (active, is_judge): (bool, bool) = c
+        .query_row(
+            "SELECT active, is_judge FROM users WHERE id = ?1",
+            [user_id],
+            |r| Ok((r.get(0)?, r.get(1)?)),
+        )
         .optional()?
         .ok_or_else(|| AppError::validation("Unknown user."))?;
     if !active {
         return Err(AppError::validation("This user account is deactivated."));
     }
-    if !policy::user_assignable(tx, user_id)? {
-        return Err(AppError::validation("This person administers the system and cannot be assigned to cases."));
+    if !policy::user_assignable(c, user_id)? {
+        return Err(AppError::validation(
+            "This person administers the system and cannot be assigned to cases.",
+        ));
     }
+    if is_judge && role != "judge" {
+        return Err(AppError::validation(
+            "Assign judicial officers through the judge-assignment action.",
+        ));
+    }
+    if role == "judge" && !is_judge {
+        return Err(AppError::validation(
+            "This person is not registered as a judicial officer.",
+        ));
+    }
+    Ok(())
+}
+
+fn insert_assignment(
+    tx: &Transaction,
+    actor: &Actor,
+    case_id: i64,
+    user_id: i64,
+    role: &str,
+    why: &str,
+) -> AppResult<i64> {
+    require_assignment_user(tx, user_id, role)?;
     let existing: Option<i64> = tx
         .query_row(
             "SELECT id FROM case_assignments WHERE case_id = ?1 AND user_id = ?2 AND role = ?3 AND end_at IS NULL",
@@ -526,7 +555,7 @@ pub fn next_actions(c: &Connection, actor: &Actor, case_id: i64) -> AppResult<Ve
 
 // ------------------------------------------------------------------ updates
 
-#[derive(Deserialize)]
+#[derive(Deserialize, Serialize)]
 struct UpdateReq {
     version: i64,
     title: Option<String>,
@@ -537,7 +566,12 @@ struct UpdateReq {
     restricted: Option<bool>,
 }
 
-async fn update(ctx: Ctx, Path(id): Path<i64>, JsonBody(req): JsonBody<UpdateReq>) -> JsonResult {
+async fn update(
+    ctx: Ctx,
+    Path(id): Path<i64>,
+    IdemKey(key): IdemKey,
+    JsonBody(req): JsonBody<UpdateReq>,
+) -> JsonResult {
     let actor = ctx.actor;
     let v = ctx
         .db
@@ -545,6 +579,7 @@ async fn update(ctx: Ctx, Path(id): Path<i64>, JsonBody(req): JsonBody<UpdateReq
             let case = policy::require_case(tx, &actor, id)?;
             if req.responsible_user_id.is_some() { require_assign_perm(&actor,"clerk")?; }
             if req.title.is_some() || req.category.is_some() || req.summary.is_some() || req.restricted.is_some() || req.responsible_user_id.is_none() { actor.require(perm::CASE_EDIT)?; }
+            idempotent(tx, &actor, &key, "case.update", &(id, &req), || {
             let before = query_one_json(tx, "SELECT title, category, summary, responsible_user_id, restricted, version FROM cases WHERE id = ?1", [id])?;
             if case.version != req.version {
                 return Err(AppError::version_conflict(before));
@@ -567,11 +602,29 @@ async fn update(ctx: Ctx, Path(id): Path<i64>, JsonBody(req): JsonBody<UpdateReq
                  WHERE id = ?1",
                 params![id, title, req.category, req.summary, req.responsible_user_id, req.restricted, crate::time::now_utc()],
             )?;
+            let mut remaining = None;
             if let Some(uid) = req.responsible_user_id {
-                require_assign_perm(&actor, "clerk")?;
-                let why=reason(&req.assignment_reason)?;
-                insert_assignment(tx, &actor, id, uid, "clerk", &why)?;
-                audit::record(tx,Some(&actor),Event::new("case.assigned","case",id,"Responsible officer assigned").case(Some(id)).details(json!({"user_id":uid,"role":"clerk","reason":why})))?;
+                let why = reason(&req.assignment_reason)?;
+                require_assignment_user(tx, uid, "clerk")?;
+                if before["responsible_user_id"].as_i64() != Some(uid) {
+                    if let Some(previous) = before["responsible_user_id"].as_i64() {
+                        let ended = tx.execute(
+                            "UPDATE case_assignments SET end_at=?3, ended_by=?4, end_reason=?5
+                             WHERE case_id=?1 AND user_id=?2 AND role='clerk' AND end_at IS NULL",
+                            params![id, previous, crate::time::now_utc(), actor.user_id, why],
+                        )?;
+                        let roles = query_json(tx,
+                            "SELECT role FROM case_assignments WHERE case_id=?1 AND user_id=?2 AND end_at IS NULL",
+                            params![id, previous])?;
+                        if ended > 0 {
+                            audit::record(tx, Some(&actor), Event::new("case.unassigned", "case", id, "Previous responsible officer assignment ended")
+                                .case(Some(id)).details(json!({"user_id":previous,"role":"clerk","reason":why,"remaining_roles":roles})))?;
+                        }
+                        remaining = Some(roles);
+                    }
+                    insert_assignment(tx, &actor, id, uid, "clerk", &why)?;
+                    audit::record(tx,Some(&actor),Event::new("case.assigned","case",id,"Responsible officer assigned").case(Some(id)).details(json!({"user_id":uid,"role":"clerk","reason":why})))?;
+                }
             }
             audit::record(
                 tx,
@@ -580,7 +633,16 @@ async fn update(ctx: Ctx, Path(id): Path<i64>, JsonBody(req): JsonBody<UpdateReq
                     .case(Some(id))
                     .details(json!({ "before": before })),
             )?;
-            case_json(tx, &actor, id)
+            let visible: bool = tx.query_row(
+                &format!("SELECT {}", policy::case_visible_sql(&actor, &id.to_string())),
+                [], |r| r.get(0),
+            )?;
+            let mut out = if remaining.is_some() && !visible { json!({"case":null}) } else { case_json(tx, &actor, id)? };
+            if let Some(roles) = remaining {
+                out["residual_access"] = json!(roles);
+            }
+            Ok(out)
+            })
         })
         .await?;
     Ok(Json(v))

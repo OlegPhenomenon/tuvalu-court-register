@@ -668,6 +668,7 @@ struct RegisterReq {
     #[serde(default)]
     restricted: bool,
     responsible_user_id: Option<i64>,
+    assignment_reason: Option<String>,
     #[serde(default)]
     participants: Vec<ParticipantInput>,
     /// Register as a new case related to an earlier one (follow-up application).
@@ -684,6 +685,14 @@ async fn register(ctx: Ctx, Path(id): Path<i64>, IdemKey(key): IdemKey, JsonBody
             let intake = require_intake(tx, &actor, id)?;
             actor.require(perm::INTAKE_MANAGE)?;
             actor.require(perm::CASE_REGISTER)?;
+            let responsible = req.responsible_user_id.unwrap_or(actor.user_id);
+            let assignment_reason = if responsible != actor.user_id {
+                actor.require(perm::CASE_ASSIGN_STAFF)?;
+                Some(optional(&req.assignment_reason).ok_or_else(|| AppError::forbidden(
+                    "Assigning another responsible officer requires a non-empty reason.",
+                ))?)
+            } else { None };
+            super::cases::require_assignment_user(tx, responsible, "clerk")?;
             idempotent(tx, &actor, &key, "intake.register", &(id, &req), || {
                 if status_of(&intake) != "ready_for_registration" {
                     return Err(AppError::invalid_transition(match status_of(&intake) {
@@ -709,6 +718,12 @@ async fn register(ctx: Ctx, Path(id): Path<i64>, IdemKey(key): IdemKey, JsonBody
                         responsible_user_id: req.responsible_user_id,
                     },
                 )?;
+                if let Some(why) = &assignment_reason {
+                    tx.execute("UPDATE case_assignments SET reason=?3 WHERE case_id=?1 AND user_id=?2 AND role='clerk' AND end_at IS NULL",
+                        params![ncase.id, responsible, why])?;
+                    audit::record(tx, Some(&actor), Event::new("case.assigned", "case", ncase.id, "Responsible officer assigned at registration")
+                        .case(Some(ncase.id)).details(json!({"user_id":responsible,"role":"clerk","reason":why})))?;
+                }
                 for p in &req.participants {
                     super::cases::add_participant(tx, &actor, ncase.id, p)?;
                 }

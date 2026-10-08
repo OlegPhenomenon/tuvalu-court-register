@@ -210,3 +210,18 @@ capacity only sandboxes idle for more than two hours are evicted. To remove an
 installation, stop it and explicitly delete its data; no maintenance command does
 that automatically. The proxy upload limit must exceed `TCR_UPLOAD_MAX_MB` plus
 multipart overhead (the nginx example accommodates the 50 MB import cap).
+
+## Responsible officers and contact corrections
+
+Use the case summary's **Change responsible officer** action with staff-assignment permission and a reason.
+Replacement ends the previous clerk assignment immediately; the result lists any other assignments that remain.
+General case-view permissions can also preserve access. Registration defaults to the registering clerk;
+choosing another officer needs staff-assignment permission and a reason. Judges use the judge-assignment action.
+
+When a shared contact's editor says to ask the registry head, the head can open **Participants → Edit contact**
+for records they can see and correct the contact without case-edit permission. A head must also have visibility
+of every linked record; restricted cases still require an assignment or restricted-case permission. The demo
+registry head is Elena. Hidden record names are not displayed in the explanation.
+
+Migration 0011 is applied at startup and adds the five party-link lookup indexes. No data rewrite is needed.
+Global audit redaction is computed for each viewer; stored audit events and chain verification remain intact.

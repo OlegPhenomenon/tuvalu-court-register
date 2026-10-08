@@ -58,17 +58,26 @@ actor lacks. Knowing a case number grants no access.
 
 Party directory access and existing-party links are scoped to visible cases/intakes (including
 representatives, senders and document sources). A creator can see an unlinked contact. Editing a
-contact shared with a hidden case returns neutral `409 party_shared`; known hidden ids return 404.
+contact requires visibility of every linked case/intake and `case.edit`, `intake.manage` or `case.view_all`.
+A contact shared with a hidden record returns neutral `409 party_shared`; GET reports `editable:false` and
+`edit_blocked_reason:"party_shared"`. The registry head can correct shared contacts across records they can see.
+Known hidden ids return 404.
 Contact changes audit field names without copying contact values. Same-name warnings are scoped too.
 
 Restricted decision document references are redacted in list/detail, next actions, closure blockers,
-history and global audit, including old versions replaced during drafting. A participant export
+history and global audit, including old versions replaced during drafting. Audit details recursively redact hidden
+document titles, filenames, hashes and inventory lines in nested dispatch snapshots without altering stored events. A participant export
 filters metadata, links and chronology by its selected versions as well as the exporter's permissions.
 Intake events become part of linked case history without rewriting the append-only journal.
 
 Changing responsibility through case PATCH and importing a named responsible user require staff
 assignment permission and an active user with case-work permissions. Imports cannot grant technical
-administrators case access. Party/participation command retries recheck access before replay.
+administrators case access. Replacing the responsible officer atomically ends the previous clerk assignment,
+records the reason and `case.unassigned`, and returns remaining roles; other visibility bases remain valid.
+Registration names another responsible officer only with `case.assign_staff` and a non-empty reason; missing
+permission/reason returns 403 without creation. Judicial officers are assigned through the judge route only.
+Case PATCH retries and registration retries recheck current permissions before replay.
+Party/participation command retries recheck access before replay.
 Judicial finalisation checks both the reviewed decision row version and exact document version
 inside the write transaction. Draft hearing confirmation likewise checks its reviewed version.
 Unsent invitations are superseded atomically when a hearing changes. Before delivery, the worker

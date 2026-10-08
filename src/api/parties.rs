@@ -33,6 +33,7 @@ fn require_party_access(actor: &Actor) -> AppResult<()> {
         perm::INTAKE_MANAGE,
         perm::CASE_REGISTER,
         perm::CASE_EDIT,
+        perm::CASE_VIEW_ALL,
         perm::DISPATCH_MANAGE,
     ]
     .iter()
@@ -102,7 +103,7 @@ async fn detail(ctx: Ctx, Path(id): Path<i64>) -> JsonResult {
                  JOIN cases cs ON cs.id = cp.case_id WHERE cp.party_id = ?1 AND {} ORDER BY cs.id DESC",
                 policy::case_visible_sql(&actor, "cs.id")
             );
-            Ok(json!({ "party": party, "editable": policy::can_edit_party(c,&actor,id)?, "cases": query_json(c, &sql, [id])? }))
+            Ok(json!({ "party": party, "editable": policy::can_edit_party(c,&actor,id)?, "edit_blocked_reason": if policy::party_shared(c,&actor,id)? { Some("party_shared") } else { None }, "cases": query_json(c, &sql, [id])? }))
         })
         .await?;
     Ok(Json(v))

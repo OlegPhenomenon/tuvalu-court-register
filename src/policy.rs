@@ -270,35 +270,40 @@ pub fn require_party(conn: &Connection, actor: &Actor, id: i64) -> AppResult<()>
     }
 }
 
-pub fn can_edit_party(conn: &Connection, actor: &Actor, id: i64) -> AppResult<bool> {
+/// A contact correction must be authorised across every linked record.
+pub fn party_shared(conn: &Connection, actor: &Actor, id: i64) -> AppResult<bool> {
     let links = party_links_sql("?1");
-    Ok(conn.query_row(&format!("SELECT EXISTS(SELECT 1 FROM ({links}) pl WHERE
-        (pl.case_id IS NOT NULL AND {case_vis} AND {edit}) OR (pl.case_id IS NULL AND pl.intake_id IS NOT NULL AND {intake}))
-        OR ((SELECT created_by FROM parties WHERE id=?1)={uid} AND NOT EXISTS(SELECT 1 FROM ({links})) AND {create})",
-        case_vis=case_visible_sql(actor,"pl.case_id"), edit=i32::from(actor.has(perm::CASE_EDIT)), intake=i32::from(actor.has(perm::INTAKE_MANAGE)),uid=actor.user_id,
-        create=i32::from(actor.has(perm::INTAKE_MANAGE)||actor.has(perm::CASE_EDIT)||actor.has(perm::CASE_REGISTER))),[id],|r|r.get(0))?)
+    Ok(conn.query_row(
+        &format!(
+            "SELECT EXISTS(SELECT 1 FROM ({links}) pl WHERE
+         (pl.case_id IS NOT NULL AND NOT ({case_vis})) OR
+         (pl.case_id IS NULL AND pl.intake_id IS NOT NULL AND NOT ({intake})))",
+            case_vis = case_visible_sql(actor, "pl.case_id"),
+            intake = i32::from(actor.has(perm::INTAKE_MANAGE))
+        ),
+        [id],
+        |r| r.get(0),
+    )?)
+}
+
+pub fn can_edit_party(conn: &Connection, actor: &Actor, id: i64) -> AppResult<bool> {
+    Ok((actor.has(perm::CASE_EDIT)
+        || actor.has(perm::INTAKE_MANAGE)
+        || actor.has(perm::CASE_VIEW_ALL))
+        && !party_shared(conn, actor, id)?)
 }
 
 pub fn require_party_edit(conn: &Connection, actor: &Actor, id: i64) -> AppResult<()> {
     require_party(conn, actor, id)?;
-    if !can_edit_party(conn, actor, id)? {
-        return Err(AppError::forbidden(
-            "You cannot edit this person's contact record.",
-        ));
-    }
-    let links = party_links_sql("?1");
-    let shared: bool = conn.query_row(
-        &format!(
-            "SELECT EXISTS(SELECT 1 FROM ({links}) pl WHERE pl.case_id IS NOT NULL AND NOT ({}))",
-            case_visible_sql(actor, "pl.case_id")
-        ),
-        [id],
-        |r| r.get(0),
-    )?;
-    if shared {
+    if party_shared(conn, actor, id)? {
         return Err(AppError::conflict(
             "party_shared",
             "This person is linked to records you cannot access; ask the registry head",
+        ));
+    }
+    if !can_edit_party(conn, actor, id)? {
+        return Err(AppError::forbidden(
+            "You cannot edit this person's contact record.",
         ));
     }
     Ok(())

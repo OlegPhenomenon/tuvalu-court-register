@@ -74,6 +74,133 @@ fn decision_event_version(c: &Connection, ev: &Value) -> AppResult<Option<i64>> 
     .optional()?)
 }
 
+/// Gather hidden-document metadata from arbitrary event snapshots. Audit storage remains intact.
+fn hidden_detail_metadata(
+    c: &Connection,
+    actor: &Actor,
+    value: &Value,
+    secrets: &mut Vec<String>,
+) -> AppResult<()> {
+    match value {
+        Value::Object(fields) => {
+            let mut documents = Vec::new();
+            if let Some(id) = fields.get("document_id").and_then(Value::as_i64) {
+                documents.push(id);
+            }
+            let mut versions = Vec::new();
+            if let Some(id) = fields.get("document_version_id").and_then(Value::as_i64) {
+                versions.push(id);
+            }
+            for key in ["document_version_ids", "version_ids"] {
+                if let Some(ids) = fields.get(key).and_then(Value::as_array) {
+                    versions.extend(ids.iter().filter_map(Value::as_i64));
+                }
+            }
+            let mut hidden = false;
+            for id in versions {
+                if policy::require_version(c, actor, id).is_err() {
+                    hidden = true;
+                    for row in query_json(
+                        c,
+                        "SELECT d.title, v.filename, v.sha256 FROM document_versions v JOIN documents d ON d.id=v.document_id WHERE v.id=?1",
+                        [id],
+                    )? {
+                        for key in ["title", "filename", "sha256"] {
+                            if let Some(text) = row[key].as_str().filter(|s| !s.is_empty()) {
+                                secrets.push(text.to_string());
+                            }
+                        }
+                    }
+                }
+            }
+            for id in documents {
+                if policy::require_document(c, actor, id).is_err() {
+                    hidden = true;
+                    for row in query_json(
+                        c,
+                        "SELECT d.title, v.filename, v.sha256 FROM documents d LEFT JOIN document_versions v ON v.document_id=d.id WHERE d.id=?1",
+                        [id],
+                    )? {
+                        for key in ["title", "filename", "sha256"] {
+                            if let Some(text) = row[key].as_str().filter(|s| !s.is_empty()) {
+                                secrets.push(text.to_string());
+                            }
+                        }
+                    }
+                }
+            }
+            if hidden {
+                // Snapshot titles can differ from the document's current title.
+                for key in ["title", "document_title", "filename", "sha256"] {
+                    if let Some(text) = fields
+                        .get(key)
+                        .and_then(Value::as_str)
+                        .filter(|s| !s.is_empty())
+                    {
+                        secrets.push(text.to_string());
+                    }
+                }
+            }
+            for child in fields.values() {
+                hidden_detail_metadata(c, actor, child, secrets)?;
+            }
+        }
+        Value::Array(items) => {
+            for item in items {
+                hidden_detail_metadata(c, actor, item, secrets)?;
+            }
+        }
+        _ => {}
+    }
+    Ok(())
+}
+
+/// Redact metadata wherever nested, including inventory text in sibling before/after bodies.
+fn redact_details(c: &Connection, actor: &Actor, details: &mut Value) -> AppResult<()> {
+    let mut secrets = Vec::new();
+    hidden_detail_metadata(c, actor, details, &mut secrets)?;
+    secrets.sort_by_key(|s| std::cmp::Reverse(s.len()));
+    secrets.dedup();
+    fn scrub(value: &mut Value, secrets: &[String]) {
+        match value {
+            Value::Object(fields) => {
+                for child in fields.values_mut() {
+                    scrub(child, secrets);
+                }
+            }
+            Value::Array(items) => {
+                for item in items {
+                    scrub(item, secrets);
+                }
+            }
+            Value::String(text) => {
+                *text = text
+                    .lines()
+                    .map(|line| {
+                        if line.starts_with("- ")
+                            && secrets.iter().any(|secret| line.contains(secret))
+                        {
+                            "- Restricted document".to_string()
+                        } else {
+                            let mut line = line.to_string();
+                            for secret in secrets {
+                                line = line.replace(secret, "Restricted document");
+                            }
+                            line
+                        }
+                    })
+                    .collect::<Vec<_>>()
+                    .join("\n");
+            }
+            _ => {}
+        }
+    }
+    if !secrets.is_empty() {
+        scrub(details, &secrets);
+    }
+    Ok(())
+}
+
 /// Shape one audit row for the case history, omitting events the actor may not see.
 fn event_json(
     c: &Connection,
@@ -147,6 +274,7 @@ fn event_json(
         "summary": if hidden_document { json!("Restricted document decision event") } else { ev["summary"].clone() },
     });
     if with_details {
+        redact_details(c, actor, &mut details)?;
         out["entity_type"] = ev["entity_type"].clone();
         out["entity_id"] = ev["entity_id"].clone();
         out["case_id"] = ev["case_id"].clone();

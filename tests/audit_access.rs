@@ -818,3 +818,374 @@ async fn f01_t27_linked_intake_dispatch_follows_hidden_case_scope() {
     let (s, b) = c.get(&format!("/api/parties/{}", p["id"])).await;
     err(s, &b, StatusCode::NOT_FOUND, "not_found");
 }
+
+#[tokio::test]
+async fn f05_r2_replacement_ends_previous_responsibility() {
+    let app = TestApp::demo();
+    let c = app.persona("olga").await;
+    let (cid, _) = register_case(&c, "DEMO replace responsible").await;
+    let elena = c.switch("elena").await;
+    let olga = user_id(&c, "Olga").await;
+    let sergei = user_id(&c, "Sergei").await;
+    let path = format!("/api/cases/{cid}");
+    let (s, b) = elena.patch(&path, json!({"version":1,"responsible_user_id":sergei,"assignment_reason":"DEMO transfer workload"})).await;
+    ok(s, &b);
+    assert_eq!(c.get(&path).await.0, StatusCode::NOT_FOUND);
+    assert_eq!(c.switch("sergei").await.get(&path).await.0, StatusCode::OK);
+    assert_eq!(b["residual_access"], json!([]));
+    let conn = c.db(&app).open().unwrap();
+    let ended: (Option<String>, Option<i64>, String) = conn.query_row("SELECT end_at,ended_by,end_reason FROM case_assignments WHERE case_id=?1 AND user_id=?2 AND role='clerk'", params![cid,olga], |r| Ok((r.get(0)?,r.get(1)?,r.get(2)?))).unwrap();
+    assert!(ended.0.is_some() && ended.1.is_some());
+    assert_eq!(ended.2, "DEMO transfer workload");
+    let (_, log) = elena
+        .get(&format!("/api/audit?case_id={cid}&action=case.unassigned"))
+        .await;
+    assert_eq!(
+        log["events"][0]["details"]["reason"],
+        "DEMO transfer workload"
+    );
+    assert_eq!(log["events"][0]["details"]["remaining_roles"], json!([]));
+}
+
+#[tokio::test]
+async fn f05_r2_registration_requires_authorized_reasoned_staff() {
+    let app = TestApp::demo();
+    let c = app.persona("olga").await;
+    let iid = new_intake(&c, "DEMO controlled registration").await;
+    let (s, b) = c
+        .post(&format!("/api/intakes/{iid}/mark-ready"), json!({}))
+        .await;
+    ok(s, &b);
+    let (_, refs) = c.get("/api/ref").await;
+    let mut req = json!({"registry_id":refs["registries"][0]["id"],"category":"civil_contract","title":"DEMO assignment control","responsible_user_id":user_id(&c,"Sergei").await,"assignment_reason":"DEMO delegate"});
+    let path = format!("/api/intakes/{iid}/register");
+    let conn = c.db(&app).open().unwrap();
+    let count = || {
+        conn.query_row("SELECT COUNT(*) FROM cases", [], |r| r.get::<_, i64>(0))
+            .unwrap()
+    };
+    let before = count();
+    let (s, b) = c
+        .post_idem(&path, "controlled-registration", req.clone())
+        .await;
+    err(s, &b, StatusCode::FORBIDDEN, "forbidden");
+    assert_eq!(count(), before);
+    for permission in ["intake.manage", "case.register"] {
+        conn.execute("INSERT INTO user_permissions(user_id,permission,granted_at) VALUES(?1,?2,'2026-01-01T00:00:00Z')",params![user_id(&c,"Elena").await,permission]).unwrap();
+    }
+    let elena = c.switch("elena").await;
+    req["assignment_reason"] = json!("   ");
+    let (s, b) = elena.post(&path, req.clone()).await;
+    err(s, &b, StatusCode::FORBIDDEN, "forbidden");
+    for name in ["Viktor", "Pavel"] {
+        req["assignment_reason"] = json!("DEMO delegate");
+        req["responsible_user_id"] = json!(user_id(&c, name).await);
+        let (s, b) = elena.post(&path, req.clone()).await;
+        err(s, &b, StatusCode::BAD_REQUEST, "validation");
+        assert_eq!(count(), before);
+    }
+    req["responsible_user_id"] = json!(user_id(&c, "Sergei").await);
+    let (s, b) = elena
+        .post_idem(&path, "controlled-registration", req.clone())
+        .await;
+    ok(s, &b);
+    assert_eq!(
+        elena
+            .post_idem(&path, "controlled-registration", req.clone())
+            .await
+            .1,
+        b
+    );
+    assert_eq!(count(), before + 1);
+    conn.execute(
+        "DELETE FROM user_permissions WHERE user_id=?1 AND permission='case.assign_staff'",
+        [user_id(&elena, "Elena").await],
+    )
+    .unwrap();
+    let (s, b) = elena.post_idem(&path, "controlled-registration", req).await;
+    err(s, &b, StatusCode::FORBIDDEN, "forbidden");
+}
+
+#[tokio::test]
+async fn f01_r2_party_link_queries_use_indexes() {
+    let app = TestApp::demo();
+    let c = app.persona("olga").await;
+    let conn = c.db(&app).open().unwrap();
+    let actor = tuvalu_court::auth::Actor {
+        user_id: user_id(&c, "Olga").await,
+        username: "olga".into(),
+        display_name: "Olga".into(),
+        perms: ["intake.manage".into()].into(),
+        is_judge: false,
+        ip: None,
+    };
+    let sql = format!(
+        "EXPLAIN QUERY PLAN SELECT p.id FROM parties p WHERE {} AND p.name LIKE '%DEMO%' LIMIT 50",
+        tuvalu_court::policy::party_visible_sql(&actor, "p.id")
+    );
+    let plan = conn
+        .prepare(&sql)
+        .unwrap()
+        .query_map([], |r| r.get::<_, String>(3))
+        .unwrap()
+        .collect::<Result<Vec<_>, _>>()
+        .unwrap()
+        .join("\n");
+    for index in [
+        "idx_participations_party",
+        "idx_participations_representative",
+        "idx_intakes_sender_party",
+        "idx_documents_source_party",
+        "idx_dispatches_recipient_party",
+    ] {
+        assert!(plan.contains(index), "Missing {index}: {plan}");
+    }
+}
+
+#[tokio::test]
+async fn f02_r2_global_audit_redacts_nested_dispatch_inventory() {
+    let app = TestApp::demo();
+    let c = app.persona("olga").await;
+    let (cid, _) = register_case(&c, "DEMO audit dispatch").await;
+    let uid = user_id(&c, "Olga").await;
+    let (_, vid) = insert_document(
+        &c.db(&app),
+        cid,
+        "DEMO Inventory Secret",
+        "evidence",
+        "restricted",
+        uid,
+    );
+    let conn = c.db(&app).open().unwrap();
+    let sha: String = conn
+        .query_row(
+            "SELECT sha256 FROM document_versions WHERE id=?1",
+            [vid],
+            |r| r.get(0),
+        )
+        .unwrap();
+    let (s,d) = c.post(&format!("/api/cases/{cid}/dispatches"),json!({"kind":"working_document","method":"post","recipient_name":"DEMO recipient","address":"DEMO address","purpose":"DEMO share working material","version_ids":[vid],"include_restricted":true})).await;
+    ok(s, &d);
+    assert!(
+        d["body"]
+            .as_str()
+            .unwrap()
+            .contains("DEMO Inventory Secret")
+    );
+    let (s, b) = c
+        .patch(
+            &format!("/api/dispatches/{}", d["id"]),
+            json!({"version":d["version"],"subject":"DEMO revised subject"}),
+        )
+        .await;
+    ok(s, &b);
+    // A future event can embed the same metadata in several levels and both snapshots.
+    let details = json!({"before":d,"after":{"nested":{"document_id":conn.query_row("SELECT document_id FROM document_versions WHERE id=?1",[vid],|r|r.get::<_,i64>(0)).unwrap(),"title":"DEMO Inventory Secret","filename":"DEMO_Inventory_Secret.pdf","sha256":sha},"body":d["body"]}});
+    c.db(&app)
+        .write_blocking(|tx| {
+            tuvalu_court::audit::record(
+                tx,
+                None,
+                tuvalu_court::audit::Event::new(
+                    "dispatch.updated",
+                    "dispatch",
+                    d["id"].as_i64().unwrap(),
+                    "DEMO nested metadata",
+                )
+                .case(Some(cid))
+                .details(details),
+            )
+        })
+        .unwrap();
+    let elena = c.switch("elena").await;
+    let (_, log) = elena.get("/api/audit?action=dispatch.updated").await;
+    for secret in [
+        "DEMO Inventory Secret",
+        "DEMO_Inventory_Secret.pdf",
+        sha.as_str(),
+    ] {
+        assert!(!log.to_string().contains(secret), "{log}");
+    }
+    assert!(log.to_string().contains("Restricted document"));
+    conn.execute("INSERT INTO user_permissions(user_id,permission,granted_at) VALUES(?1,'audit.view','2026-01-01T00:00:00Z')",[uid]).unwrap();
+    let (_, full) = c.get("/api/audit?action=dispatch.updated").await;
+    assert!(full.to_string().contains("DEMO Inventory Secret"));
+}
+
+#[tokio::test]
+async fn f14_r2_shared_contact_get_explains_block_and_head_can_correct() {
+    let app = TestApp::demo();
+    let c = app.persona("olga").await;
+    let (visible, _) = register_case(&c, "DEMO visible shared contact").await;
+    let (other, _) = register_case(&c, "DEMO unassigned shared contact").await;
+    let conn = c.db(&app).open().unwrap();
+    let pid: i64 = conn
+        .query_row(
+            "SELECT party_id FROM case_participations WHERE case_id=?1 LIMIT 1",
+            [visible],
+            |r| r.get(0),
+        )
+        .unwrap();
+    conn.execute("INSERT INTO case_participations(case_id,party_id,role,added_at) VALUES(?1,?2,'claimant',?3)",params![other,pid,tuvalu_court::time::now_utc()]).unwrap();
+    conn.execute(
+        "UPDATE case_assignments SET end_at=?1 WHERE case_id=?2",
+        params![tuvalu_court::time::now_utc(), other],
+    )
+    .unwrap();
+    let path = format!("/api/parties/{pid}");
+    let (s, b) = c.get(&path).await;
+    ok(s, &b);
+    assert_eq!(b["editable"], false);
+    assert_eq!(b["edit_blocked_reason"], "party_shared");
+    let req = json!({"version":b["party"]["version"],"name":b["party"]["name"],"contact_email":"corrected@example.invalid"});
+    let (s, b) = c.patch(&path, req.clone()).await;
+    err(s, &b, StatusCode::CONFLICT, "party_shared");
+    assert!(
+        b["error"]["message"]
+            .as_str()
+            .unwrap()
+            .contains("registry head")
+    );
+    let elena = c.switch("elena").await;
+    assert_eq!(elena.get(&path).await.1["editable"], true);
+    let (s, b) = elena.patch(&path, req).await;
+    ok(s, &b);
+    assert_eq!(b["contact_email"], "corrected@example.invalid");
+    let (_, audit) = elena.get("/api/audit?action=party.updated").await;
+    assert!(audit.to_string().contains("contact_email"));
+    assert!(!audit.to_string().contains("corrected@example.invalid"));
+}
+
+#[tokio::test]
+async fn f05_r2_staff_assigner_has_independent_responsible_dialog() {
+    let app = TestApp::demo();
+    let clerk = app.persona("olga").await;
+    let (cid, _) = register_case(&clerk, "DEMO assigner UI").await;
+    let c = clerk.switch("elena").await;
+    let (_, b) = c.get(&format!("/api/cases/{cid}")).await;
+    assert_eq!(b["allowed"]["edit"], false);
+    assert_eq!(b["allowed"]["assign_staff"], true);
+    // UI contract: the action is gated by assignment permission and its form is independent.
+    let source = include_str!("../web/src/pages/case/SummaryTab.tsx");
+    assert!(
+        source.contains("allowed.assign_staff && <Button")
+            && source.contains(">Change responsible officer</Button>")
+    );
+    let edit = source
+        .split("function EditCaseModal")
+        .nth(1)
+        .unwrap()
+        .split("function ChangeResponsibleModal")
+        .next()
+        .unwrap()
+        .split("/* ------------------------------ close form")
+        .next()
+        .unwrap();
+    assert!(!edit.contains("responsible_user_id"));
+    assert!(source.contains("function ChangeResponsibleModal"));
+}
+
+#[tokio::test]
+async fn f05_r2_replacement_preserves_other_roles_and_replays_once() {
+    let app = TestApp::demo();
+    let c = app.persona("olga").await;
+    let (cid, _) = register_case(&c, "DEMO residual assignment").await;
+    let elena = c.switch("elena").await;
+    let olga = user_id(&c, "Olga").await;
+    let sergei = user_id(&c, "Sergei").await;
+    let (s, b) = elena
+        .post(
+            &format!("/api/cases/{cid}/assignments"),
+            json!({"user_id":olga,"role":"other","reason":"DEMO retained support role"}),
+        )
+        .await;
+    ok(s, &b);
+    let path = format!("/api/cases/{cid}");
+    for target in [user_id(&c, "Viktor").await, user_id(&c, "Pavel").await] {
+        let (s,b) = elena.patch(&path,json!({"version":1,"responsible_user_id":target,"assignment_reason":"DEMO invalid target"})).await;
+        err(s, &b, StatusCode::BAD_REQUEST, "validation");
+        assert_eq!(c.get(&path).await.1["case"]["version"], 1);
+    }
+    let (s, b) = elena
+        .patch(&path, json!({"version":1,"responsible_user_id":sergei}))
+        .await;
+    err(s, &b, StatusCode::BAD_REQUEST, "validation");
+    let req = json!({"version":1,"responsible_user_id":sergei,"assignment_reason":"DEMO transfer with support"});
+    let (s, b) = patch_idem(&elena, &path, "responsible-transfer", req.clone()).await;
+    ok(s, &b);
+    assert_eq!(b["residual_access"], json!([{"role":"other"}]));
+    assert_eq!(c.get(&path).await.0, StatusCode::OK);
+    assert_eq!(
+        patch_idem(&elena, &path, "responsible-transfer", req.clone())
+            .await
+            .1,
+        b
+    );
+    let conn = c.db(&app).open().unwrap();
+    assert_eq!(
+        conn.query_row(
+            "SELECT COUNT(*) FROM audit_events WHERE case_id=?1 AND action='case.unassigned'",
+            [cid],
+            |r| r.get::<_, i64>(0)
+        )
+        .unwrap(),
+        1
+    );
+    let (s, b) = elena.patch(&path, req.clone()).await;
+    err(s, &b, StatusCode::CONFLICT, "version_conflict");
+    let mut changed = req;
+    changed["assignment_reason"] = json!("DEMO changed request");
+    let (s, b) = patch_idem(&elena, &path, "responsible-transfer", changed).await;
+    err(s, &b, StatusCode::CONFLICT, "idempotency_mismatch");
+}
+
+#[tokio::test]
+async fn f14_r2_shared_intake_blocks_case_only_editor() {
+    let app = TestApp::demo();
+    let c = app.persona("olga").await;
+    let (cid, _) = register_case(&c, "DEMO contact intake scope").await;
+    let (_, data) = c.get(&format!("/api/cases/{cid}")).await;
+    let pid = data["participants"][0]["party_id"].as_i64().unwrap();
+    let (s,b) = c.post("/api/intakes",json!({"sender_name":"DEMO linked sender","sender_party_id":pid,"channel":"counter","received_date":today(),"description":"DEMO unregistered record","is_paper_original":false})).await;
+    ok(s, &b);
+    let conn = c.db(&app).open().unwrap();
+    conn.execute(
+        "DELETE FROM user_permissions WHERE user_id=?1 AND permission='intake.manage'",
+        [user_id(&c, "Olga").await],
+    )
+    .unwrap();
+    let path = format!("/api/parties/{pid}");
+    let (s, b) = c.get(&path).await;
+    ok(s, &b);
+    assert_eq!(b["editable"], false);
+    assert_eq!(b["edit_blocked_reason"], "party_shared");
+    let (s, b) = c
+        .patch(&path, json!({"version":1,"name":"DEMO blocked correction"}))
+        .await;
+    err(s, &b, StatusCode::CONFLICT, "party_shared");
+}
+
+#[tokio::test]
+async fn f05_r2_self_replacement_commits_even_when_actor_loses_access() {
+    let app = TestApp::demo();
+    let c = app.persona("olga").await;
+    let (cid, _) = register_case(&c, "DEMO self transfer").await;
+    let conn = c.db(&app).open().unwrap();
+    conn.execute("INSERT INTO user_permissions(user_id,permission,granted_at) VALUES(?1,'case.assign_staff',?2)",params![user_id(&c,"Olga").await,tuvalu_court::time::now_utc()]).unwrap();
+    let (s,b) = c.patch(&format!("/api/cases/{cid}"),json!({"version":1,"responsible_user_id":user_id(&c,"Sergei").await,"assignment_reason":"DEMO hand over own case"})).await;
+    ok(s, &b);
+    assert!(b["case"].is_null());
+    assert_eq!(b["residual_access"], json!([]));
+    assert_eq!(
+        c.get(&format!("/api/cases/{cid}")).await.0,
+        StatusCode::NOT_FOUND
+    );
+    assert_eq!(
+        c.switch("sergei")
+            .await
+            .get(&format!("/api/cases/{cid}"))
+            .await
+            .0,
+        StatusCode::OK
+    );
+}

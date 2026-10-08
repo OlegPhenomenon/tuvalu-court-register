@@ -213,9 +213,10 @@ export function PartyContactEditor({ partyId, onSaved, onClose }: { partyId: num
   const [error, setError] = useState<unknown>(null);
   const [busy, setBusy] = useState(false);
   const [editable, setEditable] = useState(false);
+  const [blockedReason, setBlockedReason] = useState<string | null>(null);
   const load = useCallback(async () => {
     setError(null); setBusy(true);
-    try { const d = await api<{party: Party; editable: boolean}>('GET', `/parties/${partyId}`); setParty(d.party); setEditable(d.editable); }
+    try { const d = await api<{party: Party; editable: boolean; edit_blocked_reason: string | null}>('GET', `/parties/${partyId}`); setParty(d.party); setEditable(d.editable); setBlockedReason(d.edit_blocked_reason); }
     catch (e) { setError(e); } finally { setBusy(false); }
   }, [partyId]);
   useEffect(() => { void load(); }, [load]);
@@ -236,7 +237,7 @@ export function PartyContactEditor({ partyId, onSaved, onClose }: { partyId: num
       <TextField label="Postal address" value={party.address ?? ''} onChange={address => setParty({...party, address})} />
       <Button type="button" busy={busy} disabled={!party.name.trim() || conflict} onClick={() => void save()}>Save contact details</Button>
     </>}
-    {party && !editable && <p>You do not have permission to edit this contact record.</p>}
+    {party && !editable && <p>{blockedReason === 'party_shared' ? 'This person is linked to records you cannot access; ask the registry head to correct their contact details.' : 'You do not have permission to edit this contact record.'}</p>}
     <Button type="button" variant="secondary" onClick={onClose}>Cancel</Button>
   </fieldset>;
 }
@@ -260,7 +261,7 @@ export function PartyPicker({
   const { hasPerm } = useSession();
   useEffect(() => {
     let alive = true; setCanEdit(false); setEditing(false);
-    if (value && (hasPerm('case.edit') || hasPerm('intake.manage'))) {
+    if (value && (hasPerm('case.edit') || hasPerm('intake.manage') || hasPerm('case.view_all'))) {
       api<{editable: boolean}>('GET', `/parties/${value.id}`).then(d => { if (alive) setCanEdit(d.editable); }).catch(() => {});
     }
     return () => { alive = false; };

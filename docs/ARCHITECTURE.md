@@ -150,10 +150,13 @@ Intake documents (no case yet): `intake.manage` holders.
 Party directory list/search/detail and same-name warnings follow case/intake visibility. A party is visible when linked
 as a participant, representative, intake sender, document source or dispatch recipient to a visible record. An unlinked
 party is visible only to its creator. Hidden contacts return 404, including when submitted as an existing party id.
-Contact writes require `case.edit` on a visible linked case or `intake.manage` on a visible unlinked intake; the creator
-may correct an unlinked contact when holding intake/registration/edit permission. If any linked case is hidden from
-the editor, PATCH returns `409 party_shared` with the neutral message "This person is linked to records you cannot
-access; ask the registry head". No hidden case identity is included. Equal names remain separate records.
+Contact writes require visibility of **every** linked case/intake and one of `case.edit`, `intake.manage` or
+`case.view_all`. The registry head can correct a contact shared across visible cases without `case.edit`.
+If any linked record is hidden, PATCH returns `409 party_shared` with the neutral message "This person is linked to
+records you cannot access; ask the registry head"; GET returns `editable:false` and `edit_blocked_reason:"party_shared"`.
+The contact editor shows that explanation instead of a form. Hidden record identities are never included.
+Equal names remain separate records. Migration 0011 indexes participant, representative, sender, document-source
+and dispatch-recipient party links used by the directory policy.
 
 Decision list/detail responses check the exact bound document version. Without document access, `title` and
 `document_title` are "Restricted document", `restricted` is true and `document_version_id` remains the reference;
@@ -162,11 +165,23 @@ summaries and draft-decision prompts/closure blockers are neutral. Old decision 
 bound at that time from draft-edit snapshots, so replacing a restricted draft does not disclose its old metadata.
 Case history includes received/completed/supplemented/registered events and information-request events from linked
 intakes and their supplements, with original timestamps/authors and no duplicate event ids. Document redaction also
-applies to those earlier events.
+applies to those earlier events. Global audit details undergo recursive document redaction for references in any
+nested snapshot, including dispatch before/after items and inventory lines in bodies. Hidden document titles,
+filenames and hashes become "Restricted document"; authorised viewers retain the metadata. Stored audit events
+and their chain remain unchanged.
 
 Case PATCH changing `responsible_user_id` requires `case.assign_staff`, a non-empty `assignment_reason` and the
-same active/eligible-user checks as manual staff assignment. Other case fields still require `case.edit`. The edit
-form exposes this field only with staff-assignment permission and sends it only when changed. Import preview and
+same active/eligible-user checks as manual staff assignment. Replacing responsibility ends the previous officer's
+active clerk assignment in the same transaction with `end_reason`, `ended_by` and a `case.unassigned` event;
+other active roles and general view permissions remain valid. The response includes `residual_access` (remaining
+roles), and `case:null` if the assigning actor lost case access. Optional `Idempotency-Key` on case PATCH binds
+the complete request and rechecks visibility/permissions before replay. Other case fields still require `case.edit`.
+A separate "Change responsible officer" dialog is available with `allowed.assign_staff`; Edit contains no responsible
+field. Judicial officers can only receive judge assignments, never staff responsibility.
+Intake registration defaults responsibility to the actor. Naming anyone else requires `case.assign_staff` and a
+non-empty `assignment_reason` (otherwise 403, with no case/number/assignment created); target eligibility is checked
+before the command and its idempotent replay. Registration's officer picker and reason field require assignment
+permission, and omit judicial/ineligible accounts. Import preview and
 commit use the same assignee eligibility policy and require staff-assignment permission for a named responsible
 user; invalid rows are reported individually and skipped. Eligibility changes after preview abort commit with
 `409 import_changed` and no partial creation. Imported responsibility creates a clerk assignment, never a judge role.
@@ -291,7 +306,7 @@ GET  /audit?case_id=&user_id=
 /admin/users, /admin/users/:id/{permissions,deactivate,revoke-sessions,reset-password}, /admin/rooms, /admin/registries,
 /admin/ref-items, /admin/templates, /admin/settings
 ```
-`GET /parties/:id` returns `{party, cases, editable}`; party list items include `version`.
+`GET /parties/:id` returns `{party, cases, editable, edit_blocked_reason}` (`party_shared` or null); party list items include `version`.
 `PATCH /parties/:id` accepts `{version,name,contact_email,contact_phone,address,island,notes?}` and returns the party.
 Omitted `notes` is preserved; explicit null clears it. Ordinary optional contact fields accept null to clear.
 `PATCH /cases/:id/participants/:pid` accepts `{version,role,representative_party_id,representation_basis,service_contact}`
