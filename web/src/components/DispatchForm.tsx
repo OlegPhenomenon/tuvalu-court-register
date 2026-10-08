@@ -34,6 +34,20 @@ export interface FormParticipant {
   role: string;
   active: number;
   service_contact: string | null;
+  contact_email: string | null;
+  address: string | null;
+}
+
+/** Default dispatch address of a participant and where it came from (same order as the server). */
+function addressSource(p: FormParticipant): { value: string; label: string } | null {
+  const first = (v: string | null) => (v && v.trim() ? v : null);
+  const service = first(p.service_contact);
+  if (service) return { value: service, label: 'Service contact' };
+  const email = first(p.contact_email);
+  if (email) return { value: email, label: 'E-mail on the party record' };
+  const postal = first(p.address);
+  if (postal) return { value: postal, label: 'Address on the party record' };
+  return null;
 }
 
 interface DocListItem {
@@ -185,7 +199,7 @@ export function DispatchForm({ caseId, participants, kind, dispatch, preselectDe
     const p = (participants ?? []).find((x) => x.party_id === preselectPartyId && x.active);
     if (p) {
       setPartyId(String(p.id));
-      setAddress(p.service_contact ?? '');
+      setAddress(addressSource(p)?.value ?? '');
     }
   }, [editing, participants, preselectPartyId]);
 
@@ -206,10 +220,11 @@ export function DispatchForm({ caseId, participants, kind, dispatch, preselectDe
   }, [versions, decisions.data]);
 
   const chosen = (participants ?? []).find((p) => String(p.id) === partyId);
+  const chosenAddress = chosen ? addressSource(chosen) : null;
   const pickRecipient = (value: string) => {
     setPartyId(value);
     const p = (participants ?? []).find((x) => String(x.id) === value);
-    setAddress(p?.service_contact ?? '');
+    setAddress(p ? (addressSource(p)?.value ?? '') : '');
   };
 
   const toggleVersion = (id: number, checked: boolean) =>
@@ -349,7 +364,9 @@ export function DispatchForm({ caseId, participants, kind, dispatch, preselectDe
               required
               help={
                 chosen
-                  ? `Service contact: ${chosen.service_contact ?? 'none recorded — enter the address by hand.'}`
+                  ? chosenAddress
+                    ? `Default address from: ${chosenAddress.label}`
+                    : 'No address on record — enter the address by hand.'
                   : 'Make a separate package for each participant.'
               }
             />

@@ -588,6 +588,18 @@ async fn copies_review_queue_mailbox_and_delivery_records() {
     .await;
     assert_eq!(assessed["confirmations"].as_array().unwrap().len(), 2);
     assert_eq!(assessed["assessments"].as_array().unwrap().len(), 1);
+    let history = fetched(&olga, &format!("/api/cases/{cid}/history")).await;
+    let events = history["events"].as_array().unwrap();
+    for summary in [
+        "Copy package for Maria (1 document) prepared",
+        "Copy package for Maria (1 document) reviewed",
+        "Copy package for Maria (1 document) queued for delivery",
+        "Copy package for Maria (1 document) sent (maria@example.invalid)",
+        "Technical delivery acknowledgement recorded for Maria",
+        "Handover to Maria confirmed by a person",
+    ] {
+        assert!(events.iter().any(|e| e["summary"] == summary), "missing: {summary}");
+    }
     for action in ["queue", "retry", "preview", "cancel", "record-sent"] {
         denied(
             &olga,
@@ -1086,6 +1098,17 @@ async fn notices_use_case_participants_and_hearing_templates() {
     ] {
         denied(&olga, &path, req, StatusCode::BAD_REQUEST, "validation").await;
     }
+    // No service contact → default address falls back to the party's e-mail, then its address.
+    conn.execute("UPDATE parties SET contact_email='party-inbox@example.invalid', address='12 Demo Road' WHERE id=?1", [pid]).unwrap();
+    conn.execute("UPDATE case_participations SET service_contact=NULL WHERE case_id=?1 AND party_id=?2", params![cid, pid]).unwrap();
+    let d = posted(&olga,&path,json!({"kind":"notice","recipient_party_id":pid,"method":"email","template_code":"hearing_notice","hearing_id":hid})).await;
+    assert_eq!(d["address"], "party-inbox@example.invalid");
+    conn.execute("UPDATE parties SET contact_email=NULL WHERE id=?1", [pid]).unwrap();
+    let d = posted(&olga,&path,json!({"kind":"notice","recipient_party_id":pid,"method":"email","template_code":"hearing_notice","hearing_id":hid})).await;
+    assert_eq!(d["address"], "12 Demo Road");
+    conn.execute("UPDATE parties SET address='  ' WHERE id=?1", [pid]).unwrap();
+    let d = posted(&olga,&path,json!({"kind":"notice","recipient_party_id":pid,"method":"post","template_code":"hearing_notice","hearing_id":hid})).await;
+    assert!(d["address"].is_null());
     conn.execute(
         "UPDATE case_participations SET active=0 WHERE case_id=?1 AND party_id=?2",
         params![cid, pid],

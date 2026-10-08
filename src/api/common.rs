@@ -149,7 +149,7 @@ pub fn dispatch_activity(conn: &rusqlite::Connection, id: i64, activity: &str) -
         "SELECT kind, recipient_name, (SELECT COUNT(*) FROM dispatch_items WHERE dispatch_id = d.id)
          FROM dispatches d WHERE id = ?1", [id], |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?)))?;
     Ok(if kind == "copies" {
-        format!("Copies of {count} {} {activity} to {recipient}", if count == 1 { "document" } else { "documents" })
+        format!("Copy package for {recipient} ({count} {}) {activity}", if count == 1 { "document" } else { "documents" })
     } else {
         format!("{} to {recipient} {activity}", if kind == "information_request" { "Information request" } else { "Notice" })
     })

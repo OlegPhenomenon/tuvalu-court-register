@@ -144,10 +144,19 @@ fn case_rows(rows: &[Value], extra: &[(&str, &str)]) -> (Vec<Value>, Vec<Value>)
 fn fetch_items(c: &Connection, actor: &Actor, key: &str, p: &Period) -> AppResult<(Vec<Value>, Vec<Value>)> {
     let (mut columns, mut rows) = raw_items(c, actor, key, p)?;
     for row in &mut rows {
-        for (field, kind) in [("category", "case_category"), ("closure_basis", "closure_basis"), ("hearing_type", "hearing_type")] {
+        for (field, kind) in [("category", "case_category"), ("closure_basis", "closure_basis"), ("hearing_type", "hearing_type"), ("method", "dispatch_method")] {
             if let Some(code) = row[field].as_str() {
                 row[format!("{field}_label")] = json!(super::common::ref_label(c, kind, code)?);
             }
+        }
+        if let Some(code) = row["kind"].as_str() {
+            let label = match code {
+                "notice" => "Notice",
+                "copies" => "Copy package",
+                "information_request" => "Information request",
+                other => other,
+            };
+            row["kind_label"] = json!(label);
         }
         for field in ["status", "state_as_of"] {
             if let Some(code) = row[field].as_str() {
@@ -158,7 +167,7 @@ fn fetch_items(c: &Connection, actor: &Actor, key: &str, p: &Period) -> AppResul
     }
     for column in &mut columns {
         if let Some(key) = column["key"].as_str()
-            && matches!(key, "category" | "status" | "closure_basis" | "state_as_of" | "hearing_type") {
+            && matches!(key, "category" | "status" | "closure_basis" | "state_as_of" | "hearing_type" | "kind" | "method") {
             column["key"] = json!(format!("{key}_label"));
         }
     }

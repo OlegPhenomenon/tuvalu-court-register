@@ -547,16 +547,21 @@ async fn change_status(ctx: Ctx, Path(id): Path<i64>, JsonBody(req): JsonBody<St
 pub fn open_items(c: &Connection, case_id: i64) -> AppResult<Vec<Value>> {
     let mut items = query_json(
         c,
-        "SELECT 'task' AS kind, id, title AS label, status FROM tasks WHERE case_id = ?1 AND status = 'open'
+        "SELECT 'task' AS kind, id, title AS label, status, NULL AS dispatch_kind, NULL AS recipient, NULL AS hearing_starts
+         FROM tasks WHERE case_id = ?1 AND status = 'open'
          UNION ALL
-         SELECT 'hearing', id, hearing_type || ' at ' || starts_at, status FROM hearings WHERE case_id = ?1 AND status IN ('draft','scheduled')
+         SELECT 'hearing', id, hearing_type || ' at ' || starts_at, status, NULL, NULL, NULL
+         FROM hearings WHERE case_id = ?1 AND status IN ('draft','scheduled')
          UNION ALL
-         SELECT 'dispatch', id, subject || ' → ' || recipient_name, status FROM dispatches WHERE case_id = ?1 AND status IN ('draft','queued','failed')
+         SELECT 'dispatch', d.id, '', d.status, d.kind, d.recipient_name, h.starts_at
+         FROM dispatches d LEFT JOIN hearings h ON h.id = d.hearing_id
+         WHERE d.case_id = ?1 AND d.status IN ('draft','queued','failed')
          UNION ALL
-         SELECT 'decision', id, title, status FROM decisions WHERE case_id = ?1 AND status = 'draft'
+         SELECT 'decision', id, title, status, NULL, NULL, NULL FROM decisions WHERE case_id = ?1 AND status = 'draft'
          UNION ALL
-         SELECT 'unconfirmed_dispatch', d.id, d.subject || ' → ' || d.recipient_name, d.status
-         FROM dispatches d WHERE d.case_id = ?1 AND d.status = 'sent'
+         SELECT 'unconfirmed_dispatch', d.id, '', d.status, d.kind, d.recipient_name, h.starts_at
+         FROM dispatches d LEFT JOIN hearings h ON h.id = d.hearing_id
+         WHERE d.case_id = ?1 AND d.status = 'sent'
            AND NOT EXISTS (SELECT 1 FROM delivery_confirmations dc WHERE dc.dispatch_id = d.id AND dc.kind = 'human_handover')",
         [case_id],
     )?;
@@ -566,6 +571,26 @@ pub fn open_items(c: &Connection, case_id: i64) -> AppResult<Vec<Value>> {
             && let Some((t, at)) = l.split_once(" at ")
         {
             it["label"] = json!(format!("{t} at {}", crate::time::utc_to_local(at)));
+        }
+        if matches!(it["kind"].as_str(), Some("dispatch") | Some("unconfirmed_dispatch")) {
+            let recipient = it["recipient"].as_str().unwrap_or_default();
+            let base = match it["dispatch_kind"].as_str() {
+                Some("copies") => "Copy package".to_string(),
+                Some("information_request") => "Information request".to_string(),
+                _ => match it["hearing_starts"].as_str() {
+                    Some(starts) => format!(
+                        "Hearing notice for {}",
+                        crate::time::human_court_local(&crate::time::utc_to_local(starts), true)
+                    ),
+                    None => "Notice".to_string(),
+                },
+            };
+            it["label"] = json!(format!("{base} → {recipient}"));
+        }
+        if let Some(o) = it.as_object_mut() {
+            o.remove("dispatch_kind");
+            o.remove("recipient");
+            o.remove("hearing_starts");
         }
     }
     Ok(items)

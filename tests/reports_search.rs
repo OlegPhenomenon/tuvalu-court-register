@@ -156,6 +156,26 @@ async fn hearings_dispatch_and_workload_are_case_filtered() {
             r.get(0)
         })
         .unwrap();
+    // Drill-down rows keep the codes and add human labels for kind and method.
+    let (_, undelivered) = elena.get("/api/reports/undelivered_notices/items").await;
+    let row = undelivered["rows"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|r| r["id"] == did)
+        .unwrap();
+    assert_eq!(row["kind"], "notice");
+    assert_eq!(row["kind_label"], "Notice");
+    assert_eq!(row["method"], "email");
+    assert_eq!(row["method_label"], "E-mail (local mailbox in this installation)");
+    assert_eq!(row["status_label"], "Sent");
+    let keys: Vec<&str> = undelivered["columns"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|c| c["key"].as_str().unwrap())
+        .collect();
+    assert!(keys.contains(&"kind_label") && keys.contains(&"method_label") && keys.contains(&"status_label"));
     c.execute("INSERT INTO delivery_confirmations(dispatch_id,kind,note,recorded_by,recorded_at) VALUES(?1,'technical_ack','Technical delivery',?2,?3)",params![did,uid,now]).unwrap();
     let (_, technical) = elena.get("/api/reports/summary").await;
     assert_eq!(

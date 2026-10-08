@@ -459,17 +459,17 @@ async fn create(
             }
             require_ref(tx, "dispatch_method", &req.method)?;
             // One dispatch = one recipient: an active participant (default address = its service
-            // contact) or a free-form name.
+            // contact, then the party's e-mail, then the party's address) or a free-form name.
             let mut recipient_name = optional(&req.recipient_name);
             let mut address = optional(&req.address);
             if let Some(pid) = req.recipient_party_id {
-                let party: (String, Option<String>) = tx
+                let party: (String, Option<String>, Option<String>, Option<String>) = tx
                     .query_row(
-                        "SELECT p.name, cp.service_contact FROM case_participations cp
+                        "SELECT p.name, cp.service_contact, p.contact_email, p.address FROM case_participations cp
                          JOIN parties p ON p.id = cp.party_id
                          WHERE cp.case_id = ?1 AND cp.party_id = ?2 AND cp.active = 1",
                         params![case_id, pid],
-                        |r| Ok((r.get(0)?, r.get(1)?)),
+                        |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?, r.get(3)?)),
                     )
                     .optional()?
                     .ok_or_else(|| AppError::validation("The recipient is not an active participant of this case."))?;
@@ -477,7 +477,10 @@ async fn create(
                     recipient_name = Some(party.0);
                 }
                 if address.is_none() {
-                    address = party.1;
+                    address = [party.1, party.2, party.3]
+                        .into_iter()
+                        .flatten()
+                        .find(|a| !a.trim().is_empty());
                 }
             }
             let recipient_name = recipient_name
@@ -855,10 +858,15 @@ async fn confirm(ctx: Ctx, Path(id): Path<i64>, JsonBody(req): JsonBody<ConfirmR
                  VALUES (?1, ?2, ?3, ?4, ?5, ?6)",
                 params![id, req.kind, note, crate::time::parse_opt_date(req.occurred_date.as_deref())?, actor.user_id, crate::time::now_utc()],
             )?;
+            let recipient = d["recipient_name"].as_str().unwrap_or_default();
+            let summary = match req.kind.as_str() {
+                "human_handover" => format!("Handover to {recipient} confirmed by a person"),
+                _ => format!("Technical delivery acknowledgement recorded for {recipient}"),
+            };
             audit::record(
                 tx,
                 Some(&actor),
-                Event::new("dispatch.confirmed", "dispatch", id, format!("{} recorded for {}", req.kind.replace('_', " "), d["recipient_name"].as_str().unwrap_or_default()))
+                Event::new("dispatch.confirmed", "dispatch", id, summary)
                     .case(d["case_id"].as_i64())
                     .details(json!({ "kind": req.kind })),
             )?;
@@ -931,7 +939,7 @@ async fn cancel(ctx: Ctx, Path(id): Path<i64>, JsonBody(req): JsonBody<CancelReq
             audit::record(
                 tx,
                 Some(&actor),
-                Event::new("dispatch.cancelled", "dispatch", id, format!("Dispatch to {} cancelled", d["recipient_name"].as_str().unwrap_or_default()))
+                Event::new("dispatch.cancelled", "dispatch", id, super::common::dispatch_activity(tx, id, "cancelled")?)
                     .case(d["case_id"].as_i64())
                     .details(json!({ "reason": why })),
             )?;

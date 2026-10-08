@@ -84,6 +84,7 @@ async fn c1_closing_requires_confirmation_or_individual_reason_and_preserves_oth
     let items = b["error"]["details"]["items"].as_array().unwrap();
     assert_eq!(items.len(), 2);
     assert!(items.iter().all(|i| i["kind"] == "unconfirmed_dispatch" && i["status"] == "sent" && i["label"].is_string()));
+    assert!(items.iter().any(|i| i["label"] == "Notice → Alexei Fenwick"), "items: {items:?}");
     // A technical acknowledgement is not human confirmation.
     let (s, b) = olga.post(&format!("/api/dispatches/{first}/confirm"), json!({"kind":"technical_ack","note":"Local receipt"})).await;
     ok(s, &b);
@@ -125,7 +126,7 @@ async fn c1_closing_requires_confirmation_or_individual_reason_and_preserves_oth
     assert_eq!(audit_count(&olga, &app, "case.closed", cid), 1);
     let (_, card) = olga.get(&format!("/api/cases/{cid}")).await;
     let note = card["case"]["closure_note"].as_str().unwrap();
-    assert!(note.starts_with("Decision recorded\nLeft unconfirmed: "));
+    assert!(note.starts_with("Decision recorded\nLeft unconfirmed: Notice → Alexei Fenwick"));
     assert!(note.ends_with(" — Recipient could not be contacted"));
     let details: String = olga
         .db(&app)
@@ -507,8 +508,16 @@ async fn next_action_links_templates_reports_and_dispatch_wording_match_the_cont
             .as_array()
             .unwrap()
             .iter()
-            .any(|e| e["summary"] == "Copies of 2 documents sent to Maria Calder (maria@example.invalid)")
+            .any(|e| e["summary"] == "Copy package for Maria Calder (2 documents) sent (maria@example.invalid)")
     );
+    // Case-closing blockers name the hearing date and recipient instead of the e-mail subject.
+    let (s, b) = olga.post(&format!("/api/cases/{cid}/close"), json!({"basis":"decided"})).await;
+    err(s, &b, StatusCode::CONFLICT, "open_items");
+    let items = b["error"]["details"]["items"].as_array().unwrap();
+    assert!(items.iter().any(|i| i["kind"] == "unconfirmed_dispatch" && i["label"] == "Hearing notice for Tue 17 Nov 2026 → Alexei Fenwick"), "items: {items:?}");
+    assert!(items.iter().any(|i| i["kind"] == "dispatch" && i["label"] == "Hearing notice for Thu 19 Nov 2026 → Alexei Fenwick"), "items: {items:?}");
+    assert!(items.iter().any(|i| i["kind"] == "unconfirmed_dispatch" && i["label"] == "Copy package → Maria Calder"), "items: {items:?}");
+    assert!(items.iter().all(|i| i["recipient"].is_null() && i["dispatch_kind"].is_null() && i["hearing_starts"].is_null()));
     let (_, rows) = olga.get("/api/reports/new_cases/items").await;
     let row = rows["rows"].as_array().unwrap().iter().find(|r| r["id"] == cid).unwrap();
     assert_eq!(row["category"], "civil_contract");
