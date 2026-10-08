@@ -1,0 +1,12 @@
+.git
+target
+data
+web/node_modules
+web/dist
+docs/demo
+.orch
+.worktrees
+.playwright-mcp
+.kamal/secrets
+*.tcrb
+*.key
