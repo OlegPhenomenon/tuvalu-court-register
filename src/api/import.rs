@@ -693,10 +693,17 @@ async fn commit(ctx: Ctx, Path(id): Path<i64>, IdemKey(key): IdemKey) -> JsonRes
     let value = value?;
     // The import rows and idempotency response commit before any scanner network I/O.
     // Replays also finish any pending versions from an interrupted request.
-    for row in value["created"].as_array().into_iter().flatten() {
-        if let Some(version) = row["version_id"].as_i64() {
-            let key = ctx
-                .db
+    let versions: Vec<_> = value["created"]
+        .as_array()
+        .into_iter()
+        .flatten()
+        .filter_map(|row| row["version_id"].as_i64())
+        .collect();
+    let scan_db = ctx.db.clone();
+    // Detached batch continues to verdicts even if the importing connection disappears.
+    tokio::spawn(async move {
+        for version in versions {
+            let key = scan_db
                 .read(move |c| {
                     Ok(c.query_row(
                         "SELECT storage_key FROM document_versions WHERE id=?1",
@@ -705,9 +712,12 @@ async fn commit(ctx: Ctx, Path(id): Path<i64>, IdemKey(key): IdemKey) -> JsonRes
                     )?)
                 })
                 .await?;
-            crate::scan::finish(ctx.db.clone(), key).await?;
+            crate::scan::finish(scan_db.clone(), key).await?;
         }
-    }
+        Ok::<(), AppError>(())
+    })
+    .await
+    .map_err(|e| AppError::internal(e.to_string()))??;
     Ok(Json(value))
 }
 

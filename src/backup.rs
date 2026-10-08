@@ -565,6 +565,12 @@ pub fn restore(input: &Path, keyfile: &Path, target_dir: &Path) -> AppResult<Str
         return Err(invalid("Audit head does not match the manifest."));
     }
     verify_blob_rows(&c, &manifest.files)?;
+    // Counts and audit head above verify the original snapshot. Revoke source cookies
+    // only in the verified, unpublished copy, preserving accounts and second factors.
+    c.execute(
+        "UPDATE sessions SET revoked_at=?1 WHERE revoked_at IS NULL",
+        [crate::time::now_utc()],
+    )?;
     drop(c);
     drop(zip);
     // Keep the target itself in place: it may be a mounted volume.

@@ -1739,3 +1739,911 @@ async fn f10_import_scan_does_not_block_http_writes() {
     let (s, b) = write.expect("HTTP write blocked behind import scanner transaction");
     ok(s, &b);
 }
+
+fn r3_stream(dict: &str, payload: &[u8]) -> Vec<u8> {
+    let mut bytes = format!("%PDF-1.5\n1 0 obj <</Type/Pages/Count 0/Kids[]>> endobj\n2 0 obj <<{dict}/Length {}>>stream\n", payload.len()).into_bytes();
+    bytes.extend_from_slice(payload);
+    bytes.extend_from_slice(b"\nendstream\nendobj\n%%EOF");
+    bytes
+}
+
+#[test]
+fn r3_pdf_realistic_corpus_is_clean() {
+    let app = TestApp::production();
+    let db = app.state.main_db.as_ref().unwrap();
+    for name in [
+        "cups-text.pdf",
+        "cups-rtf-export.pdf",
+        "quartz-truetype.pdf",
+        "quartz-flate-image.pdf",
+    ] {
+        let bytes = std::fs::read(
+            std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+                .join("tests/fixtures/pdf")
+                .join(name),
+        )
+        .unwrap();
+        assert!(bytes.len() <= 60 * 1024);
+        let stored = tuvalu_court::storage::store(db, &bytes, name, 1_000_000).unwrap();
+        assert_eq!(
+            stored.scan_status, "clean",
+            "{name}: {:?}",
+            stored.scan_note
+        );
+    }
+}
+
+#[test]
+fn r3_pdf_non_object_payloads_are_clean() {
+    let app = TestApp::production();
+    let db = app.state.main_db.as_ref().unwrap();
+    for dict in [
+        "",
+        "/Type/XRef",
+        "/Subtype/Image/Width 1/Height 1",
+        "/Length1 12",
+        "/FunctionType 4",
+    ] {
+        for compressed in [false, true] {
+            // Pixel/font bytes, inline image data and PostScript are not PDF objects.
+            let payload = b"BI /W 1 /H 1 ID \x00\xff<({ DEMO } EI { dup mul }";
+            let (dict, payload) = if compressed {
+                (
+                    format!("{dict}/Filter/FlateDecode"),
+                    miniz_oxide::deflate::compress_to_vec_zlib(payload, 6),
+                )
+            } else {
+                (dict.to_string(), payload.to_vec())
+            };
+            let stored = tuvalu_court::storage::store(
+                db,
+                &r3_stream(&dict, &payload),
+                "demo.pdf",
+                1_000_000,
+            )
+            .unwrap();
+            assert_eq!(
+                stored.scan_status, "clean",
+                "{dict}: {:?}",
+                stored.scan_note
+            );
+        }
+    }
+    for dict in ["", "/Type/ObjStm"] {
+        let encoded = miniz_oxide::deflate::compress_to_vec_zlib(b"/J#53(DEMO active)", 6);
+        assert_eq!(
+            tuvalu_court::storage::store(
+                db,
+                &r3_stream(&format!("{dict}/Filter/FlateDecode"), &encoded),
+                "active.pdf",
+                1_000_000
+            )
+            .unwrap()
+            .scan_status,
+            "quarantined"
+        );
+    }
+}
+
+#[test]
+fn r3_pdf_predictor_encoded_object_stream_is_quarantined() {
+    let app = TestApp::production();
+    let db = app.state.main_db.as_ref().unwrap();
+    let active = b"1 0 <</Type/Catalog/OpenAction<</S/JavaScript/JS(DEMO)>> >>";
+    // PNG Up: the first row is spaces; the second row reconstructs the active object.
+    let mut predicted = vec![2];
+    predicted.extend(std::iter::repeat_n(b' ', active.len()));
+    predicted.push(2);
+    predicted.extend(active.iter().map(|b| b.wrapping_sub(b' ')));
+    let predicted = miniz_oxide::deflate::compress_to_vec_zlib(&predicted, 6);
+    let dict = format!(
+        "/Type/ObjStm/N 1/First 4/Filter/FlateDecode/DecodeParms<</Predictor 12/Columns {}>>",
+        active.len()
+    );
+    let stored = tuvalu_court::storage::store(
+        db,
+        &r3_stream(&dict, &predicted),
+        "predicted.pdf",
+        1_000_000,
+    )
+    .unwrap();
+    assert_eq!(stored.scan_status, "quarantined", "{:?}", stored.scan_note);
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn r3_import_scan_survives_dropped_request() {
+    use tokio::io::{AsyncReadExt, AsyncWriteExt};
+    let _lock = HEAVY.lock().await;
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let mut cfg = tuvalu_court::config::Config::for_tests(
+        Default::default(),
+        tuvalu_court::config::Mode::Production,
+    );
+    cfg.clamd = Some(format!("tcp://{}", listener.local_addr().unwrap()));
+    cfg.scan_timeout_ms = 3000;
+    let (app, olga) = seeded_production(cfg).await;
+    let (_, number) = register_case(&olga, "DEMO cancelled import").await;
+    let db = app.state.main_db.as_ref().unwrap();
+    let conn = db.open().unwrap();
+    let uid: i64 = conn
+        .query_row("SELECT id FROM users WHERE persona='elena'", [], |r| {
+            r.get(0)
+        })
+        .unwrap();
+    let mut c = olga.clone();
+    c.session = Some(auth::create_session(&conn, uid, true, 12).unwrap());
+    let manifest = format!(
+        "case_number,filename,title,doc_type,visibility,document_date\n{number},one.pdf,DEMO one,evidence,party_material,{}\n{number},two.pdf,DEMO two,evidence,party_material,{}\n",
+        today(),
+        today()
+    );
+    let archive = zip_files(&[
+        ("manifest.csv", manifest.as_bytes()),
+        ("one.pdf", &pdf("DEMO one")),
+        ("two.pdf", &pdf("DEMO two")),
+    ]);
+    let (s, b) = c
+        .upload("/api/import/files/preview", &[], "package.zip", &archive)
+        .await;
+    ok(s, &b);
+    let batch = b["batch_id"].as_i64().unwrap();
+    let job = tokio::spawn(async move {
+        c.post_idem(
+            &format!("/api/import/{batch}/commit"),
+            "DEMO cancelled import",
+            json!({}),
+        )
+        .await
+    });
+    let (mut socket, _) =
+        tokio::time::timeout(std::time::Duration::from_secs(5), listener.accept())
+            .await
+            .unwrap()
+            .unwrap();
+    let mut command = [0; 10];
+    socket.read_exact(&mut command).await.unwrap();
+    assert_eq!(&command, b"zINSTREAM\0");
+    loop {
+        let n = socket.read_u32().await.unwrap();
+        if n == 0 {
+            break;
+        }
+        socket.read_exact(&mut vec![0; n as usize]).await.unwrap();
+    }
+    job.abort();
+    assert!(job.await.unwrap_err().is_cancelled());
+    // Both the live scan and the next version in the batch must survive cancellation.
+    let scanner = tokio::spawn(async move {
+        socket.write_all(b"stream: OK\0").await.unwrap();
+        let (mut socket, _) = listener.accept().await.unwrap();
+        socket.read_exact(&mut command).await.unwrap();
+        loop {
+            let n = socket.read_u32().await.unwrap();
+            if n == 0 {
+                break;
+            }
+            socket.read_exact(&mut vec![0; n as usize]).await.unwrap();
+        }
+        socket.write_all(b"stream: OK\0").await.unwrap();
+    });
+    let verdict = tokio::time::timeout(std::time::Duration::from_secs(5), async {
+        loop {
+            let clean: i64 = conn.query_row("SELECT COUNT(*) FROM document_versions v JOIN documents d ON d.id=v.document_id WHERE d.title IN ('DEMO one','DEMO two') AND v.scan_status='clean'", [], |r| r.get(0)).unwrap();
+            if clean == 2 { break; }
+            tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+        }
+    }).await;
+    scanner.abort();
+    assert!(
+        verdict.is_ok(),
+        "cancelled import left committed versions pending"
+    );
+    assert_eq!(tuvalu_court::audit::verify_chain(&conn).unwrap().1, None);
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn r3_restore_revokes_source_sessions_and_allows_password_totp_login() {
+    let app = TestApp::production();
+    let c = enrolled(&app).await;
+    let db = app.state.main_db.as_ref().unwrap();
+    let conn = db.open().unwrap();
+    // The restored account must accept a fresh code, not replay a consumed one.
+    let secret: String = conn
+        .query_row(
+            "SELECT totp_secret FROM users WHERE username='demostaff'",
+            [],
+            |r| r.get(0),
+        )
+        .unwrap();
+    conn.execute(
+        "UPDATE users SET must_change_password=0,totp_last_step=NULL",
+        [],
+    )
+    .unwrap();
+    let uid: i64 = conn
+        .query_row("SELECT id FROM users WHERE username='demostaff'", [], |r| {
+            r.get(0)
+        })
+        .unwrap();
+    let pending_cookie = auth::create_session(&conn, uid, false, 12).unwrap();
+    let key = app.dir.join("sessions.key");
+    let archive = app.dir.join("sessions.tcrb");
+    let target = app.dir.join("restored");
+    tuvalu_court::backup::gen_key(&key).unwrap();
+    tuvalu_court::backup::backup(db, &archive, &key).unwrap();
+    tuvalu_court::backup::restore(&archive, &key, &target).unwrap();
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let port = listener.local_addr().unwrap().port();
+    drop(listener);
+    let child = Command::new(env!("CARGO_BIN_EXE_tuvalu-court"))
+        .arg("serve")
+        .env("TCR_MODE", "production")
+        .env("TCR_AV", "off")
+        .env("TCR_DATA_DIR", &target)
+        .env("TCR_BIND", format!("127.0.0.1:{port}"))
+        .env_remove("TCR_ENV_FILE")
+        .stdout(Stdio::null())
+        .stderr(Stdio::null())
+        .spawn()
+        .unwrap();
+    let mut server = RunningServer(child);
+    for _ in 0..100 {
+        if tokio::net::TcpStream::connect(("127.0.0.1", port))
+            .await
+            .is_ok()
+        {
+            break;
+        }
+        assert!(
+            server.0.try_wait().unwrap().is_none(),
+            "restored server exited"
+        );
+        tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+    }
+    for cookie in [c.session.as_deref().unwrap(), &pending_cookie] {
+        assert_eq!(
+            network_http(port, "GET", "/api/auth/me", json!({}), Some(cookie))
+                .await
+                .0,
+            401,
+            "source cookie survived restore"
+        );
+    }
+    let (status, b, cookie) = network_http(
+        port,
+        "POST",
+        "/api/auth/login",
+        json!({"username":"demostaff","password":"temporary-pass-99"}),
+        None,
+    )
+    .await;
+    assert_eq!(status, 200);
+    assert_eq!(b["mfa_required"], true);
+    let (status, _, cookie) = network_http(
+        port,
+        "POST",
+        "/api/auth/totp",
+        json!({"code":auth::current_totp(&secret).unwrap()}),
+        cookie.as_deref(),
+    )
+    .await;
+    assert_eq!(status, 200);
+    assert_eq!(
+        network_http(port, "GET", "/api/cases", json!({}), cookie.as_deref())
+            .await
+            .0,
+        200
+    );
+    assert_eq!(
+        c.get("/api/auth/me").await.0,
+        StatusCode::OK,
+        "restore mutated source sessions"
+    );
+}
+
+#[test]
+fn r3_pdf_untyped_asciihex_stream_is_quarantined() {
+    let app = TestApp::production();
+    let db = app.state.main_db.as_ref().unwrap();
+    let active = b"1 0 <</Type/Catalog/OpenAction<</S/JavaScript/JS(DEMO)>> >>";
+    let encoded = format!("{}>", hex::encode(active));
+    let stored = tuvalu_court::storage::store(
+        db,
+        &r3_stream("/N 1/First 4/Filter/ASCIIHexDecode", encoded.as_bytes()),
+        "hex.pdf",
+        1_000_000,
+    )
+    .unwrap();
+    assert_eq!(stored.scan_status, "quarantined", "{:?}", stored.scan_note);
+}
+
+#[test]
+fn r3_pdf_large_token_count_is_clean() {
+    let app = TestApp::production();
+    let db = app.state.main_db.as_ref().unwrap();
+    let mut bytes = b"%PDF-1.4\n1 0 obj [".to_vec();
+    bytes.extend_from_slice(&b"0 ".repeat(300_000));
+    bytes.extend_from_slice(b"] endobj\n%%EOF");
+    let stored = tuvalu_court::storage::store(db, &bytes, "large.pdf", 1_000_000).unwrap();
+    assert_eq!(stored.scan_status, "clean", "{:?}", stored.scan_note);
+}
+
+#[test]
+fn r3_pdf_predictors_images_and_decode_parameters() {
+    let app = TestApp::production();
+    let db = app.state.main_db.as_ref().unwrap();
+    let clean = b"1 0 << /Type /Pages /Count 0 /Kids [] >>";
+    for (predictor, bytes) in [
+        (
+            2,
+            clean
+                .iter()
+                .enumerate()
+                .map(|(i, b)| {
+                    if i == 0 {
+                        *b
+                    } else {
+                        b.wrapping_sub(clean[i - 1])
+                    }
+                })
+                .collect::<Vec<_>>(),
+        ),
+        (10, [&[0][..], clean].concat()),
+        (12, [&[2][..], clean].concat()),
+        (
+            15,
+            [
+                &[4][..],
+                &clean
+                    .iter()
+                    .enumerate()
+                    .map(|(i, b)| {
+                        if i == 0 {
+                            *b
+                        } else {
+                            b.wrapping_sub(clean[i - 1])
+                        }
+                    })
+                    .collect::<Vec<_>>(),
+            ]
+            .concat(),
+        ),
+    ] {
+        let compressed = miniz_oxide::deflate::compress_to_vec_zlib(&bytes, 6);
+        let dict = format!(
+            "/Type/ObjStm/N 1/First 4/Filter[/FlateDecode]/DecodeParms[<</Predictor {predictor}/Columns {}>>]",
+            clean.len()
+        );
+        let stored = tuvalu_court::storage::store(
+            db,
+            &r3_stream(&dict, &compressed),
+            "predictor.pdf",
+            1_000_000,
+        )
+        .unwrap();
+        assert_eq!(
+            stored.scan_status, "clean",
+            "predictor {predictor}: {:?}",
+            stored.scan_note
+        );
+    }
+    let compressed = miniz_oxide::deflate::compress_to_vec_zlib(b"DEMO", 6);
+    for params in [
+        "<</Predictor 99>>",
+        "<</Predictor 12/BitsPerComponent 16>>",
+        "5 0 R",
+        "[null null]",
+        "<</Predictor 12/Columns 999999999>>",
+    ] {
+        let stored = tuvalu_court::storage::store(
+            db,
+            &r3_stream(
+                &format!("/Filter/FlateDecode/DecodeParms {params}"),
+                &compressed,
+            ),
+            "opaque.pdf",
+            1_000_000,
+        )
+        .unwrap();
+        assert_eq!(
+            stored.scan_status, "quarantined",
+            "{params}: {:?}",
+            stored.scan_note
+        );
+    }
+    for filter in [
+        "ASCIIHexDecode",
+        "DCTDecode",
+        "JPXDecode",
+        "CCITTFaxDecode",
+        "JBIG2Decode",
+    ] {
+        let stored = tuvalu_court::storage::store(
+            db,
+            &r3_stream(
+                &format!("/Subtype/Image/Filter/{filter}"),
+                b"DEMO opaque image",
+            ),
+            "image.pdf",
+            1_000_000,
+        )
+        .unwrap();
+        assert_eq!(
+            stored.scan_status, "clean",
+            "image {filter}: {:?}",
+            stored.scan_note
+        );
+        let stored = tuvalu_court::storage::store(
+            db,
+            &r3_stream(
+                &format!("/Type/ObjStm/Subtype/Image/Filter/{filter}"),
+                b"DEMO hidden object",
+            ),
+            "object.pdf",
+            1_000_000,
+        )
+        .unwrap();
+        assert_eq!(stored.scan_status, "quarantined");
+    }
+    let stored = tuvalu_court::storage::store(
+        db,
+        &r3_stream(
+            "/Subtype/Image/Filter/FlateDecode/DecodeParms<</Predictor 12/BitsPerComponent 16>>",
+            &compressed,
+        ),
+        "image.pdf",
+        1_000_000,
+    )
+    .unwrap();
+    assert_eq!(stored.scan_status, "clean", "{:?}", stored.scan_note);
+    let stored = tuvalu_court::storage::store(
+        db,
+        &r3_stream("/Filter/FlateDecode/DecodeParms null", &compressed),
+        "content.pdf",
+        1_000_000,
+    )
+    .unwrap();
+    assert_eq!(stored.scan_status, "clean", "{:?}", stored.scan_note);
+}
+
+#[test]
+fn r3_pdf_indirect_length_preserves_compressed_line_endings() {
+    let app = TestApp::production();
+    let db = app.state.main_db.as_ref().unwrap();
+    let compressed = (0..1000)
+        .find_map(|n| {
+            let payload = format!("DEMO indirect stream {n}");
+            let compressed = miniz_oxide::deflate::compress_to_vec_zlib(payload.as_bytes(), 6);
+            matches!(compressed.last(), Some(b'\n' | b'\r')).then_some(compressed)
+        })
+        .unwrap();
+    let mut bytes = b"%PDF-1.5\n1 0 obj <</Filter/FlateDecode/Length 2 0 R>>stream\n".to_vec();
+    bytes.extend_from_slice(&compressed);
+    bytes.extend_from_slice(
+        format!(
+            "\nendstream\nendobj\n2 0 obj {} endobj\n%%EOF",
+            compressed.len()
+        )
+        .as_bytes(),
+    );
+    let stored = tuvalu_court::storage::store(db, &bytes, "indirect.pdf", 1_000_000).unwrap();
+    assert_eq!(stored.scan_status, "clean", "{:?}", stored.scan_note);
+}
+
+#[test]
+fn r3_pdf_payload_name_boundaries_avoid_incidental_binary_matches() {
+    let app = TestApp::production();
+    let db = app.state.main_db.as_ref().unwrap();
+    for payload in [
+        &b"\xffDEMO-pixels/JS \x00\xff"[..],
+        &b"DEMO-profile/AA "[..],
+    ] {
+        let compressed = miniz_oxide::deflate::compress_to_vec_zlib(payload, 6);
+        let stored = tuvalu_court::storage::store(
+            db,
+            &r3_stream("/Filter/FlateDecode", &compressed),
+            "demo.pdf",
+            1_000_000,
+        )
+        .unwrap();
+        assert_eq!(stored.scan_status, "clean", "{:?}", stored.scan_note);
+    }
+    for payload in [
+        &b"<</Type/Catalog/OpenAction<</S/JavaScript/J#53(DEMO)>>>>"[..],
+        &b"<</Pages 1 0 R/AA<</O 2 0 R>>>>"[..],
+        &b"<</Count 1/AA<</O 2 0 R>>>>"[..],
+        &b"<</Flag true/AA<</O 2 0 R>>>>"[..],
+    ] {
+        let compressed = miniz_oxide::deflate::compress_to_vec_zlib(payload, 6);
+        let stored = tuvalu_court::storage::store(
+            db,
+            &r3_stream("/Filter/FlateDecode", &compressed),
+            "active.pdf",
+            1_000_000,
+        )
+        .unwrap();
+        assert_eq!(stored.scan_status, "quarantined", "{:?}", stored.scan_note);
+    }
+}
+
+#[test]
+fn r3_pdf_xml_thumbnail_names_are_not_action_keys() {
+    let app = TestApp::production();
+    let db = app.state.main_db.as_ref().unwrap();
+    let compressed = miniz_oxide::deflate::compress_to_vec_zlib(
+        b"<DEMO-thumbnail>\n/AA/DEMO\n/JS/DEMO\n</DEMO-thumbnail>",
+        6,
+    );
+    let stored = tuvalu_court::storage::store(
+        db,
+        &r3_stream("/Type/Metadata/Subtype/XML/Filter/FlateDecode", &compressed),
+        "metadata.pdf",
+        1_000_000,
+    )
+    .unwrap();
+    assert_eq!(stored.scan_status, "clean", "{:?}", stored.scan_note);
+}
+
+// Follow-up PDF compatibility and fail-closed action/encoding regressions.
+fn r3_followup_pdf_status(bytes: &[u8], expected: &str, limit: u64) {
+    let app = TestApp::production();
+    let db = app.state.main_db.as_ref().unwrap();
+    let stored = tuvalu_court::storage::store(db, bytes, "demo.pdf", limit).unwrap();
+    assert_eq!(stored.scan_status, expected, "{:?}", stored.scan_note);
+}
+
+#[test]
+fn r3_followup_pdf_actions_and_duplicate_keys() {
+    for body in [
+        "1 0 obj <</OpenAction[3 0 R/Fit]>> endobj",
+        "1 0 obj <</OpenAction 2 0 R>> endobj 2 0 obj [3 0 R/Fit] endobj",
+        "1 0 obj <</AA<</O<</S/GoTo/D[3 0 R/Fit]>>>>>> endobj",
+        "1 0 obj <</OpenAction 2 0 R>> endobj 2 0 obj <</S 4 0 R/D[3 0 R/Fit]>> endobj 4 0 obj /GoTo endobj",
+        "1 0 obj <</Type/Annot/Subtype/Link/A<</S/URI/URI(https://example.test/)>>>> endobj",
+        "1 0 obj <</OpenAction<</S/GoToR/F(other.pdf)/D[0/Fit]>>>> endobj",
+        "1 0 obj <</OpenAction<</S/ResetForm>>>> endobj",
+        "1 0 obj <</OpenAction<</S/Sound>>>> endobj",
+        "1 0 obj <</OpenAction<</S/Movie>>>> endobj",
+        "1 0 obj <</Producer(DEMO first)/Producer(DEMO second)>> endobj",
+        "1 0 obj <</Note/Launch/Label/SubmitForm>> endobj",
+        "1 0 obj <</Note/Encrypt/Encrypt null>> endobj",
+        "1 0 obj <</Subtype/Link/A 2 0 R>> endobj 2 0 obj <</S 4 0 R/URI(https://example.test/)>> endobj 4 0 obj /URI endobj",
+        "1 0 obj <</Type/Font/CharProcs<</A 9 0 R>>>> endobj",
+    ] {
+        r3_followup_pdf_status(
+            format!("%PDF-1.5\n{body}\n%%EOF").as_bytes(),
+            "clean",
+            1_000_000,
+        );
+    }
+    for body in [
+        "1 0 obj <</OpenAction 2 0 R>> endobj 2 0 obj <</S 4 0 R>> endobj 4 0 obj /JavaScript endobj",
+        "1 0 obj <</OpenAction 2 0 R>> endobj 2 0 obj <</S/Launch>> endobj",
+        "1 0 obj <</OpenAction 2 0 R>> endobj",
+        "1 0 obj <</OpenAction 2 0 R>> endobj 2 0 obj <</S 4 0 R>> endobj",
+        "1 0 obj <</AA<</O 7 0 R>>>> endobj",
+        "1 0 obj <</OpenAction<</S/URI/Next 2 0 R>>>> endobj 2 0 obj <</S/Launch>> endobj",
+        "1 0 obj <</OpenAction<</S/GoToR/F 2 0 R>>>> endobj 2 0 obj <</F(DEMO.cmd)>> endobj",
+        "1 0 obj <</OpenAction<</S/GoToR/F<FEFF00640065006D006F002E006500780065>>>>>> endobj",
+        "1 0 obj <</S/URI/S/Launch>> endobj",
+        "1 0 obj <</S/URI/#53/URI>> endobj",
+        "1 0 obj <</Note/J#53>> endobj",
+        "1 0 obj <</Encrypt 2 0 R>> endobj",
+        "1 0 obj <</Subtype/Link/A 9 0 R>> endobj",
+        "1 0 obj <</Title(DEMO outline)/A 9 0 R>> endobj",
+        "1 0 obj <</OpenAction<</S/GoToR/F<</FS/URL/F(file:///DEMO%2Eexe)>>>>>> endobj",
+        "1 0 obj <</OpenAction<</S/GoToR/F(DEMO.exe:Zone.Identifier)>>>> endobj",
+        "1 0 obj <</OpenAction 2 0 R>> endobj 2 0 obj <</S/URI/Next 2 0 R>> endobj",
+    ] {
+        r3_followup_pdf_status(
+            format!("%PDF-1.5\n{body}\n%%EOF").as_bytes(),
+            "quarantined",
+            1_000_000,
+        );
+    }
+    for action in [
+        "JavaScript",
+        "Launch",
+        "SubmitForm",
+        "ImportData",
+        "Rendition",
+        "GoToE",
+    ] {
+        r3_followup_pdf_status(
+            format!("%PDF-1.5\n1 0 obj <</OpenAction<</S/{action}>>>> endobj\n%%EOF").as_bytes(),
+            "quarantined",
+            1_000_000,
+        );
+    }
+}
+
+fn r3_followup_ascii85(bytes: &[u8]) -> Vec<u8> {
+    let mut encoded = Vec::new();
+    for group in bytes.chunks(4) {
+        let mut word = [0; 4];
+        word[..group.len()].copy_from_slice(group);
+        let mut value = u32::from_be_bytes(word);
+        if value == 0 && group.len() == 4 {
+            encoded.push(b'z');
+            continue;
+        }
+        let mut digits = [0; 5];
+        for digit in digits.iter_mut().rev() {
+            *digit = (value % 85) as u8 + b'!';
+            value /= 85;
+        }
+        encoded.extend_from_slice(&digits[..group.len() + 1]);
+    }
+    encoded.extend_from_slice(b"~>");
+    encoded
+}
+fn r3_followup_runlength(bytes: &[u8]) -> Vec<u8> {
+    let mut encoded = Vec::new();
+    for group in bytes.chunks(128) {
+        encoded.push(group.len() as u8 - 1);
+        encoded.extend_from_slice(group);
+    }
+    encoded.push(128);
+    encoded
+}
+// Literal LZW codes exercise all width transitions and dictionary saturation,
+// without coupling the fixture to a compression library or the production decoder.
+fn r3_followup_lzw(bytes: &[u8], early: usize) -> Vec<u8> {
+    let mut encoded = Vec::new();
+    let mut bits = 0u32;
+    let mut available = 0usize;
+    let mut width = 9;
+    let mut next = 258usize;
+    for (index, code) in std::iter::once(256u16)
+        .chain(bytes.iter().map(|b| *b as u16))
+        .chain(std::iter::once(257))
+        .enumerate()
+    {
+        bits = (bits << width) | code as u32;
+        available += width;
+        while available >= 8 {
+            available -= 8;
+            encoded.push((bits >> available) as u8);
+            bits &= (1 << available) - 1;
+        }
+        if index > 1 && code != 257 && next < 4096 {
+            next += 1;
+            if width < 12 && next + early == 1 << width {
+                width += 1;
+            }
+        }
+    }
+    if available > 0 {
+        encoded.push((bits << (8 - available)) as u8);
+    }
+    encoded
+}
+
+#[test]
+fn r3_followup_pdf_encoded_object_streams() {
+    for active in [false, true] {
+        let content = if active {
+            b"8 0 <</JS(DEMO)>>".as_slice()
+        } else {
+            b"8 0 <</Producer(DEMO)>>"
+        };
+        let expected = if active { "quarantined" } else { "clean" };
+        for (filter, params, encoded) in [
+            (
+                "ASCIIHexDecode",
+                "",
+                format!("{}>", hex::encode(content)).into_bytes(),
+            ),
+            ("ASCII85Decode", "", r3_followup_ascii85(content)),
+            ("RunLengthDecode", "", r3_followup_runlength(content)),
+            (
+                "LZWDecode",
+                "/DecodeParms<</EarlyChange 0>>",
+                r3_followup_lzw(content, 0),
+            ),
+            (
+                "LZWDecode",
+                "/DecodeParms<</EarlyChange 1>>",
+                r3_followup_lzw(content, 1),
+            ),
+        ] {
+            let dict = format!("/Type/ObjStm/N 1/First 4/Filter/{filter}{params}");
+            r3_followup_pdf_status(&r3_stream(&dict, &encoded), expected, 1_000_000);
+        }
+        let flate = miniz_oxide::deflate::compress_to_vec_zlib(content, 6);
+        let encoded = r3_followup_ascii85(&flate);
+        r3_followup_pdf_status(
+            &r3_stream(
+                "/Type/ObjStm/N 1/First 4/Filter[/ASCII85Decode/FlateDecode]/DecodeParms[null null]",
+                &encoded,
+            ),
+            expected,
+            1_000_000,
+        );
+    }
+    // The action dictionary and /S target both live in compressed objects.
+    for action in ["GoTo", "Launch", "JavaScript"] {
+        let first_object = b"<</S 9 0 R/D[3 0 R/Fit]>>";
+        let header = format!("8 0 9 {} ", first_object.len() + 1);
+        let content = [
+            header.as_bytes(),
+            first_object,
+            b" ",
+            format!("/{action}").as_bytes(),
+        ]
+        .concat();
+        let compressed = miniz_oxide::deflate::compress_to_vec_zlib(&content, 6);
+        let mut pdf = r3_stream(
+            &format!("/Type/ObjStm/N 2/First {}/Filter/FlateDecode", header.len()),
+            &compressed,
+        );
+        pdf.extend_from_slice(b"\n10 0 obj <</OpenAction 8 0 R>> endobj\n%%EOF");
+        r3_followup_pdf_status(
+            &pdf,
+            if action == "GoTo" {
+                "clean"
+            } else {
+                "quarantined"
+            },
+            1_000_000,
+        );
+    }
+    for early in [0, 1] {
+        let mut content = b"8 0 <</Note(".to_vec();
+        content.extend_from_slice(&b"DEMO literal text ".repeat(500));
+        content.extend_from_slice(b")>>");
+        r3_followup_pdf_status(
+            &r3_stream(
+                &format!(
+                    "/Type/ObjStm/N 1/First 4/Filter/LZWDecode/DecodeParms<</EarlyChange {early}>>"
+                ),
+                &r3_followup_lzw(&content, early),
+            ),
+            "clean",
+            1_000_000,
+        );
+    }
+    // LZW KwKwK: clear, A, new-code 258, EOD decodes to AAA.
+    let codes = [256u16, 65, 258, 257];
+    let bits = codes
+        .iter()
+        .fold(0u64, |bits, code| (bits << 9) | *code as u64)
+        << 4;
+    r3_followup_pdf_status(
+        &r3_stream("/Filter/LZWDecode", &bits.to_be_bytes()[3..]),
+        "clean",
+        1_000_000,
+    );
+    r3_followup_pdf_status(
+        &r3_stream("/Filter/RunLengthDecode", &[255, b'A', 128]),
+        "clean",
+        1_000_000,
+    );
+    r3_followup_pdf_status(
+        &r3_stream("/Filter/ASCII85Decode", b"z~>"),
+        "clean",
+        1_000_000,
+    );
+    r3_followup_pdf_status(
+        &r3_stream("/Filter/ASCIIHexDecode", b"4>"),
+        "clean",
+        1_000_000,
+    );
+}
+
+#[test]
+fn r3_followup_pdf_streaming_limits_and_boundaries() {
+    // Drop the 30 MiB source before scanning: only a tiny encoded stream remains.
+    let compressed = {
+        let content = vec![b' '; 30 * 1024 * 1024];
+        miniz_oxide::deflate::compress_to_vec_zlib(&content, 6)
+    };
+    let pdf = r3_stream("/Filter/FlateDecode", &compressed);
+    r3_followup_pdf_status(&pdf, "clean", 1_000_000);
+    r3_followup_pdf_status(&pdf, "quarantined", 100_000);
+    for offset in 8180..8200 {
+        let mut content = vec![b' '; offset];
+        content.extend_from_slice(b"/J#53(DEMO)");
+        let compressed = miniz_oxide::deflate::compress_to_vec_zlib(&content, 6);
+        r3_followup_pdf_status(
+            &r3_stream("/Filter/FlateDecode", &compressed),
+            "quarantined",
+            1_000_000,
+        );
+        let mut content = vec![b' '; offset];
+        content.extend_from_slice(b"/JavaScriptLongBenignName ");
+        let compressed = miniz_oxide::deflate::compress_to_vec_zlib(&content, 6);
+        r3_followup_pdf_status(
+            &r3_stream("/Filter/FlateDecode", &compressed),
+            "clean",
+            1_000_000,
+        );
+    }
+    for (filter, data) in [
+        ("ASCIIHexDecode", b"xyz>".as_slice()),
+        ("ASCII85Decode", b"!~>"),
+        ("ASCII85Decode", b"uuuuu~>"),
+        ("RunLengthDecode", b"\x05abc"),
+        ("LZWDecode", b"\xff\xff"),
+        ("DCTDecode", b"DEMO uninspectable non-image"),
+    ] {
+        r3_followup_pdf_status(
+            &r3_stream(&format!("/Filter/{filter}"), data),
+            "quarantined",
+            1_000_000,
+        );
+    }
+}
+
+#[test]
+fn r3_followup_pdf_predictor_chains_and_type_ambiguity() {
+    for active in [false, true] {
+        let content = if active {
+            b"8 0 <</JS(DEMO)>>".as_slice()
+        } else {
+            b"8 0 <</Producer(DEMO)>>"
+        };
+        let mut predicted = vec![0];
+        predicted.extend_from_slice(content);
+        for early in [0, 1] {
+            let lzw = r3_followup_lzw(&predicted, early);
+            let encoded = r3_followup_ascii85(&lzw);
+            let dict = format!(
+                "/Type/ObjStm/N 1/First 4/Filter[/ASCII85Decode/LZWDecode]/DecodeParms[null<</EarlyChange {early}/Predictor 15/Columns {}>>]",
+                content.len()
+            );
+            r3_followup_pdf_status(
+                &r3_stream(&dict, &encoded),
+                if active { "quarantined" } else { "clean" },
+                1_000_000,
+            );
+        }
+    }
+    r3_followup_pdf_status(
+        &r3_stream(
+            "/Type 9 0 R/Subtype/Image/Filter/ASCIIHexDecode",
+            b"2F4A53>",
+        ),
+        "quarantined",
+        1_000_000,
+    );
+    for dict in [
+        "/Filter/FlateDecode/Filter/FlateDecode",
+        "/Filter/FlateDecode/DecodeParms<</Predictor 1/Predictor 1>>",
+        "/Type/ObjStm/N 1/First 4/First 4/Filter/FlateDecode",
+    ] {
+        let compressed = miniz_oxide::deflate::compress_to_vec_zlib(b"8 0 <</Producer(DEMO)>>", 6);
+        r3_followup_pdf_status(&r3_stream(dict, &compressed), "quarantined", 1_000_000);
+    }
+    // A missing object-stream header remains malformed even when its body is benign.
+    r3_followup_pdf_status(
+        &r3_stream("/Type/ObjStm", b"<</Producer(DEMO)>>"),
+        "quarantined",
+        1_000_000,
+    );
+}
+
+#[test]
+fn r3_followup_pdf_stream_names_are_not_xml_paths() {
+    let compressed = miniz_oxide::deflate::compress_to_vec_zlib(b"/J#53/DEMO", 6);
+    r3_followup_pdf_status(
+        &r3_stream("/Filter/FlateDecode", &compressed),
+        "quarantined",
+        1_000_000,
+    );
+}
+
+#[test]
+fn r3_followup_pdf_image_exception_requires_image_syntax() {
+    for dict in [
+        "/Type/Metadata/Subtype/Image/Filter/ASCIIHexDecode",
+        "/Type/XObject/Subtype/Image/N 1/First 4/Filter/ASCIIHexDecode",
+    ] {
+        let encoded = format!("{}>", hex::encode(b"8 0 <</S/Launch>>"));
+        r3_followup_pdf_status(
+            &r3_stream(dict, encoded.as_bytes()),
+            "quarantined",
+            1_000_000,
+        );
+    }
+}

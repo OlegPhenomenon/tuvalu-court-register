@@ -92,8 +92,10 @@ including drafts, carry an explicit DRAFT / working material label in the messag
   `TCR_COOKIE_SECURE=true` (always set it behind HTTPS).
 - Sessions expire after `TCR_SESSION_HOURS` (default 12), are revoked on
   password change and user deactivation, and can be revoked by an administrator
-  (`revoke-sessions`). The session token is rotated after the second factor is
-  completed (session-fixation defence).
+  (`revoke-sessions`). Restore revokes every session in the verified snapshot before
+  publication; source cookies cannot authenticate to the restored installation.
+  Passwords and enrolled TOTP secrets are preserved for a new login. The session
+  token is rotated after the second factor is completed (session-fixation defence).
 - CSRF: every non-GET request must send the header `X-TCR: 1`, and when a
   browser sends `Origin` its host must equal `Host`. Either failure → `403
   csrf`. Combined with `SameSite=Strict` this blocks cross-site form posts.
@@ -166,7 +168,8 @@ including drafts, carry an explicit DRAFT / working material label in the messag
   and out of the repository.**
 - `restore` only accepts a new or empty directory, verifies authentication,
   manifest, row counts, foreign keys, file checksums and the audit head, and
-  publishes files only after every check passes.
+  revokes all restored sessions before publication, and publishes files only after
+  every check passes. Users must log in again with password and TOTP.
 
 ## Known limitations
 
@@ -216,13 +219,33 @@ Uploads are pending until a verdict; only explicit OK allows clean. Startup
 quarantines interrupted pending checks. Download, inline preview, export, dispatch,
 SMTP attachments and mailbox links cannot retrieve pending/quarantined bytes.
 Imports commit pending versions before contacting clamd outside the writer
-transaction; full backups retain verdicts. Built-in checks include PDF dictionary
-tokenisation (comments, escaped/nested strings, hex strings, nested dictionaries,
-escaped names) and bounded inflation of every FlateDecode stream, PNG CRC/structure, JPEG
-segments/EOI and DOCX macros/ActiveX/OLE. Neither these checks nor antivirus prove
-absolute file safety; unsupported PDF stream encodings are quarantined when they
-prevent object-stream inspection or leave no inspectable document structure.
-Unparsable dictionaries are quarantined.
+transaction; their detached scan task continues through every imported version
+even if the request disconnects; full backups retain verdicts.
+Built-in checks include PDF dictionary tokenisation (comments, escaped/nested
+strings, hex strings, nested dictionaries and escaped names), including bounded
+`/Type /ObjStm` parsing and an indirect-object table. OpenAction destinations,
+GoTo and URI links are allowed; action dictionaries are checked through indirect
+references, including compressed objects and `/S` references. JavaScript names,
+attachments, RichMedia, XFA, launch/form submission, import, rendition and
+embedded/remote executable actions are quarantined. Encrypted files, unresolved
+actions and malformed syntax fail closed. Duplicate security-relevant keys
+(including action, stream decoding and file-specification keys) fail closed;
+duplicate ordinary metadata keys are allowed. Content/font/xref streams receive
+a complete-name scan at PDF lexical boundaries, with `#xx` escapes and bounded
+lookahead across chunks, rather than object tokenisation. Flate, ASCIIHex,
+ASCII85, RunLength and LZW (EarlyChange 0/1) decode through streaming filter
+chains of at most eight stages. Common 8-bit TIFF/PNG predictors are reversed
+row by row (at most 1 MiB per row). Decoded bytes across all stages share a per-
+file budget of 64 times the configured upload limit; object-stream buffers and
+the retained object table each have a 32 MiB cap, with an 8 MiB allocation
+budget per parsed value. Large scalar arrays are summarised, and fail closed if
+used as actions or decoding parameters. Clearly declared image data may remain
+uninspected for image codecs, byte-oriented image encodings or unsupported
+predictors; object streams cannot use that exception, and an image codec alone
+never exempts a non-image stream. Unsupported non-image encodings/parameters
+fail closed. Built-in checks also cover PNG CRC/structure, JPEG segments/EOI and
+DOCX macros/ActiveX/OLE. Neither these checks nor antivirus prove absolute file
+safety.
 
 SMTP requires STARTTLS or implicit TLS with rustls/ring and bundled webpki roots;
 credentials never appear in Settings. Demo ignores SMTP configuration. Production
