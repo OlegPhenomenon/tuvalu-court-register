@@ -272,3 +272,27 @@ pub async fn user_id(c: &Client, persona_display_prefix: &str) -> i64 {
         .as_i64()
         .unwrap()
 }
+
+/// Insert a document + version 1 directly (bypasses the upload endpoint) so modules can be tested
+/// independently. `visibility`: administrative | party_material | restricted | judicial_note.
+/// Returns (document_id, version_id).
+pub fn insert_document(db: &tuvalu_court::db::Db, case_id: i64, title: &str, doc_type: &str, visibility: &str, created_by: i64) -> (i64, i64) {
+    let bytes = pdf(title);
+    let (key, sha) = tuvalu_court::storage::write_blob(db, &bytes).unwrap();
+    let now = tuvalu_court::time::now_utc();
+    let conn = db.open().unwrap();
+    conn.execute(
+        "INSERT INTO documents (case_id, title, doc_type, source, visibility, created_by, created_at)
+         VALUES (?1, ?2, ?3, 'court', ?4, ?5, ?6)",
+        rusqlite::params![case_id, title, doc_type, visibility, created_by, now],
+    )
+    .unwrap();
+    let doc = conn.last_insert_rowid();
+    conn.execute(
+        "INSERT INTO document_versions (document_id, version_no, filename, content_type, size_bytes, sha256, storage_key, scan_status, uploaded_by, uploaded_at)
+         VALUES (?1, 1, ?2, 'application/pdf', ?3, ?4, ?5, 'clean', ?6, ?7)",
+        rusqlite::params![doc, format!("{}.pdf", title.replace(' ', "_")), bytes.len() as i64, sha, key, created_by, now],
+    )
+    .unwrap();
+    (doc, conn.last_insert_rowid())
+}

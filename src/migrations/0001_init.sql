@@ -418,7 +418,8 @@ CREATE TABLE decisions (
   case_id                INTEGER NOT NULL REFERENCES cases(id),
   title                  TEXT NOT NULL,
   decision_date          TEXT,
-  status                 TEXT NOT NULL CHECK (status IN ('draft','finalised','superseded')),
+  status                 TEXT NOT NULL CHECK (status IN ('draft','finalised','superseded','withdrawn')),
+  status_reason          TEXT,                      -- withdrawal reason (drafts only)
   document_id            INTEGER NOT NULL REFERENCES documents(id),
   document_version_id    INTEGER NOT NULL REFERENCES document_versions(id),  -- exact revision the decision binds to
   hearing_id             INTEGER REFERENCES hearings(id),

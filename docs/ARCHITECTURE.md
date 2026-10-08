@@ -139,7 +139,7 @@ Intake documents (no case yet): `intake.manage` holders.
 - Hearing: `draft → scheduled → held|adjourned|cancelled`; `draft → cancelled`. Adjourn creates a **new linked hearing** (old stays `adjourned`
   with reason + authoriser; new gets `previous_hearing_id`), frees the slot, generates "notify again" tasks per participant. `held` cannot be adjourned;
   correction via `hearing.admin_correct` with reason. Held never closes the case.
-- Decision: `draft → finalised → superseded` (by amendment, linked). Finalised file can never be replaced in place.
+- Decision: `draft → finalised → superseded` (by a finalised amendment, linked); `draft → withdrawn` (reason). Finalised file can never be replaced in place.
 - Dispatch (notice or copy package): `draft → queued → sent|failed`; `failed → queued` (retry = new attempt row). Technical delivery receipt,
   human confirmation and legal service assessment are **separate** records.
 - Task: `open → done|cancelled(reason)|carried_forward(reason)`.

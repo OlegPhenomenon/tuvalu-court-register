@@ -4,7 +4,14 @@ use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
 /// Ordered schema migrations; `PRAGMA user_version` stores how many were applied.
-const MIGRATIONS: &[&str] = &[include_str!("migrations/0001_init.sql")];
+const MIGRATIONS: &[&str] = &[
+    include_str!("migrations/0001_init.sql"),
+    include_str!("migrations/0002_hearings.sql"),
+    include_str!("migrations/0003_documents.sql"),
+    include_str!("migrations/0004_dispatch.sql"),
+    include_str!("migrations/0005_reports.sql"),
+    include_str!("migrations/0006_admin.sql"),
+];
 
 /// Handle to one court database (production DB or one demo sandbox) and its private file store.
 #[derive(Clone, Debug)]
