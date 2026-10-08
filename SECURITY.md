@@ -144,11 +144,10 @@ actor lacks. Knowing a case number grants no access.
 - The app reads `X-Forwarded-For` / `X-Real-IP` for rate limiting and audit IP
   records. Deploy only behind a proxy that **overwrites** these headers (the
   shipped nginx config does); direct exposure lets clients spoof them.
-- No antivirus engine — upload screening is heuristic (type + active content).
+- Format checks and antivirus are risk reduction, not proof of absolute safety. Demo and explicit `TCR_AV=off` installations use format checks only.
 - No OCR and no full-text search over file contents (search covers case fields
   and document titles).
-- No real e-mail: dispatches go to the local mailbox only. `dispatch_method`
-  "E-mail" means the local mailbox in this installation.
+- Demo dispatches stay in the local mailbox. Production SMTP uses TLS, records transport failures and retries, and never marks unconfigured delivery as sent. SMTP acknowledgement loss can produce ambiguous delivery; it cannot guarantee universal exactly-once receipt.
 - No qualified electronic signature: uploading a signed file records the file;
   the system does not assert signature validity or legal effect.
 - Single-node SQLite deployment: no replication or HA; rely on the encrypted
@@ -163,3 +162,35 @@ for the repository (Security tab → Advisories → "Report a vulnerability").
 Include steps to reproduce and the affected version/commit. If the repository
 is not on GitHub, contact the maintainer directly through the channel the
 software was delivered by.
+
+## Installation checks added after audit
+
+New and reset accounts must change their temporary password after TOTP.
+`/auth/me` exposes the flag; server middleware blocks all other API use except
+me/logout/password/TOTP enrolment and verification with `password_change_required`.
+Own-password changes require the current password and fresh TOTP (if enrolled),
+preserve TOTP, rotate the current session and revoke other sessions. Technical
+admins cannot reset judges or protected accounts.
+
+Production must configure private clamd (`TCR_CLAMD`, TCP or Unix INSTREAM) or
+explicitly set `TCR_AV=off`. Configured scanner errors and timeouts fail closed.
+Uploads are pending until a verdict; only explicit OK allows clean. Startup
+quarantines interrupted pending checks. Download, inline preview, export, dispatch,
+SMTP attachments and mailbox links cannot retrieve pending/quarantined bytes.
+Imports use the same checks; full backups retain verdicts. Built-in checks include
+escaped PDF names and bounded FlateDecode streams, PNG CRC/structure, JPEG
+segments/EOI and DOCX macros/ActiveX/OLE. Neither these checks nor antivirus prove
+absolute file safety; unsupported PDF stream encodings are quarantined when they
+prevent object-stream inspection.
+
+SMTP requires STARTTLS or implicit TLS with rustls/ring and bundled webpki roots;
+credentials never appear in Settings. Demo ignores SMTP configuration. Production
+without complete SMTP configuration keeps email queued. Successful deliveries
+retain the exact queued version inventory in a local log marked sent via SMTP;
+this does not assert legally sufficient service.
+
+Maintenance commands load the server env file, print data directory and installation
+id, and refuse an absent/uninitialised source database. Restore reads the existing
+DB inside an authenticated backup and requires explicit confirmation before writing
+a new/empty destination. Installation ids survive restore. Keep env files, data,
+backups and keys private; see `docs/OPERATIONS.md` for absolute-path commands.

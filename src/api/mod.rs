@@ -59,6 +59,7 @@ pub fn router(state: AppState) -> Router {
         .merge(admin::routes())
         .merge(audit_log::routes())
         .fallback(|| async { AppError::not_found() })
+        .layer(axum::middleware::from_fn_with_state(state.clone(), crate::auth::password_gate))
         .layer(DefaultBodyLimit::max(upload_limit))
         .layer(axum::middleware::map_response(no_store));
 

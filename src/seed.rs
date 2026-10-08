@@ -153,6 +153,7 @@ pub fn create_user(db: &Db, username: &str, display: &str, password: &str, judge
     db.write_blocking(move |tx| {
         let refs: Vec<&str> = perms.iter().map(String::as_str).collect();
         let id = insert_user(tx, &username, &display, None, &hash, judge, None, &refs)?;
+        tx.execute("UPDATE users SET must_change_password=1 WHERE id=?1", [id])?;
         crate::audit::record(tx, None, crate::audit::Event::new("user.created", "user", id, format!("User '{username}' created via command line")))?;
         Ok(id)
     })

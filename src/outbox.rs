@@ -1,5 +1,5 @@
 //! The local outbox. Every claim, permission check, attempt and mailbox entry shares one
-//! immediate transaction. No network transport is used.
+//! immediate transaction. Production delivery delegates to the SMTP transport.
 use crate::audit::{self, Event};
 use crate::auth::{self, Actor};
 use crate::db::Db;
@@ -111,6 +111,7 @@ fn audit_actor(
 /// Deliver queued dispatches, oldest first. Concurrent workers re-check the claim under
 /// BEGIN IMMEDIATE; a dispatch already handled or cancelled is skipped.
 pub fn process(db: &Db) -> AppResult<usize> {
+    crate::mail::retry_due(db)?;
     let conn = db.open()?;
     let mut stmt =
         conn.prepare("SELECT id FROM dispatches WHERE status = 'queued' ORDER BY queued_at, id")?;
@@ -143,19 +144,31 @@ pub fn process(db: &Db) -> AppResult<usize> {
             let items = match checked {
                 Ok(items) => items,
                 Err(e) if matches!(e.status.as_u16(), 400 | 403 | 404) => {
-                    failure = Some(CHANGED);
+                    failure = Some(CHANGED.to_string());
                     Vec::new()
                 }
                 Err(e) => return Err(e),
             };
             let address = d.address.as_deref().unwrap_or_default().trim();
             if failure.is_none() && (!address.contains('@') || address.rsplit_once('@').is_some_and(|(_, domain)| domain.to_ascii_lowercase().ends_with(".fail"))) {
-                failure = Some(REJECTED);
+                failure = Some(REJECTED.to_string());
+            }
+            let mut transport = "local mailbox (DEMO)";
+            if failure.is_none() {
+                match crate::mail::deliver(db, tx, id, address, &d.subject, &d.body, &items) {
+                    Ok(Some(label)) => transport = label,
+                    Ok(None) => return Ok(0),
+                    Err(e) if e.status.as_u16() == 400 => {
+                        failure = Some(e.message.clone());
+                    }
+                    Err(e) => return Err(e),
+                }
             }
             let attempt_no: i64 = tx.query_row("SELECT COALESCE(MAX(attempt_no), 0) + 1 FROM delivery_attempts WHERE dispatch_id = ?1", [id], |r| r.get(0))?;
             let now = crate::time::now_utc();
             let attribution = audit_actor(tx, d.queued_by, &actor)?;
             if let Some(why) = failure {
+                if why.starts_with("SMTP ") { crate::mail::failed(tx, id, attempt_no)?; }
                 tx.execute("INSERT INTO delivery_attempts (dispatch_id, attempt_no, status, detail, at) VALUES (?1, ?2, 'failed', ?3, ?4)", params![id, attempt_no, why, now])?;
                 tx.execute(
                     "UPDATE dispatches SET status = 'failed', failure_reason = ?2, version = version + 1,
@@ -163,16 +176,17 @@ pub fn process(db: &Db) -> AppResult<usize> {
                      reviewed_at = CASE WHEN ?3 THEN NULL ELSE reviewed_at END WHERE id = ?1",
                     params![id, why, why == CHANGED],
                 )?;
-                audit::record(tx, attribution.as_ref(), Event::new("dispatch.failed", "dispatch", id, why).case(d.case_id)
+                audit::record(tx, attribution.as_ref(), Event::new("dispatch.failed", "dispatch", id, &why).case(d.case_id)
                     .details(json!({"attempt_no": attempt_no, "failure_reason": why})))?;
             } else {
                 tx.execute("INSERT INTO mailbox (dispatch_id, attempt_no, to_address, subject, body, attachments, delivered_at) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7)",
                     params![id, attempt_no, address, d.subject, d.body, serde_json::to_string(&items)?, now])?;
                 let mailbox_id = tx.last_insert_rowid();
+                crate::mail::sent(tx, id, mailbox_id, transport)?;
                 tx.execute("INSERT INTO delivery_attempts (dispatch_id, attempt_no, status, technical_receipt, at) VALUES (?1, ?2, 'sent', ?3, ?4)",
-                    params![id, attempt_no, format!("local-mailbox:{mailbox_id}"), now])?;
+                    params![id, attempt_no, if transport == "sent via SMTP" { format!("sent via SMTP; mailbox:{mailbox_id}") } else { format!("local-mailbox:{mailbox_id}") }, now])?;
                 tx.execute("UPDATE dispatches SET status = 'sent', sent_at = ?2, failure_reason = NULL, version = version + 1 WHERE id = ?1", params![id, now])?;
-                audit::record(tx, attribution.as_ref(), Event::new("dispatch.sent", "dispatch", id, format!("{} ({address})", crate::api::common::dispatch_activity(tx, id, if d.kind == "copies" { "sent" } else { "delivered to the local mailbox" })?)).case(d.case_id)
+                audit::record(tx, attribution.as_ref(), Event::new("dispatch.sent", "dispatch", id, format!("{} ({address})", crate::api::common::dispatch_activity(tx, id, if transport == "sent via SMTP" { "sent via SMTP" } else if d.kind == "copies" { "sent" } else { "delivered to the local mailbox" })?)).case(d.case_id)
                     .details(json!({"attempt_no": attempt_no, "mailbox_id": mailbox_id})))?;
             }
             Ok(1)

@@ -18,7 +18,7 @@ sandbox pre-loaded with fictional `DEMO` data and a persona switcher.
 - Not an AI judge, not an e-library, not a public case catalogue. There is no
   public endpoint that accepts real filings.
 - All demonstration names, case categories, numbers and documents are fictional
-  and marked `DEMO`. No real e-mail is sent; outgoing messages land in a local
+  and marked `DEMO`. In demo mode no real e-mail is sent; outgoing messages land in a local
   mailbox viewer.
 
 ### Budget context
@@ -48,7 +48,7 @@ must be confirmed with the court before real use. Section and feature numbers
 | C06 | Documents and versions with type, source, checksum, visibility and original location; uploads validated server-side |
 | C07 | Multiple hearings per case with time, room, judge and status; double-booking prevented by database constraints |
 | C08 | Adjournment/cancellation creates a linked new record, keeps reason and authoriser, frees the slot, re-lists who must be notified |
-| C09 | Template-based notices and copies, review before sending, technical delivery vs. human confirmation vs. legal service assessment as separate records; real e-mail disabled — local mailbox only |
+| C09 | Template-based notices and copies, review before sending, technical delivery vs. human confirmation vs. legal service assessment as separate records; TLS SMTP in production, local mailbox in demo |
 | C10 | Hearing outcome (held/not held), attendance, result, follow-up tasks with their own state |
 | C11 | Decisions: draft → finalised → superseded; a finalised version can only be corrected by a linked amendment, never replaced |
 | C12 | Copy packages per recipient with exact document versions, mandatory preview, recorded transfer |
@@ -99,7 +99,7 @@ proxy in front for anything beyond localhost (see `deploy/nginx-tuvalu.conf`).
 
 ## Configuration
 
-All configuration is via environment variables (see `.env.example`).
+Configuration uses environment variables or the same literal `--env-file <path>` / `TCR_ENV_FILE` as the server (see `.env.example`).
 
 | Variable | Default | Meaning |
 |---|---|---|
@@ -112,6 +112,13 @@ All configuration is via environment variables (see `.env.example`).
 | `TCR_SANDBOX_TTL_HOURS` | `72` | Demo sandbox idle lifetime |
 | `TCR_MAX_SANDBOXES` | `200` | Maximum live demo sandboxes |
 | `TCR_SANDBOX_QUOTA_MB` | `25` | Storage quota per demo sandbox |
+| `TCR_ENV_FILE` | unset | Shared server/maintenance env file; `--env-file` takes precedence |
+| `TCR_SMTP_URL` | unset | Production SMTP URL; smtp requires STARTTLS, smtps implicit TLS |
+| `TCR_MAIL_FROM` | unset | Sender mailbox; production without SMTP/sender stays queued |
+| `TCR_SMTP_TIMEOUT_SECS` | `20` | Bounded SMTP operation timeout |
+| `TCR_CLAMD` | unset | Private ClamAV INSTREAM endpoint: tcp://host:3310 or unix:/socket |
+| `TCR_AV` | unset | Production without clamd requires explicit `off`; demo format checks only |
+| `TCR_SCAN_TIMEOUT_MS` | `10000` | Scanner deadline; failure/timeout quarantines |
 | `RUST_LOG` | `info` | Log level (`tracing` env filter) |
 
 ## Demo personas
@@ -170,3 +177,31 @@ and extend it independently (spec §12).
 ## Licence
 
 MIT — see `LICENSE`. Third-party components are listed in `THIRD_PARTY.md`.
+
+## Install and operate a production installation
+
+Follow [the operations runbook](docs/OPERATIONS.md) for systemd, Docker Compose or
+Kamal. Production requires clamd or explicit `TCR_AV=off` (format checks only, no
+antivirus). Configure `TCR_SMTP_URL` and `TCR_MAIL_FROM` for outbound email; absent
+configuration keeps mail queued with a visible status. Demo remains local even
+when SMTP variables are set. Pending and quarantined files are unavailable through
+all application file channels. Neither format checks nor antivirus guarantee safety.
+
+Systemd uses `/etc/tuvalu-court.env` and the `tuvalu` service user. Start the server
+once to initialise the installation, then use the same file for every maintenance
+command, for example:
+
+```sh
+sudo -u tuvalu /opt/tuvalu-court/tuvalu-court --env-file /etc/tuvalu-court.env create-user demoadmin "DEMO Registry Administrator" --perm admin.users --perm admin.settings
+sudo -u tuvalu /opt/tuvalu-court/tuvalu-court --env-file /etc/tuvalu-court.env backup /var/lib/tuvalu-court/court.tcrb /var/lib/tuvalu-court/backup.key
+sudo -u tuvalu /opt/tuvalu-court/tuvalu-court --env-file /etc/tuvalu-court.env verify-audit
+```
+
+Maintenance prints the resolved directory and installation id, and refuses to
+create an accidental empty source database. Restore checks the initialised database
+in the authenticated archive and requires `--yes` or confirmation of its installation
+id before writing an explicit empty target. See the runbook for key creation,
+complete restore steps and container commands. CLI-created/reset users enrol TOTP
+and change their temporary password before accessing records; normal password
+changes are available to every production user in Settings. Other sessions end
+on password change and TOTP remains enabled.

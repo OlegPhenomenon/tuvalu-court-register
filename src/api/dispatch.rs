@@ -68,6 +68,7 @@ fn state_summary(d: &Value) -> String {
     match d["status"].as_str().unwrap_or_default() {
         "draft" if d["reviewed_at"].is_null() => "Prepared — check recipient and contents".into(),
         "draft" => "Reviewed — ready to send".into(),
+        "queued" if d["failure_reason"].as_str() == Some("Mail transport not configured") => "Queued — mail transport not configured".into(),
         "queued" => "Queued for delivery".into(),
         "sent" => {
             let handed = d["confirmations"]

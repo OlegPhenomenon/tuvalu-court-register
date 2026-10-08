@@ -13,6 +13,7 @@ import { CheckboxField, SelectField, TextArea, TextField } from '../components/f
 import { useApi } from '../components/useApi';
 import { useRef as useRefData } from '../components/refdata';
 import './admin.css';
+import ChangePassword from './ChangePassword';
 
 type Permission = { key: string; description: string; admin_grantable: boolean };
 type User = { id: number; username: string; display_name: string; title: string | null; email: string | null; is_judge: number | boolean; active: number | boolean; permissions: string[]; mfa_enrolled: number | boolean; active_sessions: number; last_seen_at: string | null };
@@ -162,7 +163,7 @@ function Resource({ spec, kind, units = [], onChanged }: { spec: ResourceSpec; k
     {editor && <RecordEditor spec={spec} row={editor.row} kind={kind} units={units} onClose={() => setEditor(null)} onSaved={saved} />}
   </Card>;
 }
-type GeneralSettings = { court_name: string; hearing_buffer_minutes: number; intake_reference_prefix: string; timezone: string; mode: string };
+type GeneralSettings = { court_name: string; hearing_buffer_minutes: number; intake_reference_prefix: string; timezone: string; mode: string; installation_id: string; mail_transport: string; file_scanner: string };
 function GeneralEditor({ initial, onChanged }: { initial: GeneralSettings; onChanged: () => void }) {
   const { refresh } = useSession();
   const [name, setName] = useState(initial.court_name);
@@ -173,6 +174,7 @@ function GeneralEditor({ initial, onChanged }: { initial: GeneralSettings; onCha
   const [saved, setSaved] = useState(false);
   const submit = async () => { setBusy(true); setError(null); setSaved(false); try { await api('PUT', '/admin/settings', { court_name: name, hearing_buffer_minutes: Number(buffer), intake_reference_prefix: prefix }); setSaved(true); onChanged(); await refresh(); } catch (e) { setError(e); } finally { setBusy(false); } };
   return <form onSubmit={e => { e.preventDefault(); void submit(); }}><ErrorBanner error={error} onRetry={() => void submit()} />
+    <p>Installation: <code>{initial.installation_id}</code></p><p>{initial.mail_transport}</p><p>{initial.file_scanner}</p>
     <fieldset className="admin-fieldset" disabled={busy}><TextField label="Court name" value={name} onChange={setName} required /><TextField label="Hearing buffer (minutes)" type="number" value={buffer} onChange={setBuffer} min={0} max={240} step={1} required /><TextField label="Intake reference prefix" value={prefix} onChange={setPrefix} pattern="[A-Z]{1,6}" required help="1–6 uppercase letters." /><TextField label="Court timezone" value={initial.timezone} readOnly />
       <Button type="submit" busy={busy}>Save settings</Button>{saved && <p role="status">Settings saved.</p>}
     </fieldset>
@@ -196,5 +198,5 @@ function CourtSettings({ onChanged }: { onChanged: () => void }) {
 export default function Settings() {
   const { session, hasPerm } = useSession();
   const ref = useRefData();
-  return <><PageHeader title="Settings" />{hasPerm('admin.users') && <Users key={session.user.id} onChanged={ref.reload} />}{hasPerm('admin.settings') && <CourtSettings key={session.user.id} onChanged={ref.reload} />}{!hasPerm('admin.users') && !hasPerm('admin.settings') && <p>You do not have permission to manage users or settings.</p>}</>;
+  return <><PageHeader title="Settings" />{session.mode === 'production' && <Card title="My account"><ChangePassword /></Card>}{hasPerm('admin.users') && <Users key={session.user.id} onChanged={ref.reload} />}{hasPerm('admin.settings') && <CourtSettings key={session.user.id} onChanged={ref.reload} />}{!hasPerm('admin.users') && !hasPerm('admin.settings') && <p>Court settings require administrator permission.</p>}</>;
 }

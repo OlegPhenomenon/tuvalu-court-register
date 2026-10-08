@@ -51,6 +51,7 @@ export function VisibilityBadge({ value }: { value: string }) {
   </span>;
 }
 export function DocumentLinks({ version }: { version: DocumentVersion }) {
+  if (version.scan_status === 'pending_scan') return <span className="doc-quarantine">Safety check pending — cannot be opened</span>;
   if (version.scan_status !== 'clean') return <span className="doc-quarantine">Quarantined — failed the safety check, cannot be opened</span>;
   const path = `/document-versions/${version.id}/download`;
   return <span className="doc-links">
@@ -65,7 +66,7 @@ export function DocumentVersions({ versions }: { versions: DocumentVersion[] }) 
     { key: 'filename', header: 'File', render: (v) => <>{v.filename}<div className="muted">{v.size_bytes.toLocaleString('en')} bytes</div></> },
     { key: 'uploaded_at', header: 'Uploaded', render: (v) => <>{v.uploaded_by_name ?? `User #${v.uploaded_by}`}<div className="muted">{fmtLocal(v.uploaded_at)}</div></> },
     { key: 'sha256', header: 'SHA-256', render: (v) => <code title={v.sha256}>{v.sha256.slice(0, 12)}…</code> },
-    { key: 'scan_status', header: 'Safety', render: (v) => <><span className={`badge badge--${v.scan_status === 'clean' ? 'success' : 'danger'}`}>{v.scan_status === 'clean' ? 'Clean' : 'Quarantined'}</span>{v.scan_note && <div>{v.scan_note}</div>}</> },
+    { key: 'scan_status', header: 'Safety', render: (v) => <><span className={`badge badge--${v.scan_status === 'clean' ? 'success' : 'danger'}`}>{v.scan_status === 'clean' ? 'Checks passed' : v.scan_status === 'pending_scan' ? 'Check pending' : 'Quarantined'}</span>{v.scan_note && <div>{v.scan_note}</div>}</> },
     { key: 'note', header: 'Note' },
     { key: 'id', header: 'Files', render: (v) => <DocumentLinks version={v} /> },
   ]} />;

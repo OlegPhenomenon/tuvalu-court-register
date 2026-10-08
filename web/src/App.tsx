@@ -25,6 +25,7 @@ import Reports from './pages/Reports';
 import Import from './pages/Import';
 import Audit from './pages/Audit';
 import Settings from './pages/Settings';
+import ChangePassword from './pages/ChangePassword';
 import GlobalSearch from './components/GlobalSearch';
 
 const NAV: { to: string; label: string; end?: boolean; anyPerm?: string[] }[] = [
@@ -39,7 +40,7 @@ const NAV: { to: string; label: string; end?: boolean; anyPerm?: string[] }[] = 
   { to: '/reports', label: 'Reports', anyPerm: ['report.view'] },
   { to: '/import', label: 'Import', anyPerm: ['import.run'] },
   { to: '/audit', label: 'Audit', anyPerm: ['audit.view'] },
-  { to: '/settings', label: 'Settings', anyPerm: ['admin.users', 'admin.settings'] },
+  { to: '/settings', label: 'Settings' },
 ];
 
 export default function App() {
@@ -52,6 +53,7 @@ export default function App() {
 
 function Shell() {
   const { session } = useSession();
+  if (session.must_change_password) return <div className="gate"><main className="gate-card" id="main"><h1>Tuvalu Court Register</h1><ChangePassword forced /><LogoutButton /></main></div>;
   return (
     <div className="shell">
       <a className="skip-link" href="#main">Skip to content</a>
