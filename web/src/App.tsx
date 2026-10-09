@@ -1,9 +1,10 @@
 /**
- * Application shell: top bar, demo banner, permission-filtered left navigation
- * and all routes. Pages live in src/pages/.
+ * Application shell: dark sidebar (brand, grouped permission-filtered
+ * navigation, DEMO note), top bar (search, user menu) and all routes.
+ * Pages live in src/pages/.
  */
 
-import { useRef, useState } from 'react';
+import { useEffect, useRef, useState } from 'react';
 import { Link, NavLink, Route, Routes } from 'react-router-dom';
 import { api } from './api';
 import { SessionProvider, useSession } from './session';
@@ -11,6 +12,8 @@ import type { Persona } from './session';
 import { Button } from './components/Button';
 import { Modal } from './components/Modal';
 import { PageHeader } from './components/PageHeader';
+import { Emblem, Icon, initials } from './components/icons';
+import type { IconName } from './components/icons';
 import WorkQueue from './pages/WorkQueue';
 import Intakes from './pages/Intakes';
 import IntakeDetail from './pages/IntakeDetail';
@@ -28,19 +31,36 @@ import Settings from './pages/Settings';
 import ChangePassword from './pages/ChangePassword';
 import GlobalSearch from './components/GlobalSearch';
 
-const NAV: { to: string; label: string; end?: boolean; anyPerm?: string[] }[] = [
-  { to: '/', label: 'Work queue', end: true },
-  { to: '/intakes', label: 'Incoming' },
-  { to: '/cases', label: 'Cases' },
-  { to: '/calendar', label: 'Calendar' },
-  { to: '/documents', label: 'Documents' },
-  { to: '/decisions', label: 'Decisions' },
-  { to: '/dispatch', label: 'Dispatch' },
-  { to: '/mailbox', label: 'Mailbox' },
-  { to: '/reports', label: 'Reports', anyPerm: ['report.view'] },
-  { to: '/import', label: 'Import', anyPerm: ['import.run'] },
-  { to: '/audit', label: 'Audit', anyPerm: ['audit.view'] },
-  { to: '/settings', label: 'Settings' },
+type NavItem = { to: string; label: string; icon: IconName; end?: boolean; anyPerm?: string[] };
+
+const NAV: { title: string; items: NavItem[] }[] = [
+  {
+    title: 'Workspace',
+    items: [
+      { to: '/', label: 'Work queue', icon: 'queue', end: true },
+      { to: '/intakes', label: 'Incoming', icon: 'inbox' },
+      { to: '/cases', label: 'Cases', icon: 'cases' },
+      { to: '/calendar', label: 'Calendar', icon: 'calendar' },
+    ],
+  },
+  {
+    title: 'Records',
+    items: [
+      { to: '/documents', label: 'Documents', icon: 'documents' },
+      { to: '/decisions', label: 'Decisions', icon: 'decisions' },
+      { to: '/dispatch', label: 'Dispatch', icon: 'dispatch' },
+      { to: '/mailbox', label: 'Mailbox', icon: 'mailbox' },
+    ],
+  },
+  {
+    title: 'Administration',
+    items: [
+      { to: '/reports', label: 'Reports', icon: 'reports', anyPerm: ['report.view'] },
+      { to: '/import', label: 'Import', icon: 'import', anyPerm: ['import.run'] },
+      { to: '/audit', label: 'Audit', icon: 'audit', anyPerm: ['audit.view'] },
+      { to: '/settings', label: 'Settings', icon: 'settings' },
+    ],
+  },
 ];
 
 export default function App() {
@@ -53,18 +73,13 @@ export default function App() {
 
 function Shell() {
   const { session } = useSession();
-  if (session.must_change_password) return <div className="gate"><main className="gate-card" id="main"><h1>Tuvalu Court Register</h1><ChangePassword forced /><LogoutButton /></main></div>;
+  if (session.must_change_password) return <div className="gate gate--single"><main className="gate-card" id="main"><h1>Tuvalu Court Register</h1><ChangePassword forced /><LogoutButton /></main></div>;
   return (
     <div className="shell">
       <a className="skip-link" href="#main">Skip to content</a>
-      <TopBar />
-      {session.mode === 'demo' && (
-        <div className="demo-banner" role="note">
-          DEMO — independent prototype, fictional data. Nothing is sent to real people.
-        </div>
-      )}
-      <div className="shell-body">
-        <SideNav />
+      <SideNav />
+      <div className="shell-main">
+        <TopBar />
         <main className="main" id="main" tabIndex={-1}>
           <Routes>
             <Route path="/" element={<WorkQueue />} />
@@ -93,29 +108,51 @@ function TopBar() {
   const { session } = useSession();
   return (
     <header className="topbar">
-      <Link to="/" className="brand">{session.court_name}</Link>
       <GlobalSearch />
       <div className="topbar-right">
-        <span className="user-block">
-          <span className="user-name">{session.user.display_name}</span>
-          <span className="user-title">{session.user.title}</span>
-        </span>
-        {session.mode === 'demo' && <DemoControls />}
-        <LogoutButton />
+        {session.mode === 'demo' && (
+          <span className="env-pill" title="Independent prototype on fictional data. Nothing is sent to real people.">
+            DEMO environment
+          </span>
+        )}
+        <UserMenu />
       </div>
     </header>
   );
 }
 
-function DemoControls() {
+function UserMenu() {
+  const { session } = useSession();
+  const demo = session.mode === 'demo';
   const menuRef = useRef<HTMLDetailsElement>(null);
   const [personas, setPersonas] = useState<Persona[] | null>(null);
   const [personaError, setPersonaError] = useState(false);
   const [resetOpen, setResetOpen] = useState(false);
   const [busy, setBusy] = useState(false);
 
+  // Close the menu on a click outside it or on Escape.
+  useEffect(() => {
+    const onPointer = (e: PointerEvent) => {
+      const el = menuRef.current;
+      if (el?.open && !el.contains(e.target as Node)) el.open = false;
+    };
+    const onKey = (e: KeyboardEvent) => {
+      const el = menuRef.current;
+      if (e.key === 'Escape' && el?.open) {
+        el.open = false;
+        el.querySelector('summary')?.focus();
+      }
+    };
+    document.addEventListener('pointerdown', onPointer);
+    document.addEventListener('keydown', onKey);
+    return () => {
+      document.removeEventListener('pointerdown', onPointer);
+      document.removeEventListener('keydown', onKey);
+    };
+  }, []);
+
   const loadPersonas = async () => {
-    if (personas) return;
+    if (personas || !demo) return;
     try {
       setPersonas(await api<Persona[]>('GET', '/demo/personas'));
     } catch {
@@ -140,39 +177,94 @@ function DemoControls() {
     }
   };
 
+  const logout = async () => {
+    try {
+      await api('POST', '/auth/logout');
+    } finally {
+      // Full reload clears every piece of in-memory case data.
+      window.location.reload();
+    }
+  };
+
+  const closeMenu = () => {
+    if (menuRef.current) menuRef.current.open = false;
+  };
+
   return (
     <>
       <details
-        className="menu"
+        className="menu user-menu"
         ref={menuRef}
         onToggle={(e) => {
           if ((e.target as HTMLDetailsElement).open) void loadPersonas();
         }}
       >
-        <summary className="menu-toggle">Switch person</summary>
+        <summary className="user-trigger" aria-label={`Account: ${session.user.display_name}`}>
+          <span className="avatar" aria-hidden="true">{initials(session.user.display_name)}</span>
+          <span className="user-block">
+            <span className="user-name">{session.user.display_name}</span>
+            <span className="user-title">{session.user.title}</span>
+          </span>
+          <Icon name="chevronDown" size={16} className="user-chevron" />
+        </summary>
         <div className="menu-list" role="menu">
-          {personaError && <p className="menu-note">Could not load personas.</p>}
-          {!personas && !personaError && <p className="menu-note">Loading…</p>}
-          {personas?.map((p) => (
-            <button key={p.key} type="button" role="menuitem" onClick={() => void switchPersona(p.key)}>
-              <strong>{p.display}</strong>
-              <span className="menu-note">{p.title}</span>
-            </button>
-          ))}
+          {demo && (
+            <>
+              <p className="menu-heading">Switch person</p>
+              {personaError && <p className="menu-note">Could not load personas.</p>}
+              {!personas && !personaError && <p className="menu-note">Loading…</p>}
+              {personas?.map((p) => {
+                const current = p.key === session.user.persona;
+                return (
+                  <button
+                    key={p.key}
+                    type="button"
+                    role="menuitem"
+                    className={current ? 'menu-person is-current' : 'menu-person'}
+                    aria-current={current || undefined}
+                    onClick={() => void switchPersona(p.key)}
+                  >
+                    <span className="avatar avatar--sm" aria-hidden="true">{initials(p.display)}</span>
+                    <span className="menu-person-text">
+                      <strong>{p.display}</strong>
+                      <span>{p.title}</span>
+                    </span>
+                    {current && <Icon name="check" size={16} className="menu-check" />}
+                  </button>
+                );
+              })}
+              <hr className="menu-sep" />
+              <button
+                type="button"
+                role="menuitem"
+                className="menu-item"
+                onClick={() => {
+                  closeMenu();
+                  setResetOpen(true);
+                }}
+              >
+                <Icon name="reset" size={16} /> Reset my demo
+              </button>
+            </>
+          )}
+          <button type="button" role="menuitem" className="menu-item" onClick={() => void logout()}>
+            <Icon name="logout" size={16} /> Log out
+          </button>
         </div>
       </details>
 
-      <Button variant="secondary" onClick={() => setResetOpen(true)}>Reset my demo</Button>
-      <Modal title="Reset my demo" open={resetOpen} onClose={() => setResetOpen(false)}>
-        <p>
-          This wipes <strong>your own sandbox</strong> and reloads it with fresh fictional data.
-          Other visitors are not affected.
-        </p>
-        <div className="actions">
-          <Button variant="danger" busy={busy} onClick={reset}>Reset my demo</Button>
-          <Button variant="secondary" onClick={() => setResetOpen(false)}>Cancel</Button>
-        </div>
-      </Modal>
+      {demo && (
+        <Modal title="Reset my demo" open={resetOpen} onClose={() => setResetOpen(false)}>
+          <p>
+            This wipes <strong>your own sandbox</strong> and reloads it with fresh fictional data.
+            Other visitors are not affected.
+          </p>
+          <div className="actions">
+            <Button variant="danger" busy={busy} onClick={reset}>Reset my demo</Button>
+            <Button variant="secondary" onClick={() => setResetOpen(false)}>Cancel</Button>
+          </div>
+        </Modal>
+      )}
     </>
   );
 }
@@ -192,19 +284,43 @@ function LogoutButton() {
 }
 
 function SideNav() {
-  const { hasPerm } = useSession();
+  const { session, hasPerm } = useSession();
   return (
-    <nav className="sidenav" aria-label="Main navigation">
-      <ul>
-        {NAV.filter((i) => !i.anyPerm || i.anyPerm.some(hasPerm)).map((i) => (
-          <li key={i.to}>
-            <NavLink to={i.to} end={i.end} className={({ isActive }) => (isActive ? 'active' : undefined)}>
-              {i.label}
-            </NavLink>
-          </li>
-        ))}
-      </ul>
-    </nav>
+    <aside className="sidebar">
+      <Link to="/" className="sidebar-brand">
+        <Emblem size={34} />
+        <span className="sidebar-brand-text">
+          <strong>Tuvalu Court Register</strong>
+          <small>{session.court_name}</small>
+        </span>
+      </Link>
+      <nav className="sidenav" aria-label="Main navigation">
+        {NAV.map((section) => {
+          const items = section.items.filter((i) => !i.anyPerm || i.anyPerm.some(hasPerm));
+          if (items.length === 0) return null;
+          return (
+            <div className="nav-section" key={section.title}>
+              <p className="nav-heading">{section.title}</p>
+              <ul>
+                {items.map((i) => (
+                  <li key={i.to}>
+                    <NavLink to={i.to} end={i.end} className={({ isActive }) => (isActive ? 'active' : undefined)}>
+                      <Icon name={i.icon} />
+                      <span>{i.label}</span>
+                    </NavLink>
+                  </li>
+                ))}
+              </ul>
+            </div>
+          );
+        })}
+      </nav>
+      {session.mode === 'demo' && (
+        <div className="sidebar-note" role="note">
+          <strong>DEMO</strong> — independent prototype, fictional data. Nothing is sent to real people.
+        </div>
+      )}
+    </aside>
   );
 }
 

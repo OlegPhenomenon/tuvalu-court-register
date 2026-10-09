@@ -219,7 +219,7 @@ export default function Calendar() {
                         {dayTime(h, date)}
                       </td>
                       <td>
-                        <Link to={`/cases/${h.case_id}?tab=hearings`}>{h.case_number}</Link>
+                        <Link className="nowrap" to={`/cases/${h.case_id}?tab=hearings`}>{h.case_number}</Link>
                       </td>
                       <td>{h.hearing_type_label}</td>
                       <td>{h.room_name ?? '—'}</td>

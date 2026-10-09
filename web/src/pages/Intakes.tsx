@@ -145,7 +145,7 @@ export default function Intakes() {
       key: 'case_number',
       header: 'Case',
       render: (r) =>
-        r.case_id && r.case_number ? <Link to={`/cases/${r.case_id}`}>{r.case_number}</Link> : '—',
+        r.case_id && r.case_number ? <Link className="nowrap" to={`/cases/${r.case_id}`}>{r.case_number}</Link> : '—',
     },
   ];
 

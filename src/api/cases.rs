@@ -449,7 +449,7 @@ pub fn next_actions(c: &Connection, actor: &Actor, case_id: i64) -> AppResult<Ve
         "SELECT id, starts_at FROM hearings WHERE case_id=?1 AND status='scheduled' AND ends_at > ?2 ORDER BY starts_at",
         params![case_id, now],
     )? {
-        let when = crate::time::utc_to_local(h["starts_at"].as_str().unwrap_or_default());
+        let when = crate::time::human_court_local(&crate::time::utc_to_local(h["starts_at"].as_str().unwrap_or_default()), false);
         out.push(action(
             "scheduled_hearing",
             format!("Next hearing: {when} (court time)."),
@@ -602,7 +602,7 @@ pub fn next_actions(c: &Connection, actor: &Actor, case_id: i64) -> AppResult<Ve
         [case_id],
     )? {
         let who = t["assignee"].as_str().map(|a| format!(" ({a})")).unwrap_or_default();
-        let due = t["due_date"].as_str().map(|d| format!(", due {d}")).unwrap_or_default();
+        let due = t["due_date"].as_str().map(|d| format!(", due {}", crate::time::human_court_local(&format!("{d}T00:00"), true))).unwrap_or_default();
         out.push(action(
             "task",
             format!("Task: {}{who}{due}.", t["title"].as_str().unwrap_or_default()),

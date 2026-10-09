@@ -105,7 +105,7 @@ async fn queue(ctx: Ctx) -> JsonResult {
             )? {
                 items.push(json!({
                     "kind": "hearing",
-                    "title": format!("{} at {}", h["number"].as_str().unwrap_or_default(), crate::time::utc_to_local(h["starts_at"].as_str().unwrap_or_default())),
+                    "title": format!("{} at {}", h["number"].as_str().unwrap_or_default(), crate::time::utc_to_local(h["starts_at"].as_str().unwrap_or_default()).get(11..16).unwrap_or_default()),
                     "message": format!("Hearing today{}.", h["room"].as_str().map(|r| format!(" in {r}")).unwrap_or_default()),
                     "link": format!("/cases/{}?tab=hearings", h["case_id"]),
                     "case_number": h["number"],

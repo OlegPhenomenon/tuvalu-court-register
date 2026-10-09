@@ -52,7 +52,7 @@ function DocumentsList() {
       <ErrorBanner error={docs.error} onRetry={docs.reload} />
       {docs.loading ? <p role="status">Loading documents…</p> : <DataTable rows={docs.data ?? []} rowKey={(d) => String(d.id)} empty={docs.error ? 'Documents could not be loaded.' : 'No accessible documents match these filters.'} columns={[
         { key: 'title', header: 'Document', render: (d) => <>{d.title}<div className="muted">{d.doc_type_label}</div></> },
-        { key: 'case_id', header: 'Case / Filing', render: (d) => d.case_id ? <Link to={`/cases/${d.case_id}?tab=documents`}>{d.case_number}</Link> : d.intake_id ? <Link to={`/intakes/${d.intake_id}`}>Filing #{d.intake_id}</Link> : '—' },
+        { key: 'case_id', header: 'Case / Filing', render: (d) => d.case_id ? <Link className="nowrap" to={`/cases/${d.case_id}?tab=documents`}>{d.case_number}</Link> : d.intake_id ? <Link className="nowrap" to={`/intakes/${d.intake_id}`}>Filing #{d.intake_id}</Link> : '—' },
         { key: 'visibility', header: 'Visibility', render: (d) => <VisibilityBadge value={d.visibility} /> },
         { key: 'document_date', header: 'Document / Received date', render: (d) => <>{d.document_date ? fmtDate(d.document_date) : '—'}<div>{d.received_date ? fmtDate(d.received_date) : '—'}</div></> },
         { key: 'version_count', header: 'Latest file', render: (d) => { const v = d.versions.at(-1); return v ? <>{v.filename} · v{v.version_no}<div className="muted">{d.version_count} version(s)</div><DocumentLinks version={v} /></> : 'No file'; } },

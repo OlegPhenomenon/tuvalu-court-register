@@ -8,7 +8,6 @@
 import type { ComponentType } from 'react';
 import { useParams, useSearchParams } from 'react-router-dom';
 import { RegistryPage } from './case/RegistryPage';
-import { Card } from '../components/Card';
 import { ErrorBanner } from '../components/ErrorBanner';
 import { NextActions } from '../components/NextActions';
 import { PageHeader } from '../components/PageHeader';
@@ -70,26 +69,22 @@ export default function CaseWorkspace() {
   return (
     <RegistryPage>
       <PageHeader
+        eyebrow="Case"
         title={
           <>
             {c.number} <StatusBadge status={c.status} />
-            {Boolean(c.restricted) && (
-              <>
-                {' '}
-                <span className="badge badge--danger">Restricted</span>
-              </>
-            )}
+            {Boolean(c.restricted) && <span className="badge badge--danger">Restricted</span>}
           </>
         }
+        subtitle={c.title}
       />
+      <dl className="case-meta">
+        <div><dt>Registered</dt><dd>{fmtDate(c.registered_date)}</dd></div>
+        <div><dt>Responsible officer</dt><dd>{c.responsible_name ?? '—'}</dd></div>
+        <div><dt>Judge</dt><dd>{judge?.display_name ?? '—'}</dd></div>
+        <div><dt>Category</dt><dd>{c.category_label}</dd></div>
+      </dl>
       <NextActions items={data.next_actions} />
-      <Card>
-        <p style={{ fontSize: '1.1rem', fontWeight: 600, marginTop: 0 }}>{c.title}</p>
-        <p className="muted">
-          {c.category_label} · registered {fmtDate(c.registered_date)} · responsible{' '}
-          {c.responsible_name ?? '—'} · judge {judge?.display_name ?? '—'}
-        </p>
-      </Card>
 
       <Tabs
         idPrefix={`case-${caseId}`}

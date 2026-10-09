@@ -31,7 +31,7 @@ function DecisionsList() {
       <ErrorBanner error={list.error} onRetry={list.reload} />
       {list.loading ? <p role="status">Loading decisions…</p> : <DataTable rows={list.error ? [] : list.data?.items ?? []} rowKey={(d) => String(d.id)} empty={list.error ? 'Decisions could not be loaded.' : 'No accessible decisions match this status.'} columns={[
         { key: 'title', header: 'Decision', render: (d) => <><Link to={`/cases/${d.case_id}?tab=decisions#decision-${d.id}`}>{d.title}</Link><DecisionChain decision={d} decisions={list.data?.items} />{d.status_reason && <p>{d.status_reason}</p>}</> },
-        { key: 'case_id', header: 'Case', render: (d) => <Link to={`/cases/${d.case_id}?tab=decisions`}>{d.case_number}</Link> },
+        { key: 'case_id', header: 'Case', render: (d) => <Link className="nowrap" to={`/cases/${d.case_id}?tab=decisions`}>{d.case_number}</Link> },
         { key: 'status', header: 'Status', render: (d) => <StatusBadge status={d.status} /> },
         { key: 'decision_date', header: 'Decision date', render: (d) => d.decision_date ? fmtDate(d.decision_date) : 'Not recorded' },
         { key: 'document_version_id', header: 'Bound version', render: (d) => <DecisionFile decision={d} /> },

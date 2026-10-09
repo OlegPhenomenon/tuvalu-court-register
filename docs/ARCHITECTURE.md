@@ -357,11 +357,15 @@ Technical full backup/restore is **CLI only** (`tuvalu-court backup f.tcrb keyfi
 (ChaCha20-Poly1305, key file kept outside repo), manifest with counts + sha256 of every file, verified on restore into an empty data dir.
 
 ## 8. Frontend (`web/`)
-Vite + React + TypeScript + react-router. No UI kit; one CSS file, accessible (labels, focus, keyboard), responsive, print CSS for reports.
+Vite + React + TypeScript + react-router. No UI kit and no icon font: `src/styles.css` holds the design tokens and shared components
+(page-specific rules sit next to pages), icons are inline SVG in `src/components/icons.tsx`; system fonts only. Layout: dark sidebar with
+grouped, permission-filtered navigation; top bar with global search and the user menu (persona switch, "Reset my demo", log out).
+Accessible (labels, focus, keyboard), responsive down to 360 px, print CSS for reports.
 `src/api.ts` fetch wrapper (adds `X-TCR: 1`, `Idempotency-Key`, parses error JSON). Unsaved form text kept in component state and shown
 with "Not saved — retry"; **no** localStorage/IndexedDB of case data. Screens: Work queue, Incoming, Cases, Case workspace (tabs: Summary,
 Participants, Documents, Hearings, Decisions, Dispatch, Tasks, History), Calendar (day/week/month), Documents, Decisions, Dispatch,
-Mailbox, Reports, Import, Audit, Settings, Demo landing + persona switcher banner ("DEMO — fictional data").
+Mailbox, Reports, Import, Audit, Settings, Demo landing + persona picker. DEMO is marked by the "DEMO environment" pill in the top bar
+and the sidebar note ("DEMO — independent prototype, fictional data").
 
 ## 9. Tests
 Integration tests in `tests/` hit the router with a temp data dir: every state transition, every access denial (case, restricted doc,

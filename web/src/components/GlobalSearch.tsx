@@ -3,6 +3,7 @@ import { useNavigate } from 'react-router-dom';
 import { api } from '../api';
 import { useSession } from '../session';
 import { ErrorBanner } from './ErrorBanner';
+import { Icon } from './icons';
 import '../pages/admin.css';
 
 type Result = { id: number; link: string; number?: string; title?: string; case_number?: string | null; reference?: string; sender_name?: string };
@@ -38,7 +39,8 @@ export default function GlobalSearch() {
   const choose = (r: Result) => { setOpen(false); setQ(''); navigate(r.link); };
   let index = 0;
   return <div className="global-search" ref={container} onBlur={e => { if (!e.currentTarget.contains(e.relatedTarget as Node)) setOpen(false); }}>
-    <label className="field-label" htmlFor={id}>Search cases, documents and filings</label>
+    <label className="sr-only" htmlFor={id}>Search cases, documents and filings</label>
+    <Icon name="search" size={17} className="global-search-icon" />
     <input className="input" id={id} value={q} autoComplete="off" role="combobox" aria-autocomplete="list" aria-expanded={open && q.trim().length >= 2} aria-controls={`${id}-list`} aria-activedescendant={open && active >= 0 ? `${id}-${active}` : undefined} placeholder="Number, name or title…" onFocus={() => setOpen(true)} onChange={e => { setQ(e.target.value); setOpen(true); }} onKeyDown={e => {
       if (e.key === 'Escape') { e.preventDefault(); setOpen(false); setActive(-1); }
       if (e.key === 'ArrowDown' || e.key === 'ArrowUp') { e.preventDefault(); setOpen(true); if (rows.length) setActive(a => e.key === 'ArrowDown' ? (a + 1) % rows.length : a <= 0 ? rows.length - 1 : a - 1); }

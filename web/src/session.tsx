@@ -14,6 +14,7 @@ import { api, ApiError } from './api';
 import { Button } from './components/Button';
 import { ErrorBanner } from './components/ErrorBanner';
 import { TextField } from './components/fields';
+import { Emblem, Icon, initials } from './components/icons';
 
 export interface SessionUser {
   id: string;
@@ -123,11 +124,28 @@ export function SessionProvider({ children }: { children: ReactNode }) {
 function GateShell({ children }: { children: ReactNode }) {
   return (
     <div className="gate">
-      <div className="gate-card">
-        <h1 className="gate-title">Tuvalu Court Register</h1>
-        <p className="gate-sub">Independent prototype · DEMO data</p>
-        {children}
-      </div>
+      <aside className="gate-hero">
+        <div className="gate-brand">
+          <Emblem size={42} />
+          <span>Tuvalu Court Register</span>
+        </div>
+        <div className="gate-hero-body">
+          <h1>Case management for the court registry</h1>
+          <p>
+            From the first filing to the final decision: registration, hearings, notices, decisions and a
+            tamper-evident audit trail in one place.
+          </p>
+          <ul className="gate-points">
+            <li><Icon name="inbox" /> Filings checked and registered as numbered cases</li>
+            <li><Icon name="calendar" /> Hearings, rooms and notices to every participant</li>
+            <li><Icon name="audit" /> Role-based access and a hash-chained audit log</li>
+          </ul>
+        </div>
+        <p className="gate-foot">Independent prototype · fictional DEMO data</p>
+      </aside>
+      <main className="gate-panel" id="main">
+        <div className="gate-card">{children}</div>
+      </main>
     </div>
   );
 }
@@ -173,17 +191,19 @@ function DemoLanding({ go }: { go: (s: Stage) => void }) {
   };
   return (
     <>
-      <p>
+      <span className="gate-tag">DEMO · fictional data</span>
+      <h2>Explore the demo</h2>
+      <p className="gate-lead">
         This is an <strong>independent prototype</strong> of a court register, running on{' '}
         <strong>fictional DEMO data</strong>. Nothing you do here is sent to real people, and no real
         cases, names or filings exist in this system.
       </p>
-      <p>
+      <p className="gate-lead">
         The demo runs in a private sandbox that belongs only to your browser. You can switch between
         staff personas and reset your own sandbox at any time.
       </p>
       <ErrorBanner error={error} onRetry={start} />
-      <Button busy={busy} onClick={start}>Start the demo</Button>
+      <Button className="btn--lg" busy={busy} onClick={start}>Start the demo</Button>
     </>
   );
 }
@@ -219,12 +239,13 @@ function PersonaPicker({ go }: { go: (s: Stage) => void }) {
 
   return (
     <>
+      <span className="gate-tag">DEMO · fictional data</span>
       <h2>Choose who you are today</h2>
-      <p className="muted">Each persona has a different job and different permissions.</p>
+      <p className="gate-lead">Each persona has a different job and different permissions. You can switch at any time.</p>
       <ErrorBanner error={error} onRetry={load} />
       {!personas && !error && <p className="muted">Loading…</p>}
       <div className="persona-list">
-        {personas?.map((p) => (
+        {personas?.map((p, i) => (
           <button
             key={p.key}
             type="button"
@@ -232,10 +253,14 @@ function PersonaPicker({ go }: { go: (s: Stage) => void }) {
             disabled={busy !== null}
             onClick={() => void pick(p.key)}
           >
-            <strong>{p.display}</strong>
-            <span className="persona-title">{p.title}</span>
-            <span className="persona-summary">{p.summary}</span>
-            {busy === p.key && <span className="muted">Signing in…</span>}
+            <span className="avatar avatar--lg" data-tone={i % 5} aria-hidden="true">{initials(p.display)}</span>
+            <span className="persona-text">
+              <strong>{p.display}</strong>
+              <span className="persona-title">{p.title}</span>
+              <span className="persona-summary">{p.summary}</span>
+              {busy === p.key && <span className="muted">Signing in…</span>}
+            </span>
+            <Icon name="chevronRight" className="persona-go" />
           </button>
         ))}
       </div>
@@ -274,7 +299,8 @@ function LoginForm({ go, refresh }: { go: (s: Stage) => void; refresh: () => Pro
 
   return (
     <form onSubmit={submit}>
-      <p>Sign in with your staff account.</p>
+      <h2>Sign in</h2>
+      <p className="gate-lead">Sign in with your staff account.</p>
       <ErrorBanner error={error} />
       <TextField label="Username" value={username} onChange={setUsername} required autoComplete="username" />
       <TextField label="Password" type="password" value={password} onChange={setPassword} required autoComplete="current-password" />
