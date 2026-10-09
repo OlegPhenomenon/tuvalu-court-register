@@ -42,6 +42,15 @@ export interface Persona {
   summary: string;
 }
 
+/**
+ * Technical administrators hold only `admin.*` permissions and never see cases,
+ * filings, documents or judicial notes (the server enforces this). The UI hides
+ * the case sections for them instead of showing empty lists.
+ */
+export function isAdminOnly(user: SessionUser): boolean {
+  return user.perms.length > 0 && user.perms.every((p) => p.startsWith('admin.'));
+}
+
 type Stage =
   | { name: 'loading' }
   | { name: 'landing' }

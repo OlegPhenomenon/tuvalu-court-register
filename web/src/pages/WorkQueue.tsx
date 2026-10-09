@@ -6,7 +6,7 @@ import { Icon } from '../components/icons';
 import type { IconName } from '../components/icons';
 import { PageHeader } from '../components/PageHeader';
 import { useApi } from '../components/useApi';
-import { useSession } from '../session';
+import { isAdminOnly, useSession } from '../session';
 import { fmtDate } from '../time';
 
 /** GET /api/queue response item — server-computed next steps for this user. */
@@ -73,7 +73,21 @@ export default function WorkQueue() {
       <ErrorBanner error={error} onRetry={reload} />
       {!loading && !error && groups.length === 0 && (
         <Card>
-          <p className="muted">Nothing needs your attention right now.</p>
+          {isAdminOnly(session.user) ? (
+            <>
+              <p>
+                As a <strong>{session.user.title.toLowerCase()}</strong> you manage staff accounts and reference
+                data. This role has no access to cases, filings, documents or judicial notes, so case lists are not
+                shown to you.
+              </p>
+              <p className="muted">
+                Open <Link to="/settings">Settings</Link> to manage users, or switch to another person (for example
+                the registry clerk or the head of registry) in the menu at the top right to see the case work.
+              </p>
+            </>
+          ) : (
+            <p className="muted">Nothing needs your attention right now.</p>
+          )}
         </Card>
       )}
       {groups.map(([kind, items]) => {

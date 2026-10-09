@@ -7,7 +7,7 @@
 import { useEffect, useRef, useState } from 'react';
 import { Link, NavLink, Route, Routes } from 'react-router-dom';
 import { api } from './api';
-import { SessionProvider, useSession } from './session';
+import { isAdminOnly, SessionProvider, useSession } from './session';
 import type { Persona } from './session';
 import { Button } from './components/Button';
 import { Modal } from './components/Modal';
@@ -31,25 +31,26 @@ import Settings from './pages/Settings';
 import ChangePassword from './pages/ChangePassword';
 import GlobalSearch from './components/GlobalSearch';
 
-type NavItem = { to: string; label: string; icon: IconName; end?: boolean; anyPerm?: string[] };
+/** `caseWork` items need case access, which admin-only roles never have. */
+type NavItem = { to: string; label: string; icon: IconName; end?: boolean; anyPerm?: string[]; caseWork?: boolean };
 
 const NAV: { title: string; items: NavItem[] }[] = [
   {
     title: 'Workspace',
     items: [
       { to: '/', label: 'Work queue', icon: 'queue', end: true },
-      { to: '/intakes', label: 'Incoming', icon: 'inbox' },
-      { to: '/cases', label: 'Cases', icon: 'cases' },
-      { to: '/calendar', label: 'Calendar', icon: 'calendar' },
+      { to: '/intakes', label: 'Incoming', icon: 'inbox', caseWork: true },
+      { to: '/cases', label: 'Cases', icon: 'cases', caseWork: true },
+      { to: '/calendar', label: 'Calendar', icon: 'calendar', caseWork: true },
     ],
   },
   {
     title: 'Records',
     items: [
-      { to: '/documents', label: 'Documents', icon: 'documents' },
-      { to: '/decisions', label: 'Decisions', icon: 'decisions' },
-      { to: '/dispatch', label: 'Dispatch', icon: 'dispatch' },
-      { to: '/mailbox', label: 'Mailbox', icon: 'mailbox' },
+      { to: '/documents', label: 'Documents', icon: 'documents', caseWork: true },
+      { to: '/decisions', label: 'Decisions', icon: 'decisions', caseWork: true },
+      { to: '/dispatch', label: 'Dispatch', icon: 'dispatch', caseWork: true },
+      { to: '/mailbox', label: 'Mailbox', icon: 'mailbox', caseWork: true },
     ],
   },
   {
@@ -285,6 +286,7 @@ function LogoutButton() {
 
 function SideNav() {
   const { session, hasPerm } = useSession();
+  const adminOnly = isAdminOnly(session.user);
   return (
     <aside className="sidebar">
       <Link to="/" className="sidebar-brand">
@@ -296,7 +298,7 @@ function SideNav() {
       </Link>
       <nav className="sidenav" aria-label="Main navigation">
         {NAV.map((section) => {
-          const items = section.items.filter((i) => !i.anyPerm || i.anyPerm.some(hasPerm));
+          const items = section.items.filter((i) => (!i.anyPerm || i.anyPerm.some(hasPerm)) && !(i.caseWork && adminOnly));
           if (items.length === 0) return null;
           return (
             <div className="nav-section" key={section.title}>
